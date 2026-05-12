@@ -29,14 +29,17 @@ DATA_FILE="$("$PYTHON_BIN" scripts/fetch_pytorch_issues.py \
 REPORT_DATE="$(basename "$(dirname "$DATA_FILE")")"
 REPORT_FILE="reports/${REPORT_DATE}.md"
 PROMPT_FILE="$(mktemp)"
+CODEX_DATA_FILE="$(mktemp)"
 
 cleanup() {
-  rm -f "$PROMPT_FILE"
+  rm -f "$PROMPT_FILE" "$CODEX_DATA_FILE"
 }
 trap cleanup EXIT
 
+"$PYTHON_BIN" scripts/compact_issues_for_codex.py "$DATA_FILE" "$CODEX_DATA_FILE"
+
 sed \
-  -e "s|{{DATA_FILE}}|${DATA_FILE}|g" \
+  -e "s|{{DATA_FILE}}|${CODEX_DATA_FILE}|g" \
   -e "s|{{REPORT_DATE}}|${REPORT_DATE}|g" \
   prompts/analyze_daily_issues.md > "$PROMPT_FILE"
 
@@ -46,6 +49,10 @@ sed \
   -m "$CODEX_MODEL" \
   -o "$REPORT_FILE" \
   - < "$PROMPT_FILE"
+
+if [[ ! -s "$REPORT_FILE" ]]; then
+  "$PYTHON_BIN" scripts/render_report.py "$DATA_FILE" "$REPORT_FILE"
+fi
 
 git add "$DATA_FILE" "$REPORT_FILE"
 
