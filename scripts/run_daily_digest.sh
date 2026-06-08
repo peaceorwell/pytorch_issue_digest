@@ -20,7 +20,7 @@ fi
 
 PYTHON_BIN="${REQUEST_PYTHON_BIN:-${PYTHON_BIN:-/usr/bin/python3}}"
 CODEX_BIN="${REQUEST_CODEX_BIN:-${CODEX_BIN:-/Applications/Codex.app/Contents/Resources/codex}}"
-CODEX_MODEL="${REQUEST_CODEX_MODEL:-${CODEX_MODEL:-gpt-5.3-codex}}"
+CODEX_MODEL="${REQUEST_CODEX_MODEL:-${CODEX_MODEL:-}}"
 LOOKBACK_HOURS="${REQUEST_LOOKBACK_HOURS:-${LOOKBACK_HOURS:-24}}"
 TIMEZONE="${REQUEST_TIMEZONE:-${TIMEZONE:-Asia/Shanghai}}"
 MAX_COMMENTS="${REQUEST_MAX_COMMENTS:-${MAX_COMMENTS:-20}}"
@@ -51,12 +51,21 @@ sed \
   -e "s|{{REPORT_DATE}}|${REPORT_DATE}|g" \
   prompts/analyze_daily_issues.md > "$PROMPT_FILE"
 
-"$CODEX_BIN" exec \
-  --cd "$REPO_ROOT" \
-  --sandbox workspace-write \
-  -m "$CODEX_MODEL" \
-  -o "$REPORT_FILE" \
-  - < "$PROMPT_FILE"
+CODEX_ARGS=(
+  exec
+  --cd "$REPO_ROOT"
+  --sandbox workspace-write
+  -o "$REPORT_FILE"
+)
+
+if [[ -n "$CODEX_MODEL" && "$CODEX_MODEL" != "auto" ]]; then
+  CODEX_ARGS+=(-m "$CODEX_MODEL")
+fi
+
+if ! "$CODEX_BIN" "${CODEX_ARGS[@]}" - < "$PROMPT_FILE"; then
+  echo "warning: Codex report generation failed; falling back to local renderer" >&2
+  "$PYTHON_BIN" scripts/render_report.py "$DATA_FILE" "$REPORT_FILE"
+fi
 
 if [[ ! -s "$REPORT_FILE" ]]; then
   "$PYTHON_BIN" scripts/render_report.py "$DATA_FILE" "$REPORT_FILE"
