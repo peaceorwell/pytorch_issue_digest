@@ -1,0 +1,297 @@
+{
+  "metadata": {
+    "repo": "pytorch/pytorch",
+    "keywords": [
+      "compile",
+      "inductor",
+      "dynamo"
+    ],
+    "generated_at": "2026-06-13T04:00:05.964429+00:00",
+    "since": "2026-06-12T04:00:05.964429+00:00",
+    "lookback_hours": 24.0,
+    "timezone": "Asia/Shanghai",
+    "report_date": "2026-06-13",
+    "issue_count": 7
+  },
+  "issues": [
+    {
+      "number": 187127,
+      "title": "DISABLED test_aot_inductor_consts_cpp_build_xpu (__main__.AOTInductorTestDualWrapper)",
+      "url": "https://github.com/pytorch/pytorch/issues/187127",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/187127",
+      "state": "closed",
+      "author": "guangyey",
+      "created_at": "2026-06-12T01:42:57Z",
+      "updated_at": "2026-06-12T22:57:27Z",
+      "closed_at": "2026-06-12T22:57:27Z",
+      "labels": [
+        "module: tests",
+        "triaged",
+        "skipped",
+        "oncall: pt2",
+        "oncall: export",
+        "module: aotinductor",
+        "module: xpu",
+        "bot-triaged"
+      ],
+      "comments_count": 2,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "Platforms: xpu\n\nThis test was disabled because it is failing on main branch ([recent examples](https://torch-ci.com/failure?failureCaptures=%5B%22test%2Finductor%2Ftest_aot_inductor.py%3A%3AAOTInductorTestDualWrapper%3A%3Atest_aot_inductor_consts_cpp_build_xpu%22%5D)).\n\ncc @mruberry @chauhang @penguinwu @avikchaudhuri @zhxchen17 @tugsbayasgalan @angelayi @ydwu4 @desertfire @yushangdi @jataylo @iupaikov-amd @gujinghui @EikanWang @fengyuan14",
+      "comments": [
+        {
+          "author": "pytorch-bot[bot]",
+          "created_at": "2026-06-12T01:43:01Z",
+          "updated_at": "2026-06-12T01:43:01Z",
+          "body": "<!-- validation-comment-start --><body>Hello there! From the DISABLED prefix in this issue title, it looks like you are attempting to disable a test in PyTorch CI. The information I have parsed is below:\n\n* Test name: `test_aot_inductor_consts_cpp_build_xpu (__main__.AOTInductorTestDualWrapper)`\n* Platforms for which to skip the test: xpu\n* Disabled by `guangyey`\n\nWithin ~15 minutes, `test_aot_inductor_consts_cpp_build_xpu (__main__.AOTInductorTestDualWrapper)` will be disabled in PyTorch CI for these platforms: xpu. Please verify that your test name looks correct, e.g., `test_cuda_assert_async (__main__.TestCuda)`.\n\nTo modify the platforms list, please include a line in the issue body, like below. The default action will disable the test for all platforms if no platforms list is specified. \n```\nPlatforms: case-insensitive, list, of, platforms\n```\nWe currently support the following platforms: asan, dynamo, inductor, linux, mac, macos, rocm, slow, win, windows, xpu.\n\n\n### How to re-enable a test\nTo re-enable the test globally, close the issue. To re-enable a test for only a subset of platforms, remove the platforms from the list in the issue body. This may take some time to propagate. To re-enable a test only for a PR, put `Fixes #187127` in the PR body and rerun the test jobs. Note that if a test is flaky, it maybe be difficult to tell if the test is still flaky on the PR.\n</body><!-- validation-comment-end -->",
+          "url": "https://github.com/pytorch/pytorch/issues/187127#issuecomment-4686581465"
+        },
+        {
+          "author": "github-actions[bot]",
+          "created_at": "2026-06-12T22:57:26Z",
+          "updated_at": "2026-06-12T22:57:26Z",
+          "body": "I cannot find any mention of this test in the database for the past 7 days or in the logs for the past 5 commits on viable/strict.  Closing this issue as it is highly likely that this test has either been renamed or removed.  If you think this is a false positive, please feel free to re-open this issue.",
+          "url": "https://github.com/pytorch/pytorch/issues/187127#issuecomment-4696171528"
+        }
+      ]
+    },
+    {
+      "number": 130622,
+      "title": "PyTorch profiler produces a trace that is huge and unreadable by perfetto webui when `torch._dynamo` is imported within the code traced",
+      "url": "https://github.com/pytorch/pytorch/issues/130622",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/130622",
+      "state": "closed",
+      "author": "fxmarty",
+      "created_at": "2024-07-12T14:58:52Z",
+      "updated_at": "2026-06-12T19:38:53Z",
+      "closed_at": "2026-06-12T19:38:53Z",
+      "labels": [
+        "triaged",
+        "oncall: profiler",
+        "oncall: pt2"
+      ],
+      "comments_count": 5,
+      "matched_keywords": [
+        "dynamo"
+      ],
+      "body": "### 🐛 Describe the bug\n\nHi,\r\n\r\nAs per title.\r\n\r\n```python\r\nfrom torch.profiler import ProfilerActivity, profile\r\nimport torch\r\n\r\nwith profile(\r\n    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],\r\n    record_shapes=True,\r\n    profile_memory=True,\r\n    with_stack=True,\r\n) as prof:\r\n    import torch._dynamo as dynamo\r\n    # import torch\r\n    res = torch.rand(10, 20) @ torch.rand(20, 30)\r\n\r\nprof.export_chrome_trace(\"trace.json\")\r\n```\r\n\r\nOpening the resulting trace (which is huge, 300 MB) in perfetto gives\r\n```\r\nUI: https://ui.perfetto.dev/v45.0-f256f01ae\r\n\r\nFailure parsing JSON: unable to parse string\r\n\r\nTrace: not available (FILE). Provide repro steps.\r\nUA: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\r\nReferrer: \r\n```\r\n\r\nor with the legacy UI\r\n```\r\nWhile importing:\r\nSyntaxError: Bad control character in string literal in JSON at position 11948131 (line 322583 column 51)\r\n    at JSON.parse (<anonymous>)\r\n    at new TraceEventImporter (https://ui.perfetto.dev/v45.0-f256f01ae/assets/catapult_trace_viewer.js:6185:19)\r\n    at Import.createImporter_ (https://ui.perfetto.dev/v45.0-f256f01ae/assets/catapult_trace_viewer.js:2022:8)\r\n    at https://ui.perfetto.dev/v45.0-f256f01ae/assets/catapult_trace_viewer.js:2016:167\r\n    at Task.run (https://ui.perfetto.dev/v45.0-f256f01ae/assets/catapult_trace_viewer.js:3252:95)\r\n    at runAnother (https://ui.perfetto.dev/v45.0-f256f01ae/assets/catapult_trace_viewer.js:3255:371)\r\n    at runTask (https://ui.perfetto.dev/v45.0-f256f01ae/assets/catapult_trace_viewer.js:3019:57)\r\n    at processIdleWork (https://ui.perfetto.dev/v45.0-f256f01ae/assets/catapult_trace_viewer.js:3024:116)\r\n    at https://ui.perfetto.dev/v45.0-f256f01ae/assets/catapult_trace_viewer.js:3017:81\r\n```\r\n\r\nand indeed there is an entry with an illegal name in the `trace.json`:\r\n```\r\n  {\r\n    \"ph\": \"X\", \"cat\": \"python_function\", \"name\": \"\u0010£ù·\u001a(1): <module>\", \"pid\": 41202, \"tid\": 41202,\r\n    \"ts\": 1720796204239178, \"dur\": 7618,\r\n    \"args\": {\r\n      \"Python parent id\": 46055, \"Python id\": 46056, \"Ev Idx\": 46080\r\n    }\r\n  },\r\n```\r\n\r\nThis issue does not occur when `import torch` is being traced.\n\n### Versions\n\n```\r\nPyTorch version: 2.3.1+cu118\r\nIs debug build: False\r\nCUDA used to build PyTorch: 11.8\r\nROCM used to build PyTorch: N/A\r\n\r\nOS: Ubuntu 22.04.4 LTS (x86_64)\r\nGCC version: (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0\r\nClang version: 14.0.0-1ubuntu1.1\r\nCMake version: version 3.27.4\r\nLibc version: glibc-2.35\r\n\r\nPython version: 3.9.12 (main, Apr  5 2022, 06:56:58)  [GCC 7.5.0] (64-bit runtime)\r\nPython platform: Linux-5.15.0-113-generic-x86_64-with-glibc2.35\r\nIs CUDA available: True\r\nCUDA runtime version: 11.7.99\r\nCUDA_MODULE_LOADING set to: LAZY\r\nGPU models and configuration: GPU 0: NVIDIA GeForce RTX 3060 Laptop GPU\r\nNvidia driver version: 535.183.01\r\ncuDNN version: Probably one of the following:\r\n/usr/local/cuda-11.7/targets/x86_64-linux/lib/libcudnn.so.8.6.0\r\n/usr/local/cuda-11.7/targets/x86_64-linux/lib/libcudnn_adv_infer.so.8.6.0\r\n/usr/local/cuda-11.7/targets/x86_64-linux/lib/libcudnn_adv_train.so.8.6.0\r\n/usr/local/cuda-11.7/targets/x86_64-linux/lib/libcudnn_cnn_infer.so.8.6.0\r\n/usr/local/cuda-11.7/targets/x86_64-linux/lib/libcudnn_cnn_train.so.8.6.0\r\n/usr/local/cuda-11.7/targets/x86_64-linux/lib/libcudnn_ops_infer.so.8.6.0\r\n/usr/local/cuda-11.7/targets/x86_64-linux/lib/libcudnn_ops_train.so.8.6.0\r\nHIP runtime version: N/A\r\nMIOpen runtime version: N/A\r\nIs XNNPACK available: True\r\n\r\nCPU:\r\nArchitecture:                       x86_64\r\nCPU op-mode(s):                     32-bit, 64-bit\r\nAddress sizes:                      46 bits physical, 48 bits virtual\r\nByte Order:                         Little Endian\r\nCPU(s):                             20\r\nOn-line CPU(s) list:                0-19\r\nVendor ID:                          GenuineIntel\r\nModel name:                         12th Gen Intel(R) Core(TM) i7-1280P\r\nCPU family:                         6\r\nModel:                              154\r\nThread(s) per core:                 2\r\nCore(s) per socket:                 14\r\nSocket(s):                          1\r\nStepping:                           3\r\nCPU max MHz:                        4800,0000\r\nCPU min MHz:                        400,0000\r\nBogoMIPS:                           3993.60\r\nFlags:                              fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb cat_l2 cdp_l2 ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow vnmi flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdt_a rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect avx_vnni dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req umip pku ospke waitpkg gfni vaes vpclmulqdq tme rdpid movdiri movdir64b fsrm md_clear serialize pconfig arch_lbr flush_l1d arch_capabilities\r\nVirtualization:                     VT-x\r\nL1d cache:                          544 KiB (14 instances)\r\nL1i cache:                          704 KiB (14 instances)\r\nL2 cache:                           11,5 MiB (8 instances)\r\nL3 cache:                           24 MiB (1 instance)\r\nNUMA node(s):                       1\r\nNUMA node0 CPU(s):                  0-19\r\nVulnerability Gather data sampling: Not affected\r\nVulnerability Itlb multihit:        Not affected\r\nVulnerability L1tf:                 Not affected\r\nVulnerability Mds:                  Not affected\r\nVulnerability Meltdown:             Not affected\r\nVulnerability Mmio stale data:      Not affected\r\nVulnerability Retbleed:             Not affected\r\nVulnerability Spec rstack overflow: Not affected\r\nVulnerability Spec store bypass:    Mitigation; Speculative Store Bypass disabled via prctl and seccomp\r\nVulnerability Spectre v1:           Mitigation; usercopy/swapgs barriers and __user pointer sanitization\r\nVulnerability Spectre v2:           Mitigation; Enhanced IBRS; IBPB conditional; RSB filling; PBRSB-eIBRS SW sequence; BHI BHI_DIS_S\r\nVulnerability Srbds:                Not affected\r\nVulnerability Tsx async abort:      Not affected\r\n\r\nVersions of relevant libraries:\r\n[pip3] flake8==6.1.0\r\n[pip3] flake8-bugbear==23.3.23\r\n[pip3] flake8-comprehensions==3.12.0\r\n[pip3] flake8-executable==2.1.3\r\n[pip3] flake8-logging-format==0.9.0\r\n[pip3] flake8-pyi==23.3.1\r\n[pip3] flake8-simplify==0.19.3\r\n[pip3] lovely-numpy==0.2.11\r\n[pip3] mypy==1.9.0\r\n[pip3] mypy-extensions==1.0.0\r\n[pip3] numpy==1.26.0\r\n[pip3] onnx==1.16.0\r\n[pip3] onnx-graphsurgeon==0.3.12\r\n[pip3] onnx-simplifier==0.4.35\r\n[pip3] onnx-tool==0.9.0\r\n[pip3] onnxoptimizer==0.3.13\r\n[pip3] onnxruntime==1.17.1\r\n[pip3] onnxruntime-extensions==0.9.0\r\n[pip3] onnxruntime-gpu==1.17.1\r\n[pip3] onnxscript==0.1.0.dev20231010\r\n[pip3] open-clip-torch==2.23.0\r\n[pip3] optree==0.10.0\r\n[pip3] torch==2.3.1+cu118\r\n[pip3] torch-model-archiver==0.6.1\r\n[pip3] torch-tb-profiler==0.4.1\r\n[pip3] torch-workflow-archiver==0.2.5\r\n[pip3] torchaudio==2.3.1+cu118\r\n[pip3] torchinfo==1.7.0\r\n[pip3] torchserve==0.6.1\r\n[pip3] torchvision==0.18.1+cu118\r\n[pip3] torchviz==0.0.2\r\n[pip3] triton==2.3.1\r\n[conda] cudatoolkit               11.3.1               h2bc3f7f_2    anaconda\r\n[conda] lovely-numpy              0.2.11                   pypi_0    pypi\r\n[conda] numpy                     1.26.0                   pypi_0    pypi\r\n[conda] open-clip-torch           2.23.0                   pypi_0    pypi\r\n[conda] optree                    0.10.0                   pypi_0    pypi\r\n[conda] torch                     2.3.1+cu118              pypi_0    pypi\r\n[conda] torch-model-archiver      0.6.1                    pypi_0    pypi\r\n[conda] torch-tb-profiler         0.4.1                    pypi_0    pypi\r\n[conda] torch-workflow-archiver   0.2.5                    pypi_0    pypi\r\n[conda] torchaudio                2.3.1+cu118              pypi_0    pypi\r\n[conda] torchfix                  0.4.0                    pypi_0    pypi\r\n[conda] torchinfo                 1.7.0                    pypi_0    pypi\r\n[conda] torchserve                0.6.1                    pypi_0    pypi\r\n[conda] torchvision               0.18.1+cu118             pypi_0    pypi\r\n[conda] torchviz                  0.0.2                    pypi_0    pypi\r\n[conda] triton                    2.3.1                    pypi_0    pypi\r\n```\n\ncc @robieta @chaekit @aaronenyeshi @guotuofeng @guyang3532 @dzhulgakov @davidberard98 @briancoutinho @sraikund16 @sanrise @ezyang @anijain2305 @chauhang @penguinwu",
+      "comments": [
+        {
+          "author": "fxmarty",
+          "created_at": "2024-07-12T16:24:06Z",
+          "updated_at": "2024-07-12T16:24:06Z",
+          "body": "I am made aware by @gante that https://pytorch.org/docs/stable/generated/torch.compiler.is_compiling.html was added in PyTorch 2.3, which solves the issue instead of using `torch._dynamo.is_compiling()`.",
+          "url": "https://github.com/pytorch/pytorch/issues/130622#issuecomment-2225920540"
+        },
+        {
+          "author": "fxmarty",
+          "created_at": "2024-07-18T17:27:59Z",
+          "updated_at": "2024-07-18T17:29:58Z",
+          "body": "Actually, I don't think I should close this issue.\r\n\r\nI hit the same problem in an other context not using Transformers library, simply profiling a model that has been `torch.compile`'d.\r\n\r\nA workaround is to call compiled model's forward at least once before using the profiler.",
+          "url": "https://github.com/pytorch/pytorch/issues/130622#issuecomment-2237128943"
+        },
+        {
+          "author": "lhtin",
+          "created_at": "2025-03-27T09:06:53Z",
+          "updated_at": "2025-03-27T09:06:53Z",
+          "body": "Is there any solution now?",
+          "url": "https://github.com/pytorch/pytorch/issues/130622#issuecomment-2757262464"
+        },
+        {
+          "author": "garymm",
+          "created_at": "2025-03-31T23:29:57Z",
+          "updated_at": "2025-03-31T23:29:57Z",
+          "body": "I believe this is not specific to torch.compile.\nI'm not using it and I get this issue, with this string:\n```json\n\"ph\": \"X\", \"cat\": \"python_function\", \"name\": \"getpass.py(0): ^P<D6>^G<C4><FF>/\", \"pid\": 1554749, \"tid\": 1554749,\n```",
+          "url": "https://github.com/pytorch/pytorch/issues/130622#issuecomment-2767645044"
+        },
+        {
+          "author": "bringlein",
+          "created_at": "2025-04-01T13:25:02Z",
+          "updated_at": "2025-04-01T13:25:02Z",
+          "body": "I think it is related to https://github.com/pytorch/pytorch/issues/121219 ? ",
+          "url": "https://github.com/pytorch/pytorch/issues/130622#issuecomment-2769354300"
+        }
+      ]
+    },
+    {
+      "number": 187124,
+      "title": "DISABLED test_aot_inductor_consts_cpp_build_xpu (__main__.AOTInductorTestDualWrapper)",
+      "url": "https://github.com/pytorch/pytorch/issues/187124",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/187124",
+      "state": "closed",
+      "author": "guangyey",
+      "created_at": "2026-06-12T01:41:27Z",
+      "updated_at": "2026-06-12T19:21:46Z",
+      "closed_at": "2026-06-12T19:21:46Z",
+      "labels": [
+        "module: tests",
+        "triaged",
+        "skipped",
+        "oncall: pt2",
+        "oncall: export",
+        "module: aotinductor",
+        "module: xpu",
+        "bot-triaged"
+      ],
+      "comments_count": 2,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "Platforms: xpu\n\nThis test was disabled because it is failing on main branch ([recent examples](https://torch-ci.com/failure?failureCaptures=%5B%22test%2Finductor%2Ftest_aot_inductor.py%3A%3AAOTInductorTestDualWrapper%3A%3Atest_aot_inductor_consts_cpp_build_xpu%22%5D)).\n\ncc @mruberry @chauhang @penguinwu @avikchaudhuri @zhxchen17 @tugsbayasgalan @angelayi @ydwu4 @desertfire @yushangdi @jataylo @iupaikov-amd @gujinghui @EikanWang @fengyuan14",
+      "comments": [
+        {
+          "author": "pytorch-bot[bot]",
+          "created_at": "2026-06-12T01:41:32Z",
+          "updated_at": "2026-06-12T01:41:32Z",
+          "body": "<!-- validation-comment-start --><body>Hello there! From the DISABLED prefix in this issue title, it looks like you are attempting to disable a test in PyTorch CI. The information I have parsed is below:\n\n* Test name: `test_aot_inductor_consts_cpp_build_xpu (__main__.AOTInductorTestDualWrapper)`\n* Platforms for which to skip the test: xpu\n* Disabled by `guangyey`\n\nWithin ~15 minutes, `test_aot_inductor_consts_cpp_build_xpu (__main__.AOTInductorTestDualWrapper)` will be disabled in PyTorch CI for these platforms: xpu. Please verify that your test name looks correct, e.g., `test_cuda_assert_async (__main__.TestCuda)`.\n\nTo modify the platforms list, please include a line in the issue body, like below. The default action will disable the test for all platforms if no platforms list is specified. \n```\nPlatforms: case-insensitive, list, of, platforms\n```\nWe currently support the following platforms: asan, dynamo, inductor, linux, mac, macos, rocm, slow, win, windows, xpu.\n\n\n### How to re-enable a test\nTo re-enable the test globally, close the issue. To re-enable a test for only a subset of platforms, remove the platforms from the list in the issue body. This may take some time to propagate. To re-enable a test only for a PR, put `Fixes #187124` in the PR body and rerun the test jobs. Note that if a test is flaky, it maybe be difficult to tell if the test is still flaky on the PR.\n</body><!-- validation-comment-end -->",
+          "url": "https://github.com/pytorch/pytorch/issues/187124#issuecomment-4686574849"
+        },
+        {
+          "author": "guangyey",
+          "created_at": "2026-06-12T02:41:40Z",
+          "updated_at": "2026-06-12T02:41:40Z",
+          "body": "fix in https://github.com/pytorch/pytorch/pull/187137",
+          "url": "https://github.com/pytorch/pytorch/issues/187124#issuecomment-4686842198"
+        }
+      ]
+    },
+    {
+      "number": 185819,
+      "title": "Inductor pointwise operations slower with TMA than without",
+      "url": "https://github.com/pytorch/pytorch/issues/185819",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/185819",
+      "state": "open",
+      "author": "riccardofelluga",
+      "created_at": "2026-06-01T14:48:49Z",
+      "updated_at": "2026-06-12T16:38:43Z",
+      "closed_at": null,
+      "labels": [
+        "module: performance",
+        "triaged",
+        "enhancement",
+        "oncall: pt2",
+        "module: inductor",
+        "bot-triaged"
+      ],
+      "comments_count": 4,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "### 🐛 Describe the bug\n\nEnabling Inductor's generic pointwise TMA path with\n`torch._inductor.config.triton.use_tensor_descriptor=True` makes this simple\nSiLU kernel slower than the default `torch.compile` path on both B200 and H100.\n\nThis is due to descriptor setup overhead: the generic codegen path builds\nTMA tensor descriptors inside the generated Triton kernel, so each CTA pays\ndescriptor construction cost. For a simple memory-bound pointwise op, that\noverhead can outweigh any benefit from TMA loads.\n\n## Repro\n\n\n```python\n\"\"\"\nRun:\n  python repro_inductor_tma_slowdown.py\n\"\"\"\n\nimport statistics\n\nimport torch\nimport torch._inductor.config as inductor_config\n\n\nSHAPES = [\n    (4096, 4096),\n    (8192, 8192),\n    (16384, 16384),\n]\n\n\ndef compile_silu():\n    return torch.compile(\n        lambda x: torch.nn.functional.silu(x),\n        mode=\"max-autotune-no-cudagraphs\",\n        fullgraph=True,\n    )\n\n\ndef bench(fn, x, warmup=10, iters=100):\n    for _ in range(warmup):\n        fn(x)\n    torch.cuda.synchronize()\n\n    times_us = []\n    for _ in range(iters):\n        start = torch.cuda.Event(enable_timing=True)\n        end = torch.cuda.Event(enable_timing=True)\n        start.record()\n        fn(x)\n        end.record()\n        torch.cuda.synchronize()\n        times_us.append(start.elapsed_time(end) * 1000)\n    return statistics.median(times_us)\n\n\nif not torch.cuda.is_available():\n    raise SystemExit(\"CUDA is required\")\n\nprint(f\"PyTorch: {torch.__version__}\")\nprint(f\"CUDA: {torch.version.cuda}\")\nprint()\nprint(\"| Shape | default compile us | compile + TMA us | slowdown |\")\nprint(\"|---|---:|---:|---:|\")\n\nfor shape in SHAPES:\n    x = torch.randn(shape, device=\"cuda\", dtype=torch.bfloat16)\n\n    torch._dynamo.reset()\n    inductor_config.triton.use_tensor_descriptor = False\n    inductor_config.assume_aligned_inputs = False\n    default = compile_silu()\n    default(x)\n    default_us = bench(default, x)\n\n    torch._dynamo.reset()\n    inductor_config.triton.use_tensor_descriptor = True\n    inductor_config.assume_aligned_inputs = True\n    tma = compile_silu()\n    tma(x)\n    tma_us = bench(tma, x)\n    slowdown = tma_us / default_us\n\n    m, n = shape\n    print(f\"| {m}x{n} | {default_us:.1f} | {tma_us:.1f} | {slowdown:.2f}x |\")\n\n```\n\nThe script compares the same bf16 SiLU workload in two modes:\n\n1. Default `torch.compile`\n2. `torch.compile` with `triton.use_tensor_descriptor=True`\n\nIt resets Dynamo before compiling each mode so the two paths do not share a\ncached compiled graph.\n\n## Results\n\n### B200\n\n| Shape | default compile us | compile + TMA us | slowdown |\n|---|---:|---:|---:|\n| 4096x4096 | 56.1 | 78.8 | 1.41x |\n| 8192x8192 | 87.5 | 141.4 | 1.62x |\n| 16384x16384 | 220.0 | 358.4 | 1.63x |\n\n### H100\n\n| Shape | default compile us | compile + TMA us | slowdown |\n|---|---:|---:|---:|\n| 4096x4096 | 52.4 | 72.3 | 1.38x |\n| 8192x8192 | 117.8 | 140.2 | 1.19x |\n| 16384x16384 | 380.9 | 433.9 | 1.14x |\n\n## Proposed Direction\n\nThe TMA descriptor should be created once on the host and passed into the\nkernel, instead of being rebuilt inside every CTA. Inductor already has\nhost-side TMA descriptor infrastructure for template paths; the gap is wiring\nthat approach into the generic pointwise codegen path.\n\n\n### Error logs\n\n_No response_\n\n### Versions\n\nCollecting environment information...\nPyTorch version: 2.13.0\nIs debug build: False\nCUDA used to build PyTorch: 13.2\n\nOS: Ubuntu 26.04 LTS (x86_64)\nGCC version: (Ubuntu 15.2.0-16ubuntu1) 15.2.0\nClang version: 21.1.8 (6ubuntu1)\nCMake version: version 4.3.2\nLibc version: glibc-2.43\n\nPython version: 3.14.4 (main, Apr  8 2026, 04:02:31) [GCC 15.2.0] (64-bit runtime)\nPython platform: Linux-7.0.0-22-generic-x86_64-with-glibc2.43\nIs CUDA available: True\nCUDA runtime version: 13.2\n\ncc @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @aakhundov @coconutruben @jataylo",
+      "comments": [
+        {
+          "author": "jananisriram",
+          "created_at": "2026-06-02T08:14:49Z",
+          "updated_at": "2026-06-02T08:14:49Z",
+          "body": "Thanks for flagging this, and the PR looks like a great first step! I'm working on adding host-side TMA support for the Triton GEMM Inductor templates and intend to base my work off your PR.",
+          "url": "https://github.com/pytorch/pytorch/issues/185819#issuecomment-4600111087"
+        },
+        {
+          "author": "riccardofelluga",
+          "created_at": "2026-06-02T11:25:09Z",
+          "updated_at": "2026-06-02T11:25:09Z",
+          "body": "Hi @jananisriram, do you have a related PR or draft PR?",
+          "url": "https://github.com/pytorch/pytorch/issues/185819#issuecomment-4601902446"
+        },
+        {
+          "author": "jananisriram",
+          "created_at": "2026-06-09T01:54:59Z",
+          "updated_at": "2026-06-12T16:38:43Z",
+          "body": "@riccardofelluga ~~just opened at PR at https://github.com/pytorch/pytorch/pull/186752!~~",
+          "url": "https://github.com/pytorch/pytorch/issues/185819#issuecomment-4655290303"
+        },
+        {
+          "author": "jananisriram",
+          "created_at": "2026-06-12T16:37:52Z",
+          "updated_at": "2026-06-12T16:37:52Z",
+          "body": "@riccardofelluga I've opened a PR for host-side TMA for pointwise kernels (https://github.com/pytorch/pytorch/pull/186904), which takes inspiration from https://github.com/pytorch/pytorch/pull/185825 but adds more robust edge case checks and some performance improvements. I'll rebase https://github.com/pytorch/pytorch/pull/186752 (host-side TMA for GEMM templates) and https://github.com/pytorch/pytorch/pull/186756 (host-side TMA epilogue store) onto this new implementation.",
+          "url": "https://github.com/pytorch/pytorch/issues/185819#issuecomment-4693256706"
+        }
+      ]
+    },
+    {
+      "number": 187173,
+      "title": "[Inductor] max_unpool2d backward produces incorrect output strides on CPU",
+      "url": "https://github.com/pytorch/pytorch/issues/187173",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/187173",
+      "state": "open",
+      "author": "Arindamsamanta2004",
+      "created_at": "2026-06-12T12:09:20Z",
+      "updated_at": "2026-06-12T12:12:39Z",
+      "closed_at": null,
+      "labels": [
+        "module: cpu",
+        "triaged",
+        "module: memory format",
+        "oncall: pt2",
+        "module: decompositions",
+        "module: inductor",
+        "oncall: cpu inductor",
+        "bot-triaged"
+      ],
+      "comments_count": 1,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "## Bug\n\nThe `_max_unpoolnd` decomposition used by Inductor always produces contiguous output, but the native CPU kernel (`aten/src/ATen/native/MaxUnpooling.cpp`) preserves the input's memory format via `suggest_memory_format()`. When the input is channels-last, Inductor outputs contiguous strides instead of channels-last strides, causing `Significant strides mismatch` assertion failures.\n\n## Tests affected\n\n```\ntest/inductor/test_torchinductor_opinfo.py::TestInductorOpInfoCPU::test_comprehensive_nn_functional_max_unpool2d_grad_cpu_float32\ntest/inductor/test_torchinductor_opinfo.py::TestInductorOpInfoCPU::test_comprehensive_nn_functional_max_unpool2d_grad_cpu_float64\n```\n\n## Repro\n\n```bash\npython test/inductor/test_torchinductor_opinfo.py TestInductorOpInfoCPU.test_comprehensive_nn_functional_max_unpool2d_grad_cpu_float32 -v\n```\n\n### Minimal standalone repro\n\n```python\nimport torch\nimport torch.nn.functional as F\n\npool_input = torch.randn(1, 2, 3, 6).to(memory_format=torch.channels_last)\npooled, indices = F.max_pool2d(pool_input, kernel_size=3, padding=1, return_indices=True)\n\neager = F.max_unpool2d(pooled, indices, kernel_size=3, stride=3, padding=1, output_size=(1, 2, 3, 6))\n\n@torch.compile\ndef fn(x, idx):\n    return F.max_unpool2d(x, idx, kernel_size=3, stride=3, padding=1, output_size=(1, 2, 3, 6))\n\ncompiled = fn(pooled, indices)\n\nprint(f\"eager strides:    {eager.stride()}\")    # (36, 1, 12, 2) — channels-last\nprint(f\"compiled strides: {compiled.stride()}\")  # (36, 18, 6, 1) — contiguous (WRONG)\nassert eager.stride() == compiled.stride()       # Fails\n```\n\n## Error\n\n```\nAssertionError: Significant strides mismatch at leaf 0, dim 1:\n  (36, 18, 6, 1) != (36, 1, 12, 2) for shape torch.Size([1, 2, 3, 6])\n```\n\n- Compiled (Inductor): `(36, 18, 6, 1)` — contiguous\n- Eager (expected):     `(36, 1, 12, 2)` — channels-last\n\nValues are correct; only the stride layout is wrong.\n\n## Root cause\n\nThe `_max_unpoolnd` decomposition in `torch/_decomp/decompositions.py` constructs the output via:\n\n```python\noutput = self.new_zeros(output_shape)             # always contiguous\nreturn aten._unsafe_index_put(\n    output.reshape(-1), [indices_flat], ...\n).view(output.shape)                              # also contiguous\n```\n\nThe native CPU kernel does:\n\n```cpp\nauto memory_format = self_.suggest_memory_format();\noutput.resize_({numBatch, numChannels, oheight, owidth}, memory_format);\n```\n\nThe decomposition ignores the input's memory format entirely.\n\nNote: the CUDA native kernel (`MaxUnpooling.cu`) always produces contiguous output (no `memory_format` arg to `resize_()`), so this is a CPU-only mismatch.\n\n## Fix\n\nPreserve `suggest_memory_format()` in `_max_unpoolnd` (`torch/_decomp/decompositions.py`), CPU-only to match native kernel behavior.\n\n## Versions\n\n- PyTorch: main (`b71eaf9`)\n- Python: 3.12, Linux x86_64\n\ncc @jgong5 @mingfeima @XiaobingSuper @sanchitintel @ashokei @jingxu10 @aditew01 @jamesr66a @voznesenskym @penguinwu @EikanWang @Guobing-Chen @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @chauhang @aakhundov @coconutruben @jataylo @jansel @eellison @isuruf\n",
+      "comments": [
+        {
+          "author": "Arindamsamanta2004",
+          "created_at": "2026-06-12T12:10:13Z",
+          "updated_at": "2026-06-12T12:10:13Z",
+          "body": "I am working on it.",
+          "url": "https://github.com/pytorch/pytorch/issues/187173#issuecomment-4691137759"
+        }
+      ]
+    },
+    {
+      "number": 187170,
+      "title": "[inductor] test_comprehensive_addbmm_cpu_float16 fails due to overly strict float32 reference comparison",
+      "url": "https://github.com/pytorch/pytorch/issues/187170",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/187170",
+      "state": "open",
+      "author": "RiyaP2508",
+      "created_at": "2026-06-12T11:26:37Z",
+      "updated_at": "2026-06-12T11:36:45Z",
+      "closed_at": null,
+      "labels": [
+        "module: tests",
+        "triaged",
+        "module: half",
+        "oncall: pt2",
+        "module: inductor",
+        "bot-triaged"
+      ],
+      "comments_count": 0,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "## 🐛 Describe the bug\n\n`test_comprehensive_addbmm_cpu_float16` in `test/inductor/test_torchinductor_opinfo.py` fails consistently with a numerical precision mismatch.\n\n## Error\nAssertionError: Tensor-likes are not close!\n\nMismatched elements: 1 / 50 (2.0%) Greatest absolute difference: 0.01904296875 at index (3, 3) (up to 0.006 allowed) Greatest relative difference: 0.141845703125 at index (3, 3) (up to 0.01 allowed)\n## Root Cause\n\nThe test uses `reference_in_float=True` (default on CPU), which:\n1. Runs `addbmm` with inputs upcast to float32\n2. Accumulates all 5 batch `addmm_` iterations in full float32 precision\n3. Downcasts to float16 once at the end\n\nThe compiled path runs the same ATen kernel (`make_fallback`) with float16 inputs, which rounds back to float16 storage after each of the 5 batch iterations. This accumulated intermediate rounding produces a deterministic ~0.019 difference — exceeding the tolerance of 0.006.\n\nThis is **not** an Inductor bug — the compiled output matches eager float16 exactly, since both use the same ATen `addbmm` kernel via `make_fallback`.\n\n## To reproduce\n\n```\n```bash\nPYTORCH_OPINFO_SAMPLE_INPUT_INDEX=1 python test/inductor/test_torchinductor_opinfo.py \\\n    TestInductorOpInfoCPU.test_comprehensive_addbmm_cpu_float16\n```\n\n\n\n\n**Triggering input:**\n```\nSampleInput(\n    input=Tensor[size=(1,), dtype=float16],   # scalar, broadcast\n    args=[Tensor[size=(5, 5, 5), dtype=float16], Tensor[size=(5, 5, 10), dtype=float16]],\n    kwargs={'beta': 1, 'alpha': 1},\n    broadcasts_input=True\n)\n```\n**Expected Fix**\nSet reference_in_float=False for addbmm f16 on CPU in inductor_override_kwargs[\"cpu\"], so the test compares compiled f16 against eager f16 directly (same kernel → identical results).\n\n**Versions**\nPyTorch: main (nightly)\nPlatform: Linux CPU\nTest config: sgpu\nPython: 3.12\n",
+      "comments": []
+    },
+    {
+      "number": 187158,
+      "title": "[Inductor] AssertionError: Unregistered range symbol 'yindex' in TMA template epilogue fusion",
+      "url": "https://github.com/pytorch/pytorch/issues/187158",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/187158",
+      "state": "open",
+      "author": "kumartanmay-28",
+      "created_at": "2026-06-12T08:11:05Z",
+      "updated_at": "2026-06-12T08:50:38Z",
+      "closed_at": null,
+      "labels": [
+        "triaged",
+        "oncall: pt2",
+        "module: inductor",
+        "bot-triaged"
+      ],
+      "comments_count": 0,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "### 🐛 Describe the bug\n\nPyTorch Inductor's TMA persistent template crashes with AssertionError when attempting to fuse epilogue operations (e.g., bias addition) with tma_store enabled. The error occurs because the 'yindex' symbol used in epilogue fusion is not registered in the kernel's range_tree_nodes dictionary.\n\n  ## Prerequisites\n  - CUDA GPU with TMA support (sm_90+)\n  - Triton with device-side TMA API\n  - Config: triton.enable_persistent_tma_matmul=1, triton.enable_template_tma_store=True\n\n  ## Steps to Reproduce\n  1. Run any test from test_max_autotune_addmm_persistent_tma_* with tma_store=True\n  2. Execute test with TMA persistent template enabled\n  3. Template attempts to fuse bias addition in epilogue\n\n  Expected Behavior\n\n  - TMA persistent template should successfully generate code with epilogue fusion\n  - Bias tensor should be loaded and fused into the output operation\n  - Test should pass with optimized TMA store kernel\n\n  Actual Behavior\n\n  Test fails with:\n  AssertionError: Unregistered range symbol: yindex\n    File \"torch/_inductor/codegen/triton.py\", line 305, in get_block_shape\n      assert node is not None, f\"Unregistered range symbol: {var.name}\"\n\n\n### Versions\n\nPyTorch version: 2.13.0a0+gite094363\nIs debug build: False\nCUDA used to build PyTorch: 13.0\nROCM used to build PyTorch: N/A\n\nOS: Red Hat Enterprise Linux 9.6 (Plow) (x86_64)\nGCC version: (GCC) 11.5.0 20240719 (Red Hat 11.5.0-14)\nClang version: Could not collect\nCMake version: version 3.31.6\nLibc version: glibc-2.34\n\nPython version: 3.12.11 | packaged by conda-forge | (main, Jun  4 2025, 14:45:31) [GCC 13.3.0] (64-bit runtime)\nPython platform: Linux-5.14.0-687.el9.x86_64-x86_64-with-glibc2.34\nIs CUDA available: True\nCUDA runtime version: 13.0.88\nCUDA_MODULE_LOADING set to: \nGPU models and configuration: GPU 0: NVIDIA H200\nNvidia driver version: 595.45.04\ncuDNN version: Could not collect\nIs XPU available: False\nHIP runtime version: N/A\nMIOpen runtime version: N/A\nIs XNNPACK available: False\nCaching allocator config: N/A\n\nCPU:\nArchitecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           46 bits physical, 57 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  160\nOn-line CPU(s) list:                     0-159\nVendor ID:                               GenuineIntel\nModel name:                              Intel Xeon Processor (SapphireRapids)\nCPU family:                              6\nModel:                                   143\nThread(s) per core:                      2\nCore(s) per socket:                      40\nSocket(s):                               2\nStepping:                                4\nBogoMIPS:                                4200.00\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology cpuid tsc_known_freq pni pclmulqdq vmx ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch cpuid_fault ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 wbnoinvd arat vnmi avx512vbmi umip pku ospke waitpkg avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq la57 rdpid bus_lock_detect cldemote movdiri movdir64b fsrm md_clear serialize tsxldtrk amx_bf16 avx512_fp16 amx_tile amx_int8 arch_capabilities\nVirtualization:                          VT-x\nHypervisor vendor:                       KVM\nVirtualization type:                     full\nL1d cache:                               5 MiB (160 instances)\nL1i cache:                               5 MiB (160 instances)\nL2 cache:                                320 MiB (80 instances)\nL3 cache:                                32 MiB (2 instances)\nNUMA node(s):                            2\nNUMA node0 CPU(s):                       0-79\nNUMA node1 CPU(s):                       80-159\nVulnerability Gather data sampling:      Not affected\nVulnerability Indirect target selection: Mitigation; Aligned branch/return thunks\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI SW loop, KVM SW loop\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected\n\nVersions of relevant libraries:\n[pip3] intel-cmplr-lib-ur==2026.0.0\n[pip3] intel-openmp==2026.0.0\n[pip3] mkl-include==2024.2.0\n[pip3] mkl-static==2024.2.0\n[pip3] mypy==1.16.0\n[pip3] mypy_extensions==1.1.0\n[pip3] numpy==1.26.2\n[pip3] nvidia-cuda-cupti==13.3.35\n[pip3] onnx==1.21.0\n[pip3] onnx-ir==0.1.16\n[pip3] onnxscript==0.6.2\n[pip3] optree==0.13.0\n[pip3] tbb==2021.13.1\n[pip3] tcmlib==1.5.0\n[pip3] torch==2.13.0a0+gite094363\n[pip3] triton==3.7.0\n[pip3] umf==1.1.0\n[conda] cuda-nvrtc                   13.0.88              hecca717_0            conda-forge\n[conda] cudnn                        9.22.0.52            hf3c2b3b_0            nvidia\n[conda] intel-cmplr-lib-ur           2026.0.0             pypi_0                pypi\n[conda] intel-openmp                 2026.0.0             pypi_0                pypi\n[conda] libcublas                    13.1.1.3             h676940d_0            conda-forge\n[conda] libcudnn                     9.22.0.52            h0c24e3a_0            nvidia\n[conda] libcudnn-dev                 9.22.0.52            hf3c2b3b_0            nvidia\n[conda] mkl-include                  2024.2.0             pypi_0                pypi\n[conda] mkl-static                   2024.2.0             pypi_0                pypi\n[conda] numpy                        1.26.2               pypi_0                pypi\n[conda] nvidia-cuda-cupti            13.3.35              pypi_0                pypi\n[conda] optree                       0.13.0               pypi_0                pypi\n[conda] tbb                          2021.13.1            pypi_0                pypi\n[conda] tcmlib                       1.5.0                pypi_0                pypi\n[conda] torch                        2.13.0a0+gite094363  pypi_0                pypi\n[conda] triton                       3.7.0                pypi_0                pypi\n[conda] umf                          1.1.0                pypi_0                pypi\n\n\ncc @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @aakhundov @coconutruben @jataylo",
+      "comments": []
+    }
+  ]
+}
