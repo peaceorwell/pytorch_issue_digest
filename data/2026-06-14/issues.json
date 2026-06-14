@@ -1,0 +1,171 @@
+{
+  "metadata": {
+    "repo": "pytorch/pytorch",
+    "keywords": [
+      "compile",
+      "inductor",
+      "dynamo"
+    ],
+    "generated_at": "2026-06-14T04:11:40.416810+00:00",
+    "since": "2026-06-13T04:11:40.416810+00:00",
+    "lookback_hours": 24.0,
+    "timezone": "Asia/Shanghai",
+    "report_date": "2026-06-14",
+    "issue_count": 4
+  },
+  "issues": [
+    {
+      "number": 185610,
+      "title": "[Inductor] Correctness discrepancy in torch.minimum with signed zeros (-0.0 vs 0.0) on CUDA (bfloat16)",
+      "url": "https://github.com/pytorch/pytorch/issues/185610",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/185610",
+      "state": "closed",
+      "author": "xyt66665000",
+      "created_at": "2026-05-29T08:28:44Z",
+      "updated_at": "2026-06-13T21:26:52Z",
+      "closed_at": "2026-06-13T21:26:51Z",
+      "labels": [
+        "module: cuda",
+        "triaged",
+        "module: bfloat16",
+        "module: correctness (silent)",
+        "module: edge cases",
+        "oncall: pt2",
+        "module: inductor",
+        "bot-triaged"
+      ],
+      "comments_count": 1,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "### 🐛 Describe the bug\n\nThere is a correctness discrepancy between eager mode and `torch.compile` (Inductor) when calling `torch.minimum` with `-0.0` and `0.0` using `bfloat16` tensors on CUDA. \n\nEager mode preserves the negative sign and returns `-0.0` (`0x8000`), whereas `torch.compile` returns `0.0` (`0x0000`).\n\n### Reproduction Script\n```python\nimport torch\n\ndef fn(x, y):\n    return torch.minimum(x, y)\n\nx = torch.tensor([-0.0], dtype=torch.bfloat16, device=\"cuda\")\ny = torch.tensor([0.0], dtype=torch.bfloat16, device=\"cuda\")\n\neager_out = fn(x, y)\ninductor_fn = torch.compile(fn)\ninductor_out = inductor_fn(x, y)\n\nprint(\"--- Output ---\")\nprint(f\"Eager:    {eager_out.item()} (Hex: {eager_out.view(torch.int16).item() & 0xFFFF:#06x})\")\nprint(f\"Inductor: {inductor_out.item()}  (Hex: {inductor_out.view(torch.int16).item() & 0xFFFF:#06x})\")\n```\n\n### Actual Output\n```text\n(torch-nightly) xyt19@Oasis:/tmp$ python bug.py\n--- Output ---\nEager:    -0.0 (Hex: 0x8000)\nInductor: 0.0  (Hex: 0x0000)\n```\n\n### Expected Behavior\n`torch.compile` should match the eager mode output and return `-0.0` (Hex: `0x8000`).\n\n\n### Versions\n\nPyTorch version: 2.13.0.dev20260521+cu130\nIs debug build: False\nCUDA used to build PyTorch: 13.0\nROCM used to build PyTorch: N/A\n\nOS: Ubuntu 24.04.4 LTS (x86_64)\nGCC version: (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0\nClang version: 18.1.3 (1ubuntu1)\nCMake version: version 3.28.3\nLibc version: glibc-2.39\n\nPython version: 3.10.20 (main, Mar 11 2026, 17:46:40) [GCC 14.3.0] (64-bit runtime)\nPython platform: Linux-5.15.167.4-microsoft-standard-WSL2-x86_64-with-glibc2.39\nIs CUDA available: True\nCUDA runtime version: 12.0.140\nNvidia driver version: 596.49\ncuDNN version: Probably one of the following:\n/usr/lib/x86_64-linux-gnu/libcudnn.so.9.21.1\n/usr/lib/x86_64-linux-gnu/libcudnn_adv.so.9.21.1\n/usr/lib/x86_64-linux-gnu/libcudnn_cnn.so.9.21.1\n/usr/lib/x86_64-linux-gnu/libcudnn_engines_precompiled.so.9.21.1\n/usr/lib/x86_64-linux-gnu/libcudnn_engines_runtime_compiled.so.9.21.1\n/usr/lib/x86_64-linux-gnu/libcudnn_engines_tensor_ir.so.9.21.1\n/usr/lib/x86_64-linux-gnu/libcudnn_graph.so.9.21.1\n/usr/lib/x86_64-linux-gnu/libcudnn_heuristic.so.9.21.1\n/usr/lib/x86_64-linux-gnu/libcudnn_ops.so.9.21.1\nIs XPU available: False\nHIP runtime version: N/A\nMIOpen runtime version: N/A\nIs XNNPACK available: True\nCaching allocator config: N/A\nersions of relevant libraries:\n[pip3] numpy==2.2.6\n[pip3] nvidia-cublas==13.1.1.3\n[pip3] nvidia-cuda-cupti==13.0.85\n[pip3] nvidia-cuda-nvrtc==13.0.88\n[pip3] nvidia-cuda-runtime==13.0.96\n[pip3] nvidia-cudnn-cu13==9.20.0.48\n[pip3] nvidia-cufft==12.0.0.61\n[pip3] nvidia-curand==10.4.0.35\n[pip3] nvidia-cusolver==12.0.4.66\n[pip3] nvidia-cusparse==12.6.3.3\n[pip3] nvidia-cusparselt-cu13==0.8.1\n[pip3] nvidia-nccl-cu13==2.29.7\n[pip3] nvidia-nvjitlink==13.0.88\n[pip3] nvidia-nvtx==13.0.85\n[pip3] torch==2.13.0.dev20260521+cu130\n[pip3] torchaudio==2.11.0.dev20260525+cu130\n[pip3] torchvision==0.28.0.dev20260525+cu130\n[pip3] triton==3.7.0+git88b227e2\n[conda] numpy 2.2.6 pypi_0 pypi\n[conda] nvidia-cublas 13.1.1.3 pypi_0 pypi\n[conda] nvidia-cuda-cupti 13.0.85 pypi_0 pypi\n[conda] nvidia-cuda-nvrtc 13.0.88 pypi_0 pypi\n[conda] nvidia-cuda-runtime 13.0.96 pypi_0 pypi\n[conda] nvidia-cudnn-cu13 9.20.0.48 pypi_0 pypi\n[conda] nvidia-cufft 12.0.0.61 pypi_0 pypi\n[conda] nvidia-curand 10.4.0.35 pypi_0 pypi\n[conda] nvidia-cusolver 12.0.4.66 pypi_0 pypi\n[conda] nvidia-cusparse 12.6.3.3 pypi_0 pypi\n[conda] nvidia-cusparselt-cu13 0.8.1 pypi_0 pypi\n[conda] nvidia-nccl-cu13 2.29.7 pypi_0 pypi\n[conda] nvidia-nvjitlink 13.0.88 pypi_0 pypi\n[conda] nvidia-nvtx 13.0.85 pypi_0 pypi\n[conda] torch 2.13.0.dev20260521+cu130 pypi_0 pypi\n[conda] torchaudio 2.11.0.dev20260525+cu130 pypi_0 pypi\n[conda] torchvision 0.28.0.dev20260525+cu130 pypi_0 pypi\n[conda] triton 3.7.0+git88b227e2 pypi_0 pypi\n\ncc @ptrblck @msaroufim @eqy @tinglvv @nWEIdia @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @aakhundov @coconutruben @jataylo",
+      "comments": [
+        {
+          "author": "zou3519",
+          "created_at": "2026-06-08T17:12:54Z",
+          "updated_at": "2026-06-08T17:12:54Z",
+          "body": "leaving for Inductor team to figure out if this is hi-pri, triage review was unsure because this is an edge case. cc @eellison ",
+          "url": "https://github.com/pytorch/pytorch/issues/185610#issuecomment-4651496135"
+        }
+      ]
+    },
+    {
+      "number": 173123,
+      "title": "[DTensor] Gradient of unused output becomes plain torch.Tensor in backward, causing type mismatch with torch.compile",
+      "url": "https://github.com/pytorch/pytorch/issues/173123",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/173123",
+      "state": "open",
+      "author": "fegin",
+      "created_at": "2026-01-23T00:24:07Z",
+      "updated_at": "2026-06-13T16:38:34Z",
+      "closed_at": null,
+      "labels": [
+        "oncall: distributed",
+        "triaged",
+        "module: dtensor",
+        "bot-triaged",
+        "oncall: distributed parallelisms",
+        "ptd-bot-triaged"
+      ],
+      "comments_count": 6,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "### 🐛 Describe the bug\n\n**Summary**\n\nWhen an op with DTensor inputs returns multiple DTensor outputs and one output is unused in the downstream computation, the gradient for that unused output is returned as a plain torch.Tensor of zeros instead of a DTensor. This causes a type mismatch during the backward pass when combined with torch.compile.\n\n**Reproduce**\n\nMini repro: https://gist.github.com/fegin/ac5ded1a7bdb8686a94357043ef74b50\n\nCommand: `torchrun --nproc-per-node 4 dtensor_unused_output.py`\n\nError message:\n```\n[rank0]:   File \"/data/users/chienchin/mywork3/pytorch/torch/_functorch/_aot_autograd/runtime_wrappers.py\", line 2526, in backward\n[rank0]:     all_args = _backward_prologue_functional(\n[rank0]:   File \"/data/users/chienchin/mywork3/pytorch/torch/_functorch/_aot_autograd/runtime_wrappers.py\", line 1972, in _backward_prologue_functional\n[rank0]:     flat_processed_tangents = list(\n[rank0]:   File \"/data/users/chienchin/mywork3/pytorch/torch/_functorch/_aot_autograd/runtime_wrappers.py\", line 1975, in <genexpr>\n[rank0]:     AOTDispatchAutograd.process_runtime_tangent(\n[rank0]:   File \"/data/users/chienchin/mywork3/pytorch/torch/_functorch/_aot_autograd/runtime_wrappers.py\", line 2238, in process_runtime_tangent\n[rank0]:     raise RuntimeError(\n[rank0]: RuntimeError:\n[rank0]: During the backward, we encountered a tensor subclass where we guessed its\n[rank0]: metadata incorrectly.\n\n[rank0]: Expected metadata: (DTensorSpec(mesh=DeviceMesh((dp=4), 'cuda', stride=(1,)), placements=(Shard(dim=0),), tensor_meta=TensorMeta(shape=torch.Size([16, 16]), stride=(16, 1), dtype=torch.float32), shard_order=(ShardOrderEntry(tensor_dim=0, mesh_dims=(0,)),)), False), expected type: <class 'torch.distributed.tensor.DTensor'>\n\n[rank0]: Runtime metadata: None, runtime type: <class 'torch.Tensor'>\n\n[rank0]: shape: torch.Size([16, 16])\n[rank0]: To fix this, your tensor subclass must implement the dunder method __force_to_same_metadata__.\n```\n\n### Versions\n\nnightly\n\ncc @awgu @wanchaol @fduwjj @wz337 @wconstab @d4l3k @pragupta @msaroufim @dcci @aditvenk @weifengpy @tianyu-l @XilunWu @SherlockNoMad @ppwwyyxx @H-Huang",
+      "comments": [
+        {
+          "author": "fegin",
+          "created_at": "2026-01-23T00:24:19Z",
+          "updated_at": "2026-01-23T00:24:19Z",
+          "body": "cc., @bdhirsh ",
+          "url": "https://github.com/pytorch/pytorch/issues/173123#issuecomment-3787536302"
+        },
+        {
+          "author": "arkadip-maitra",
+          "created_at": "2026-01-23T04:20:15Z",
+          "updated_at": "2026-01-23T12:26:26Z",
+          "body": "raised a pr",
+          "url": "https://github.com/pytorch/pytorch/issues/173123#issuecomment-3788139470"
+        },
+        {
+          "author": "bdhirsh",
+          "created_at": "2026-01-23T15:59:19Z",
+          "updated_at": "2026-01-23T15:59:19Z",
+          "body": "So the main problem is this is a shortcoming of the fact that compile tries really hard to support partial graphs + the fact that we trace out a backward graph \"ahead-of-time\". We need to choose between raising a hard error, or silently having worse performance.\n\nIn this particular repro, the error is coming up because:\n\n(1) The repro does some forward compute involving `self.weight2`, but the output of that compute is **not** used to compute a loss. So we never actually need to compute any gradients for `self.weight2`\n\n(2) there are a few graph breaks, due to the prints in `MultiOutputOp.backward`\n\n(3) this causes `torch.compile` to generate a few partial graphs, instead of one larger graph of the model ([tlparse](https://manifold.edge.x2p.facebook.net/v0/read/tree/logs/hirsheybar/eaf04aa3-0089-4c46-9641-9b583cecacad/custom/rank_0/index.html?bucketName=tlparse_reports&apiKey=tlparse_reports-key&withPayload=1&timeoutMsec=10000#[0/0])).\n\n(4) if you look at the generated backward graph for `[1/0]` ([link](https://manifold.edge.x2p.facebook.net/v0/read/tree/logs/hirsheybar/eaf04aa3-0089-4c46-9641-9b583cecacad/custom/rank_0/-_0_0_1/aot_backward_graph_10.txt?bucketName=tlparse_reports&apiKey=tlparse_reports-key&withPayload=1&timeoutMsec=10000)) `torch.compile` assumes that we need to compute gradients for **both** `self.weight1` and `self.weight2`, which requires running an extra matmul.\n\nRunning \"additional matmuls\", or \"additional collectives\" in the backward seems to me like a pretty unacceptable perf hit. The general way to avoid this performance hit is to:\n\n(1) fix graph breaks\n\n(2) ensure that if you return multiple outputs from a compiled region, then if you don't actually plan on computing gradients for all of the outputs, you should `.detach()` any outputs that you don't want to compute gradients for.",
+          "url": "https://github.com/pytorch/pytorch/issues/173123#issuecomment-3790950961"
+        },
+        {
+          "author": "bdhirsh",
+          "created_at": "2026-01-23T16:04:23Z",
+          "updated_at": "2026-01-23T16:04:23Z",
+          "body": "My tentative vote would be to make this error more informative, rather than removing it (and creating performance cliffs). I have an issue here about improving the error message: https://github.com/pytorch/pytorch/issues/172556",
+          "url": "https://github.com/pytorch/pytorch/issues/173123#issuecomment-3790974571"
+        },
+        {
+          "author": "fegin",
+          "created_at": "2026-01-23T18:32:40Z",
+          "updated_at": "2026-01-23T18:32:40Z",
+          "body": "This is not a torch.compile issue. torch.compile just surface the error in a different way and is confusing. But the bug does exist even without torch.compile. We will get mix a torch.Tensor and DTensor error due to grad_output_2 being a plain Tensor. ",
+          "url": "https://github.com/pytorch/pytorch/issues/173123#issuecomment-3791703417"
+        },
+        {
+          "author": "wconstab",
+          "created_at": "2026-01-25T19:34:24Z",
+          "updated_at": "2026-01-25T19:34:24Z",
+          "body": "Trying to catch up on this issue. It sounds like the situation is that we have inconsistent proposals between compile and eager. \n\nFor compile, we could make it an error if you don't bprop through all the outputs of all the graphs that required grad. This would nicely avoid ever needing zeros like handling for subclasses, or wasting activation memory, or doing extra work in backwards.\n\nBut in eager, we can't error like this because we can't know if an output will be used later. And to be complete / correct in eager, we do need zeros like handling for subclasses.  Note, it's also better in eager to detach if possible, to avoid wasting memory.\n\nIt might be worth adding the subclass zeros like handling for eager, and erroring (or warning?) in compile, and making changes to add detach when possible in fsdp/cp apis?",
+          "url": "https://github.com/pytorch/pytorch/issues/173123#issuecomment-3797134164"
+        }
+      ]
+    },
+    {
+      "number": 172491,
+      "title": "Direct access to DTensor._local_tensor breaks _dynamo_graph_capture_for_export",
+      "url": "https://github.com/pytorch/pytorch/issues/172491",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/172491",
+      "state": "open",
+      "author": "ezyang",
+      "created_at": "2026-01-14T20:44:54Z",
+      "updated_at": "2026-06-13T16:38:02Z",
+      "closed_at": null,
+      "labels": [
+        "oncall: distributed",
+        "triaged",
+        "module: dtensor",
+        "bot-triaged",
+        "oncall: distributed parallelisms",
+        "ptd-bot-triaged"
+      ],
+      "comments_count": 0,
+      "matched_keywords": [
+        "dynamo"
+      ],
+      "body": "### 🐛 Describe the bug\n\n```\nimport torch\nimport torch.distributed as dist\nfrom torch._dynamo.functional_export import _dynamo_graph_capture_for_export\nfrom torch.distributed.tensor import DTensor, Replicate, distribute_tensor\n\ndist.init_process_group(backend=\"fake\", world_size=1, rank=0)\nmesh = torch.distributed.device_mesh.init_device_mesh(\"cpu\", (1,))\n\n\nclass Model(torch.nn.Module):\n    def forward(self, x):\n        return x._local_tensor.sum()\n\n\ndtensor = distribute_tensor(torch.randn(2, 4), mesh, [Replicate()])\n_dynamo_graph_capture_for_export(Model())(dtensor)\n```\n\nfails with\n\n```\n[rank0]: Traceback (most recent call last):\n[rank0]:   File \"/data/users/ezyang/fbsource/genai/msl/sixlib/test_repro_getitemsource.py\", line 18, in <module>\n[rank0]:     _dynamo_graph_capture_for_export(Model())(dtensor)\n[rank0]:   File \"/data/users/ezyang/c/pytorch/torch/_dynamo/functional_export.py\", line 851, in inner\n[rank0]:     assert isinstance(source, torch._dynamo.source.GetItemSource), source\n[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank0]: AssertionError: AttrSource(base=GetItemSource(base=LocalSource(local_name='flat_args', is_input=True, dynamism=None, is_derefed_cell_contents=False), index=0, index_is_slice=False), member='_local_tensor')\n```\n\n### Versions\n\nmain\n\ncc @awgu @wanchaol @fegin @fduwjj @wz337 @wconstab @d4l3k @pragupta @msaroufim @dcci @aditvenk @weifengpy @tianyu-l @XilunWu @SherlockNoMad @ppwwyyxx @H-Huang",
+      "comments": []
+    },
+    {
+      "number": 187241,
+      "title": "[inductor] TypeError: Too few arguments for CSE in cutedsl_kernel.py (torch 2.10.0, Python 3.11)",
+      "url": "https://github.com/pytorch/pytorch/issues/187241",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/187241",
+      "state": "open",
+      "author": "swagglian",
+      "created_at": "2026-06-13T07:08:47Z",
+      "updated_at": "2026-06-13T07:11:17Z",
+      "closed_at": null,
+      "labels": [
+        "triage review",
+        "module: typing",
+        "oncall: pt2",
+        "module: inductor",
+        "module: python version",
+        "bot-triaged"
+      ],
+      "comments_count": 0,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "### 🐛 Describe the bug\n\n## Bug Report\n\n### Summary\n\nIn `torch 2.10.0`, `torch/_inductor/codegen/cutedsl/cutedsl_kernel.py` references `CSE[Any]` with only one type argument, but the `CSE` class in `torch/_inductor/codegen/common.py` is defined as `Generic[CSEVariableType, AugmentedKeyT]`, which requires two type arguments. This causes a `TypeError` at import time on Python 3.11.\n\n### Error Message\n\n```\nTypeError: Too few arguments for <class 'torch._inductor.codegen.common.CSE'>; actual 1, expected 2\n```\n\nFull traceback:\n```\nFile \".../torch/_inductor/codegen/cutedsl/cutedsl_kernel.py\", line 77, in CuteDSLSubgraphInfo\n    cse: Optional[CSE[Any]] = None\n         ~~~^^^^^\nTypeError: Too few arguments for <class 'torch._inductor.codegen.common.CSE'>; actual 1, expected 2\n```\n\n### Root Cause\n\nIn `torch/_inductor/codegen/common.py`, the `CSE` class is defined with two generic parameters:\n\n```python\n# torch/_inductor/codegen/common.py, line 1886\nclass CSE(Generic[CSEVariableType, AugmentedKeyT]):\n```\n\nHowever, in `torch/_inductor/codegen/cutedsl/cutedsl_kernel.py`, it is used with only one type argument:\n\n```python\n# torch/_inductor/codegen/cutedsl/cutedsl_kernel.py, line 77\ncse: Optional[CSE[Any]] = None\n```\n\nThis internal inconsistency was introduced when `CSE` was refactored to accept a second generic parameter, but `cutedsl_kernel.py` was not updated accordingly.\n\nNote: On Python 3.11, both `Optional[CSE[Any]]` and `CSE[Any] | None` trigger runtime generic type validation, so changing the annotation syntax alone does not fix the issue. The correct fix is:\n\n```python\ncse: Optional[CSE[Any, Any]] = None\n```\n\n### Steps to Reproduce\n\n```bash\npython3 -c \"from torch._inductor.codegen.cutedsl.cutedsl_kernel import CuteDSLTemplateKernel\"\n```\n\n### Environment\n\n- PyTorch version: 2.10.0+cpu\n- Python version: 3.11.4\n- OS: openEuler (aarch64)\n- Install source: official wheel `torch-2.10.0+cpu-cp311-cp311-manylinux_2_28_aarch64.whl`\n\n### Expected Behavior\n\nThe module imports successfully without any `TypeError`.\n\n### Suggested Fix\n\nIn `torch/_inductor/codegen/cutedsl/cutedsl_kernel.py`, update the annotation:\n\n```python\n# Before\ncse: Optional[CSE[Any]] = None\n\n# After\ncse: Optional[CSE[Any, Any]] = None\n```\n\n### Versions\n\nhttps://download.pytorch.org/whl/cpu/torch-2.10.0%2Bcpu-cp311-cp311-manylinux_2_28_aarch64.whl\n\ncc @lolpack @maggiemoss @ndmitchell @kinto0 @samwgoldman @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @aakhundov @coconutruben @jataylo",
+      "comments": []
+    }
+  ]
+}
