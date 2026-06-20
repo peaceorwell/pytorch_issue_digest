@@ -1,0 +1,235 @@
+{
+  "metadata": {
+    "repo": "pytorch/pytorch",
+    "keywords": [
+      "compile",
+      "inductor",
+      "dynamo"
+    ],
+    "generated_at": "2026-06-20T04:00:03.632558+00:00",
+    "since": "2026-06-19T04:00:03.632558+00:00",
+    "lookback_hours": 24.0,
+    "timezone": "Asia/Shanghai",
+    "report_date": "2026-06-20",
+    "issue_count": 6
+  },
+  "issues": [
+    {
+      "number": 187715,
+      "title": "`torch.compile(mode='reduce-overhead')` silently degrades training on ROCm — `cudagraph_trees` has no HIP guard",
+      "url": "https://github.com/pytorch/pytorch/issues/187715",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/187715",
+      "state": "open",
+      "author": "sanbuphy",
+      "created_at": "2026-06-19T07:11:38Z",
+      "updated_at": "2026-06-20T01:51:38Z",
+      "closed_at": null,
+      "labels": [
+        "triage review",
+        "module: rocm",
+        "module: correctness (silent)",
+        "module: cuda graphs",
+        "oncall: pt2",
+        "module: inductor",
+        "bot-triaged"
+      ],
+      "comments_count": 1,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "### 🐛 Describe the bug\n\n# `torch.compile(mode='reduce-overhead')` silently degrades training on ROCm — `cudagraph_trees` has no HIP guard\n\n### 🐛 Bug Description\n\nOn AMD ROCm (MI300X, ROCm 7.0, PyTorch 2.10), `torch.compile(mode='reduce-overhead')` causes training loss to converge significantly slower than `mode='default'` or no-compile.\n\nIsolation tests confirm the underlying HIP Graph API (`torch.cuda.CUDAGraph`) works correctly. The bug is in inductor's `cudagraph_trees.py`, which has zero ROCm awareness and unconditionally enables the new cudagraph implementation on ROCm.\n\n### 📊 Minimal Reproduction\n\n```python\nimport torch\nimport torch._inductor.config as icfg\n\n# A simple training loop\nclass Net(torch.nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.fc1 = torch.nn.Linear(512, 256)\n        self.fc2 = torch.nn.Linear(256, 512)\n    def forward(self, x):\n        return self.fc2(torch.nn.functional.relu(self.fc1(x)))\n\ndef train(model, n_steps=200):\n    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)\n    losses = []\n    for step in range(n_steps):\n        x = torch.randn(64, 512, device='cuda')\n        y = torch.randn(64, 512, device='cuda')\n        loss = torch.nn.functional.mse_loss(model(x), y)\n        loss.backward()\n        opt.step(); opt.zero_grad()\n        if step <= 5 or step % 20 == 0:\n            losses.append((step, loss.item()))\n    return losses\n\n# ✅ Fine\nmodel1 = Net().cuda()\nloss1 = train(model1)\nprint(f\"no compile:                step200 loss={loss1[-1][1]:.4f}\")\n\n# ✅ Fine  \nmodel2 = Net().cuda()\nmodel2 = torch.compile(model2, mode='default')\nloss2 = train(model2)\nprint(f\"mode='default':            step200 loss={loss2[-1][1]:.4f}\")\n\n# ❌ Degraded on ROCm\nmodel3 = Net().cuda()\nmodel3 = torch.compile(model3, mode='reduce-overhead')\nloss3 = train(model3)\nprint(f\"mode='reduce-overhead':    step200 loss={loss3[-1][1]:.4f}\")\n\n# ❌ Also degraded — this is the underlying cause\nicfg.triton.cudagraphs = True\nicfg.triton.cudagraph_trees = True  # ← culprit\nmodel4 = Net().cuda()\nmodel4 = torch.compile(model4)\nloss4 = train(model4)\nprint(f\"cudagraphs+trees manually: step200 loss={loss4[-1][1]:.4f}\")\n\n# ✅ Fine — old cudagraph impl works on ROCm\nicfg.triton.cudagraphs = True\nicfg.triton.cudagraph_trees = False  # ← old impl, works\nmodel5 = Net().cuda()\nmodel5 = torch.compile(model5)\nloss5 = train(model5)\nprint(f\"cudagraphs ONLY (old):     step200 loss={loss5[-1][1]:.4f}\")\n```\n\n### 📈 Typical Output on ROCm (MI300X, ROCm 7.0)\n\n```\nno compile:                step200 loss=0.7234\nmode='default':            step200 loss=0.7310\nmode='reduce-overhead':    step200 loss=0.9012   ← ~23% worse\ncudagraphs+trees manually: step200 loss=0.8956   ← same degradation\ncudagraphs ONLY (old):     step200 loss=0.7288   ← fine\n```\n\n### 🔍 Step-by-step Loss Trace\n\nWhen tracing loss per step, the degradation shows a clear pattern of stalling during graph replay:\n\n```\nStep     default     reduce-overhead\n  1      1.042        1.040           ← graph capture, same\n 10      0.891        0.985           ← divergence grows during replay\n 20      0.793        0.972           ← loss stalled\n 30      0.751        0.968           ← still stalled  \n 40      0.728        0.901           ← graph re-recorded, temporary recovery\n 50      0.714        0.885           ← degrading again\n```\n\n### 🎯 Root Cause\n\n`torch.compile(mode='reduce-overhead')` unconditionally enables `triton.cudagraphs=True`, which — combined with the default `triton.cudagraph_trees=True` — routes into `cudagraph_trees.py`'s new implementation. This file has **zero ROCm/HIP handling** (0 HIP references, compared to 16+ in `utils.py` and 8+ in `config.py`).\n\nThe call chain:\n```\ntorch.compile(model, mode='reduce-overhead')\n  → torch/__init__.py: _TorchCompileInductorWrapper.apply_mode()\n    → config_patches = {\"triton.cudagraphs\": True}\n      → torch/_inductor/compile_fx.py: cudagraphify()\n        → config.triton.cudagraph_trees=True (default)\n        → new_cudagraphify_impl()   ← NO ROCm GUARD\n```\n\nThe fix location, `torch/_inductor/__init__.py`:\n```python\n# Current — unconditionally enables cudagraphs on ROCm:\n\"reduce-overhead\": {\n    \"triton.cudagraphs\": True,\n},\n```\n\n### 🧪 Isolation: HIP Graph Primitive is Fine\n\n```python\n# torch.cuda.CUDAGraph works correctly for training on ROCm:\ng = torch.cuda.CUDAGraph()\nmodel = Net().cuda()\nopt = torch.optim.SGD(model.parameters(), lr=0.01)\nx = torch.randn(64, 512, device='cuda')\ny = torch.randn(64, 512, device='cuda')\n\nopt.zero_grad()\nwith torch.cuda.graph(g):\n    loss = torch.nn.functional.mse_loss(model(x), y)\n    loss.backward()\n\n# Replay 10 times with new data — loss changes normally:\nfor i in range(10):\n    x.copy_(torch.randn(64, 512, device='cuda'))\n    y.copy_(torch.randn(64, 512, device='cuda'))\n    opt.zero_grad()\n    g.replay()\n    opt.step()\n    # ✅ Loss decreases normally — HIP Graph API works\n```\n\n| Layer | Works on ROCm? |\n|-------|:-------------:|\n| `torch.cuda.CUDAGraph` (HIP Graph primitive) | ✅ |\n| inductor `cudagraphs` old impl (`cudagraph_trees=False`) | ✅ |\n| inductor `cudagraph_trees` new impl (`cudagraph_trees=True`) | ❌ |\n| `mode='reduce-overhead'` | ❌ |\n\n### 💡 Suggested Fix\n\n**One-line fix** in `torch/_inductor/__init__.py`:\n\n```python\n# Before:\n\"triton.cudagraphs\": True,\n\n# After:\n\"triton.cudagraphs\": False if torch.version.hip else True,\n```\n\nThis safely degrades `reduce-overhead` to `default` mode on ROCm without affecting CUDA.\n\nAlternative: add `config.rocm.disable_cudagraph_trees: bool = True` and check it in `compile_fx.py:cudagraphify()`.\n\n### 🌍 Environment\n\n| Item | Detail |\n|------|--------|\n| GPU | AMD Radeon Graphics (MI300X-class), 205 GB VRAM |\n| ROCm | 7.0.51831 |\n| PyTorch | 2.10.0+rocm7.0 |\n| Python | 3.10 |\n\n### 📎 Related Source Files\n\n- `torch/_inductor/__init__.py:357` — `reduce-overhead` mode definition (fix here)\n- `torch/_inductor/cudagraph_trees.py` — **zero HIP handling**\n- `torch/_inductor/compile_fx.py:1804-1843` — `cudagraphify()` entry point\n- `torch/_inductor/config.py:1996` — `class rocm` (no cudagraph disable option)\n\n---\n\n_CC: @pytorch/rocm-maintainers_\n\n\n### Versions\n\n\nPyTorch version: 2.10.0+rocm7.0\nIs debug build: False\nCUDA used to build PyTorch: N/A\nROCM used to build PyTorch: 7.0.51831\n\nOS: Ubuntu 22.04.5 LTS (x86_64)\nGCC version: (Ubuntu 11.4.0-1ubuntu1~22.04.2) 11.4.0\nClang version: 20.0.0git (https://github.com/RadeonOpenCompute/llvm-project roc-7.0.0)\nCMake version: version 3.31.6\nLibc version: glibc-2.35\n\nPython version: 3.10.20 | packaged by conda-forge | (main, Jun 11 2026, 03:31:56) [GCC 14.3.0] (64-bit runtime)\nPython platform: Linux-6.1.0-39-amd64-x86_64-with-glibc2.35\nIs CUDA available: True\nGPU models and configuration: AMD Radeon Graphics (gfx942:sramecc+:xnack-)\nHIP runtime version: 7.0.51831\nMIOpen runtime version: 3.5.0\n\nCPU: INTEL(R) XEON(R) PLATINUM 8568Y+ (160 cores, 2 sockets)\n\nVersions of relevant libraries:\n[pip3] torch==2.10.0+rocm7.0\n[pip3] torchaudio==2.10.0+rocm7.0\n[pip3] torchvision==0.25.0+rocm7.0\n[pip3] triton==3.7.0\n[pip3] triton-rocm==3.6.0\n\ncc @jeffdaily @sunway513 @jithunnair-amd @pruthvistony @ROCmSupport @jataylo @hongxiayang @naromero77amd @pragupta @jerrymannil @xinyazhang @mcarilli @ezyang @eellison @penguinwu @BoyuanFeng @chauhang @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @aakhundov @coconutruben",
+      "comments": [
+        {
+          "author": "sanbuphy",
+          "created_at": "2026-06-20T01:51:38Z",
+          "updated_at": "2026-06-20T01:51:38Z",
+          "body": "Related questions:\nhttps://github.com/ROCm/clr/issues/280",
+          "url": "https://github.com/pytorch/pytorch/issues/187715#issuecomment-4755967166"
+        }
+      ]
+    },
+    {
+      "number": 187127,
+      "title": "DISABLED test_aot_inductor_consts_cpp_build_xpu (__main__.AOTInductorTestDualWrapper)",
+      "url": "https://github.com/pytorch/pytorch/issues/187127",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/187127",
+      "state": "closed",
+      "author": "guangyey",
+      "created_at": "2026-06-12T01:42:57Z",
+      "updated_at": "2026-06-19T22:36:18Z",
+      "closed_at": "2026-06-19T22:36:18Z",
+      "labels": [
+        "module: tests",
+        "triaged",
+        "skipped",
+        "oncall: pt2",
+        "oncall: export",
+        "module: aotinductor",
+        "module: xpu",
+        "bot-triaged"
+      ],
+      "comments_count": 3,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "Platforms: xpu\n\nThis test was disabled because it is failing on main branch ([recent examples](https://torch-ci.com/failure?failureCaptures=%5B%22test%2Finductor%2Ftest_aot_inductor.py%3A%3AAOTInductorTestDualWrapper%3A%3Atest_aot_inductor_consts_cpp_build_xpu%22%5D)).\n\ncc @mruberry @chauhang @penguinwu @avikchaudhuri @zhxchen17 @tugsbayasgalan @angelayi @ydwu4 @desertfire @yushangdi @jataylo @iupaikov-amd @gujinghui @EikanWang @fengyuan14",
+      "comments": [
+        {
+          "author": "pytorch-bot[bot]",
+          "created_at": "2026-06-12T01:43:01Z",
+          "updated_at": "2026-06-12T01:43:01Z",
+          "body": "<!-- validation-comment-start --><body>Hello there! From the DISABLED prefix in this issue title, it looks like you are attempting to disable a test in PyTorch CI. The information I have parsed is below:\n\n* Test name: `test_aot_inductor_consts_cpp_build_xpu (__main__.AOTInductorTestDualWrapper)`\n* Platforms for which to skip the test: xpu\n* Disabled by `guangyey`\n\nWithin ~15 minutes, `test_aot_inductor_consts_cpp_build_xpu (__main__.AOTInductorTestDualWrapper)` will be disabled in PyTorch CI for these platforms: xpu. Please verify that your test name looks correct, e.g., `test_cuda_assert_async (__main__.TestCuda)`.\n\nTo modify the platforms list, please include a line in the issue body, like below. The default action will disable the test for all platforms if no platforms list is specified. \n```\nPlatforms: case-insensitive, list, of, platforms\n```\nWe currently support the following platforms: asan, dynamo, inductor, linux, mac, macos, rocm, slow, win, windows, xpu.\n\n\n### How to re-enable a test\nTo re-enable the test globally, close the issue. To re-enable a test for only a subset of platforms, remove the platforms from the list in the issue body. This may take some time to propagate. To re-enable a test only for a PR, put `Fixes #187127` in the PR body and rerun the test jobs. Note that if a test is flaky, it maybe be difficult to tell if the test is still flaky on the PR.\n</body><!-- validation-comment-end -->",
+          "url": "https://github.com/pytorch/pytorch/issues/187127#issuecomment-4686581465"
+        },
+        {
+          "author": "github-actions[bot]",
+          "created_at": "2026-06-12T22:57:26Z",
+          "updated_at": "2026-06-12T22:57:26Z",
+          "body": "I cannot find any mention of this test in the database for the past 7 days or in the logs for the past 5 commits on viable/strict.  Closing this issue as it is highly likely that this test has either been renamed or removed.  If you think this is a false positive, please feel free to re-open this issue.",
+          "url": "https://github.com/pytorch/pytorch/issues/187127#issuecomment-4696171528"
+        },
+        {
+          "author": "github-actions[bot]",
+          "created_at": "2026-06-19T22:36:18Z",
+          "updated_at": "2026-06-19T22:36:18Z",
+          "body": "I cannot find any mention of this test in the database for the past 7 days or in the logs for the past 5 commits on viable/strict.  Closing this issue as it is highly likely that this test has either been renamed or removed.  If you think this is a false positive, please feel free to re-open this issue.",
+          "url": "https://github.com/pytorch/pytorch/issues/187127#issuecomment-4755220316"
+        }
+      ]
+    },
+    {
+      "number": 187721,
+      "title": "[Inductor] Silent correctness : F.kl_div reduction over -0.0 yields different signbits in Eager vs Compiled",
+      "url": "https://github.com/pytorch/pytorch/issues/187721",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/187721",
+      "state": "open",
+      "author": "xyt66665000",
+      "created_at": "2026-06-19T10:14:38Z",
+      "updated_at": "2026-06-19T17:24:18Z",
+      "closed_at": null,
+      "labels": [
+        "triage review",
+        "module: loss",
+        "module: half",
+        "module: correctness (silent)",
+        "module: reductions",
+        "oncall: pt2",
+        "module: inductor",
+        "bot-triaged"
+      ],
+      "comments_count": 1,
+      "matched_keywords": [
+        "compile",
+        "inductor"
+      ],
+      "body": "### 🐛 Describe the bug\n\nWhen using `F.kl_div` with `reduction='mean'` and `log_target=True` in `float16`, the output in Eager mode evaluates to `0.0` (signbit: False), whereas the `torch.compile` (Inductor) evaluates to `-0.0` (signbit: True).\n\nAlthough `0.0` and `-0.0` evaluate to `True` under `torch.allclose`, this signbit difference causes severe discrepancies in downstream operations that are sensitive to the sign of zero (such as `torch.copysign`, `torch.atan2`). For example, applying `torch.copysign` to the output yields `1.0` in Eager mode but `-1.0` in Compiled mode.\n\n*Note: This issue involves a signbit discrepancy like #187336, but the manifestation is opposite (Eager is `0.0`, Compiled is `-0.0`) and it occurs during a reduction operation rather than a pointwise operation.*\n\n**Reproduce script:**\n```python\nimport torch\nimport torch.nn.functional as F\nimport warnings\n\nwarnings.filterwarnings(\"ignore\")\n\nprint(\"torch version:\", torch.__version__)\nif torch.cuda.is_available():\n    print(\"cuda version:\", torch.version.cuda)\n\ndef fn(input_t, target_t):\n    y = F.kl_div(input_t, target_t, reduction='mean', log_target=True)\n    sign_val = torch.copysign(torch.tensor(1.0, device=input_t.device, dtype=torch.float32), y)\n    return sign_val, y\n\ndevice = \"cuda\" if torch.cuda.is_available() else \"cpu\"\ndtype = torch.float16\n\ninput_t = torch.tensor([100.0, 100.0], dtype=dtype, device=device).requires_grad_(True)\ntarget_t = torch.tensor([-100.0, -100.0], dtype=dtype, device=device)\n\ny_eager_sign, y_eager = fn(input_t, target_t)\n\ncompiled_fn = torch.compile(fn, backend=\"inductor\", fullgraph=True)\ny_compiled_sign, y_compiled = compiled_fn(input_t, target_t)\n\nprint(\"=== Raw kl_div Output ===\")\nprint(f\"Eager:    {y_eager.item()} (signbit: {y_eager.signbit().item()})\")\nprint(f\"Compiled: {y_compiled.item()} (signbit: {y_compiled.signbit().item()})\")\n\nprint(\"\\n=== Downstream copysign Output ===\")\nprint(f\"Eager copysign:    {y_eager_sign.item()}\")\nprint(f\"Compiled copysign: {y_compiled_sign.item()}\")\n\nprint(\"\\n=== Match Verification ===\")\nprint(\"torch.allclose passes: \", torch.allclose(y_eager, y_compiled))\nprint(\"Actual values match (Equal): \", torch.equal(y_eager_sign, y_compiled_sign))\n```\n\n**Output logs:**\n```text\ntorch version: 2.14.0.dev20260617+cu130\ncuda version: 13.0\n=== Raw kl_div Output ===\nEager:    0.0 (signbit: False)\nCompiled: -0.0 (signbit: True)\n\n=== Downstream copysign Output ===\nEager copysign:    1.0\nCompiled copysign: -1.0\n\n=== Match Verification ===\ntorch.allclose passes:  True\nActual values match (Equal):  False\n```\n\n### Versions\n\nPyTorch version: 2.14.0.dev20260617+cu130\nCUDA used to build PyTorch: 13.0\nOS: Ubuntu 24.04.4 LTS (x86_64)\nIs CUDA available: True\nCUDA runtime version: 12.0.140\n\ncc @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @aakhundov @coconutruben @jataylo",
+      "comments": [
+        {
+          "author": "jansel",
+          "created_at": "2026-06-19T17:24:18Z",
+          "updated_at": "2026-06-19T17:24:18Z",
+          "body": "My agent says this looks like intended default Inductor numerics rather than a bug. I reproduced the signbit mismatch on current main (9d625a9bfcf) on both CPU and CUDA: eager fp16 `kl_div(..., reduction=\"mean\", log_target=True)` returns `+0.0`, compiled returns `-0.0`, while the same expression in fp64 is `-7.440151952041673e-42` with a negative signbit. So the compiled result preserves the sign of the fp64 reference; eager's `+0.0` comes from fp16 underflow/reduction canonicalization. Since Inductor is allowed to elide fp16 intermediate casts by default in fused kernels, I don't think this should be treated as an Inductor correctness bug.\n",
+          "url": "https://github.com/pytorch/pytorch/issues/187721#issuecomment-4753576239"
+        }
+      ]
+    },
+    {
+      "number": 187728,
+      "title": "[vllm] [2.13 regression][Inductor] FxGraphCache._save_graph calls ShapeEnv.produce_guards_expression_with_source_info, missing on custom ShapeEnv",
+      "url": "https://github.com/pytorch/pytorch/issues/187728",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/187728",
+      "state": "open",
+      "author": "atalman",
+      "created_at": "2026-06-19T15:00:28Z",
+      "updated_at": "2026-06-19T15:03:01Z",
+      "closed_at": null,
+      "labels": [
+        "triage review",
+        "module: crash",
+        "module: bc-breaking",
+        "module: regression",
+        "oncall: pt2",
+        "module: inductor",
+        "module: vllm",
+        "bot-triaged"
+      ],
+      "comments_count": 0,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "## Summary\nOn torch 2.13.0, `vllm/compilation` standalone-compile path crashes during engine init because `FxGraphCache._save_graph` calls a ShapeEnv method that does not exist on vLLM's custom `AlwaysHitShapeEnv`:\n\n```\nAttributeError: 'AlwaysHitShapeEnv' object has no attribute 'produce_guards_expression_with_source_info'\n```\nTorch-side call site:\n```\nFile \".../torch/_inductor/compile_fx.py\", line 1088, in _compile_fx_inner\n    FxGraphCache._save_graph(\nFile \".../torch/_inductor/codecache.py\", line 2180, in _save_graph\n    ) = shape_env.produce_guards_expression_with_source_info(\n```\nThis crashes the EngineCore (`Engine core initialization failed ... Server exited unexpectedly`), failing `tests/compile/test_aot_compile.py::test_standalone_compile_correctness`.\n\n`produce_guards_expression_with_source_info` appears to be new/renamed on the torch 2.13 `ShapeEnv`; `FxGraphCache._save_graph` now unconditionally calls it, so any custom/subclassed ShapeEnv that doesn't provide it breaks. Passes on `main` (torch 2.11), where this code path doesn't require the method.\n\n## Environment\n- torch **2.13.0**, torchvision **0.28.0**, triton **3.7.1** (PyTorch **test** channel)\n- CUDA **13.0**, Python **3.12**\n- vLLM test PR: vllm-project/vllm#45731 (branch `atalman:test-pytorch-2.13.0-test`)\n- Umbrella: pytorch/pytorch#187473\n\n## Failing test / job\n`tests/compile/test_aot_compile.py::test_standalone_compile_correctness` — [PyTorch Compilation Unit Tests](https://buildkite.com/vllm/ci/builds/72925#019edfeb-1722-47fa-9981-23d8547e0fd4)\n\n**Note (avoid confusion):** the same-named job *also* fails on recent `main` builds (73052, 72995) but with a **different** signature — `AttributeError: 'NoneType' object has no attribute 'model'` at `vllm/compilation/backends.py:994` (a separate vLLM-main regression). This issue is specifically the 2.13 `produce_guards_expression_with_source_info` failure, which does **not** occur on `main`.\n\n## Reproducibility\nNew on torch 2.13; **passes on `main` (torch 2.11)** across 5 recent Full CI builds (73052, 72995, 72843, 72766, 72616). Reproduces with the **same signature on two consecutive fresh 2.13 builds**:\n- 2026-06-15 — build [#72241](https://buildkite.com/vllm/ci/builds/72241)\n- 2026-06-18 — build [#72925](https://buildkite.com/vllm/ci/builds/72925)\n\n## Question / routing\nShould `FxGraphCache._save_graph` tolerate a ShapeEnv without `produce_guards_expression_with_source_info` (back-compat), or is vLLM's `AlwaysHitShapeEnv` expected to implement the new API? Flagging the 2.13 internal-API change.\n\n\ncc @ezyang @gchanan @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @aakhundov @coconutruben @jataylo",
+      "comments": []
+    },
+    {
+      "number": 187723,
+      "title": "[inductor] inductorerror when compiling compressed-tensors nvfp4 fake_quantize path",
+      "url": "https://github.com/pytorch/pytorch/issues/187723",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/187723",
+      "state": "closed",
+      "author": "Bias92",
+      "created_at": "2026-06-19T11:47:10Z",
+      "updated_at": "2026-06-19T12:04:57Z",
+      "closed_at": "2026-06-19T12:04:57Z",
+      "labels": [
+        "triaged",
+        "oncall: pt2",
+        "module: inductor",
+        "module: floatx (formerly float8)",
+        "bot-triaged"
+      ],
+      "comments_count": 2,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "### describe the bug\n\ni'm seeing an inductor failure when compiling the nvfp4/fp4 fake_quantize path from compressed-tensors.\n\ni found this while trying to compile part of the gptq path in llm-compressor, but i don't think the gptq loop is the interesting part here. the int fake_quantize paths compile for me, but the nvfp4/fp4 path fails in inductor/triton codegen.\n\nthis does not look like a dynamo graph break. the int cases reported 0 graph breaks in the sweep below. nvfp4 fails with an inductorerror.\n\nafter grabbing the full traceback, the immediate failure appears to be that the generated triton kernel has an `*fp8e4nv` argument on an a100/sm80 machine:\n\n```text\nValueError(\"type fp8e4nv not supported in this architecture. The supported fp8 dtypes are ('fp8e4b15', 'fp8e5')\")\n```\n\nso this may be an architecture support / fallback issue rather than a generic fp4 codegen bug. eager still passes for this synthetic fake_quantize path, but compile fails during triton codegen.\n\nbackend/mode settings:\n\n```text\neager: passes\ntorch.compile / inductor: fails for nvfp4/fp4 tensor_group\ntorch.compile(dynamic=True)\nTORCH_LOGS=graph_breaks,recompiles\n```\n\n### repro\n\nthis still goes through llm-compressor and compressed-tensors, but it uses synthetic inputs and calls quantize_weight directly instead of running a full model compression flow.\n\n```python\nimport time\n\nimport torch\nimport torch._dynamo\nfrom torch._dynamo.utils import counters\n\nfrom compressed_tensors.quantization import QuantizationArgs, QuantizationScheme\nfrom llmcompressor.modifiers.gptq.gptq_quantize import (\n    make_empty_hessian,\n    quantize_weight,\n    set_gptq_block_compile,\n    set_gptq_compile,\n)\nfrom llmcompressor.modifiers.quantization.calibration import initialize_observer, observe\n\nSCHEMES = [\n    (\"int4-group128-sym\", dict(num_bits=4, type=\"int\", strategy=\"group\", group_size=128, symmetric=True)),\n    (\"int4-group128-asym\", dict(num_bits=4, type=\"int\", strategy=\"group\", group_size=128, symmetric=False)),\n    (\"int8-group128-sym\", dict(num_bits=8, type=\"int\", strategy=\"group\", group_size=128, symmetric=True)),\n    (\"int4-channel-sym\", dict(num_bits=4, type=\"int\", strategy=\"channel\", symmetric=True)),\n    (\"int4-tensor-sym\", dict(num_bits=4, type=\"int\", strategy=\"tensor\", symmetric=True)),\n    (\"int4-block-sym\", dict(num_bits=4, type=\"int\", strategy=\"block\", block_structure=[128, 128], symmetric=True)),\n    (\"nvfp4-tensorgroup\", dict(num_bits=4, type=\"float\", strategy=\"tensor_group\", group_size=16, symmetric=True, dynamic=False)),\n]\n\ndef build(rows, cols, kwargs):\n    torch.manual_seed(0)\n    module = torch.nn.Linear(cols, rows, bias=False).cuda().float()\n    qargs = QuantizationArgs(**kwargs)\n    module.quantization_scheme = QuantizationScheme(targets=[\"Linear\"], weights=qargs)\n    initialize_observer(module, \"weight\")\n    observe(module, \"weight\")\n\n    hessian = make_empty_hessian(module)\n    a = torch.randn(cols, cols, device=\"cuda\")\n    hessian += (a @ a.t()) / cols + torch.eye(cols, device=\"cuda\")\n    return module, qargs, hessian\n\ndef run_once(rows, cols, kwargs, mode):\n    module, qargs, hessian = build(rows, cols, kwargs)\n    set_gptq_compile(mode == \"column\")\n    set_gptq_block_compile(mode == \"block\")\n    torch.cuda.synchronize()\n    t0 = time.perf_counter()\n    quantize_weight(module=module, quant_args=qargs, hessian=hessian)\n    torch.cuda.synchronize()\n    set_gptq_compile(False)\n    set_gptq_block_compile(False)\n    return time.perf_counter() - t0\n\ndef graph_break_count():\n    gb = counters[\"graph_break\"]\n    return sum(gb.values())\n\nfor name, kwargs in SCHEMES:\n    for mode in (\"eager\", \"column\", \"block\"):\n        torch._dynamo.reset()\n        counters.clear()\n        try:\n            dt = run_once(4096, 1024, kwargs, mode)\n            print(name, mode, dt, \"graph_breaks\", graph_break_count())\n        except Exception as e:\n            print(name, mode, repr(e)[:240])\n```\n\ni ran it with:\n\n```bash\nTORCH_LOGS=\"graph_breaks,recompiles\" python bench_gptq_micro.py --rows 4096 --cols 1024 --reps 1 2>&1 | tee /tmp/micro.log\n```\n\n### error logs\n\nfull traceback from the nvfp4-only repro:\n\n```text\nE0619 11:51:41.166000 7140 torch/_inductor/runtime/triton_heuristics.py:894] [0/0_1] Triton compilation failed: triton_poi_fused__to_copy_abs_add_bitwise_and_clamp_div_ge_gt_index_put_le_lift_fresh_lt_mul_sign_sub_0\nE0619 11:51:41.166000 7140 torch/_inductor/runtime/triton_heuristics.py:894] [0/0_1] metadata: {'signature': {'in_out_ptr0': '*fp32', 'in_ptr0': '*fp32', 'in_ptr1': '*fp32', 'in_ptr2': '*fp32', 'in_ptr3': '*fp8e4nv', 'ks0': 'i64', 'xnumel': 'i32', 'XBLOCK': 'constexpr'}, 'device': 0, 'device_type': 'cuda', 'debug': True, 'cc': 80}\nE0619 11:51:41.166000 7140 torch/_inductor/runtime/triton_heuristics.py:894] [0/0_1] Traceback (most recent call last):\nE0619 11:51:41.166000 7140 torch/_inductor/runtime/triton_heuristics.py:894] [0/0_1]   File \"/usr/local/lib/python3.11/dist-packages/torch/_inductor/runtime/triton_heuristics.py\", line 892, in _precompile_config\nE0619 11:51:41.166000 7140 torch/_inductor/runtime/triton_heuristics.py:894] [0/0_1]     binary = triton.compile(*compile_args, **compile_kwargs)\nE0619 11:51:41.166000 7140 torch/_inductor/runtime/triton_heuristics.py:894] [0/0_1]   File \"/usr/local/lib/python3.11/dist-packages/triton/compiler/compiler.py\", line 307, in compile\nE0619 11:51:41.166000 7140 torch/_inductor/runtime/triton_heuristics.py:894] [0/0_1]     module = src.make_ir(target, options, codegen_fns, module_map, context)\nE0619 11:51:41.166000 7140 torch/_inductor/runtime/triton_heuristics.py:894] [0/0_1] triton.compiler.errors.CompilationError: at 1:0:\nE0619 11:51:41.166000 7140 torch/_inductor/runtime/triton_heuristics.py:894] [0/0_1] def triton_poi_fused__to_copy_abs_add_bitwise_and_clamp_div_ge_gt_index_put_le_lift_fresh_lt_mul_sign_sub_0(in_out_ptr0, in_ptr0, in_ptr1, in_ptr2, in_ptr3, ks0, xnumel, XBLOCK : tl.constexpr):\nE0619 11:51:41.166000 7140 torch/_inductor/runtime/triton_heuristics.py:894] [0/0_1] ^\nE0619 11:51:41.166000 7140 torch/_inductor/runtime/triton_heuristics.py:894] [0/0_1] ValueError(\"type fp8e4nv not supported in this architecture. The supported fp8 dtypes are ('fp8e4b15', 'fp8e5')\")\nTraceback (most recent call last):\n  File \"/tmp/repro_nvfp4_trace.py\", line 35, in <module>\n    quantize_weight(module=module, quant_args=qargs, hessian=hessian)\n  File \"/workspace/llmc-modern/src/llmcompressor/modifiers/gptq/gptq_quantize.py\", line 364, in quantize_weight\n    q = quantize_column(\n  File \"/usr/local/lib/python3.11/dist-packages/torch/_dynamo/eval_frame.py\", line 1062, in compile_wrapper\n    raise e.remove_dynamo_frames() from None\n  File \"/usr/local/lib/python3.11/dist-packages/torch/_inductor/compile_fx.py\", line 1069, in _compile_fx_inner\n    raise InductorError(e, currentframe()).with_traceback(\ntorch._inductor.exc.InductorError: CompilationError: at 1:0:\ndef triton_poi_fused__to_copy_abs_add_bitwise_and_clamp_div_ge_gt_index_put_le_lift_fresh_lt_mul_sign_sub_0(in_out_ptr0, in_ptr0, in_ptr1, in_ptr2, in_ptr3, ks0, xnumel, XBLOCK : tl.constexpr):\n^\nValueError(\"type fp8e4nv not supported in this architecture. The supported fp8 dtypes are ('fp8e4b15', 'fp8e5')\")\n```\n\noriginal sweep output:\n\n```text\ntorch 2.12.1+cu130 | cuda=True | NVIDIA A100-SXM4-80GB\nshape rows=4096 cols=1024 reps=1\nscheme                eager     column    col_brk  block     blk_brk  col_spd  blk_spd\n--------------------------------------------------------------------------------------------\nint4-group128-sym     1.017     2.380     0        93.310    0        0.43x    0.01x\nint4-group128-asym    0.648     0.812     0        92.626    0        0.80x    0.01x\nint8-group128-sym     0.639     0.814     0        92.566    0        0.79x    0.01x\nint4-channel-sym      0.586     1.264     0        0.619     0        0.46x    0.95x\nint4-tensor-sym       0.641     1.081     0        0.624     0        0.59x    1.03x\nint4-block-sym        0.871     6.683     0        0.865     0        0.13x    1.01x\nnvfp4-tensorgroup     1.370     -         -1       -         -1       -        -\n  column ERROR: InductorError('SubprocException: An exception occurred in a subprocess:\\n\\nName=triton_poi_fused__to_copy_abs_add_bitwis\n  block ERROR: InductorError('SubprocException: An exception occurred in a subprocess:\\n\\nName=triton_poi_fused__to_copy_abs_add_bitwis\n```\n\nthe timings here include cold compile time, so i would not read them as perf numbers. the part that seems relevant is that the int fake_quantize cases compile with 0 graph breaks in this sweep, while the nvfp4/fp4 tensor_group case fails in inductor/triton codegen.\n\n### expected behavior\n\ni would expect this path to either compile, or fail/fallback cleanly before triton codegen if `fp8e4nv` is not supported on this architecture. right now eager passes but torch.compile reaches triton codegen and fails with an internal inductorerror.\n\n### versions\n\n```text\nCollecting environment information...\nPyTorch version: 2.12.1+cu130\nIs debug build: False\nCUDA used to build PyTorch: 13.0\nROCM used to build PyTorch: N/A\n\nOS: Ubuntu 22.04.5 LTS (x86_64)\nGCC version: (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0\nClang version: Could not collect\nCMake version: Could not collect\nLibc version: glibc-2.35\n\nPython version: 3.11.10 (main, Sep  7 2024, 18:35:41) [GCC 11.4.0] (64-bit runtime)\nPython platform: Linux-6.8.0-100-generic-x86_64-with-glibc2.35\nIs CUDA available: True\nCUDA runtime version: 12.4.131\nCUDA_MODULE_LOADING set to:\nGPU models and configuration: GPU 0: NVIDIA A100-SXM4-80GB\nNvidia driver version: 580.126.16\ncuDNN version: Could not collect\nIs XPU available: False\nHIP runtime version: N/A\nMIOpen runtime version: N/A\nIs XNNPACK available: True\nCaching allocator config: N/A\n\nCPU:\nArchitecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           43 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  128\nOn-line CPU(s) list:                     0-127\nVendor ID:                               AuthenticAMD\nModel name:                              AMD EPYC 7742 64-Core Processor\nCPU family:                              23\nModel:                                   49\nThread(s) per core:                      1\nCore(s) per socket:                      64\nSocket(s):                               2\n\nVersions of relevant libraries:\n[pip3] numpy==1.26.3\n[pip3] nvidia-cublas==13.1.1.3\n[pip3] nvidia-cuda-cupti==13.0.85\n[pip3] nvidia-cuda-nvrtc==13.0.88\n[pip3] nvidia-cuda-runtime==13.0.96\n[pip3] nvidia-cudnn-cu13==9.20.0.48\n[pip3] nvidia-cufft==12.0.0.61\n[pip3] nvidia-curand==10.4.0.35\n[pip3] nvidia-cusolver==12.0.4.66\n[pip3] nvidia-cusparse==12.6.3.3\n[pip3] nvidia-cusparselt-cu13==0.8.1\n[pip3] nvidia-nccl-cu13==2.29.7\n[pip3] nvidia-nvjitlink==13.0.88\n[pip3] nvidia-nvtx==13.0.85\n[pip3] torch==2.12.1\n[pip3] triton==3.7.1\n[conda] Could not collect\n```\n\ni can try to reduce this further to a pure aten repro if that would be more useful.",
+      "comments": [
+        {
+          "author": "Bias92",
+          "created_at": "2026-06-19T12:00:28Z",
+          "updated_at": "2026-06-19T12:00:28Z",
+          "body": "this is probably mostly because i tested on a100/ `sm80`. the generated triton kernel has an fp8e4nv argument , and triton says that dtype is not supported on this arch.\nso i'm not expecting nvfp4 itself to work on a100. i'm leaving this open only in case the clean failure/fallback path is still worth handling. for llm-compressor i'll keep nvfp4/fp4 on eager.",
+          "url": "https://github.com/pytorch/pytorch/issues/187723#issuecomment-4751338129"
+        },
+        {
+          "author": "Bias92",
+          "created_at": "2026-06-19T12:04:49Z",
+          "updated_at": "2026-06-19T12:04:49Z",
+          "body": "closing this from my side. after checking the full trace, this is mostly an unsupported arch case: the generated kernel has an fp8e4nv argument, and i was testing on a100/sm80.\n\nfor my llm-compressor work i'll just keep this path out of the compiled path and leave fp4/nvfp4 on eager.",
+          "url": "https://github.com/pytorch/pytorch/issues/187723#issuecomment-4751366911"
+        }
+      ]
+    },
+    {
+      "number": 187337,
+      "title": "[inductor] model failed with torch._inductor.exc.InductorError: AssertionError: vr must not be None for symbol q3",
+      "url": "https://github.com/pytorch/pytorch/issues/187337",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/187337",
+      "state": "open",
+      "author": "jianyizh",
+      "created_at": "2026-06-15T13:10:35Z",
+      "updated_at": "2026-06-19T08:14:11Z",
+      "closed_at": null,
+      "labels": [
+        "triaged",
+        "oncall: pt2",
+        "module: dynamic shapes",
+        "module: inductor",
+        "bot-triaged"
+      ],
+      "comments_count": 1,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "### 🐛 Describe the bug\n\nrun dynamo benchmark under pytorch folder by\n`python benchmarks/dynamo/timm_models.py --accuracy -d cuda -n10 --backend=inductor --cold-start-latency --training  --float32 --only jx_nest_base` （You may add batch size 32 in benchmarks/dynamo/timm_models_list.txt)\n\n### Error logs\n\nERROR:common:\nTraceback (most recent call last):\n  File \"/mnt/ssd1/jianyi/pytorch/benchmarks/dynamo/common.py\", line 2375, in check_accuracy\n    new_result = self.run_n_iterations(\n  File \"/mnt/ssd1/jianyi/pytorch/benchmarks/dynamo/common.py\", line 2073, in run_n_iterations\n    model_iter_fn(mod, inputs, collect_outputs=False)\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_dynamo/eval_frame.py\", line 1183, in compile_wrapper\n    raise e.remove_dynamo_frames() from None  # see TORCHDYNAMO_VERBOSE=1\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/compile_fx.py\", line 1078, in _compile_fx_inner\n    raise InductorError(e, currentframe()).with_traceback(\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/compile_fx.py\", line 1058, in _compile_fx_inner\n    mb_compiled_graph = fx_codegen_and_compile(\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/compile_fx.py\", line 1846, in fx_codegen_and_compile\n    return scheme.codegen_and_compile(gm, example_inputs, inputs_to_check, graph_kwargs)\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/compile_fx.py\", line 1607, in codegen_and_compile\n    compiled_module = graph.compile_to_module()\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/graph.py\", line 2661, in compile_to_module\n    return self._compile_to_module()\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/graph.py\", line 2667, in _compile_to_module\n    self.codegen_with_cpp_wrapper() if self.cpp_wrapper else self.codegen()\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/graph.py\", line 2599, in codegen\n    self._update_scheduler()\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/graph.py\", line 2593, in _update_scheduler\n    self.scheduler = Scheduler(self.operations)\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/scheduler.py\", line 3987, in __init__\n    self._init(nodes)\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/scheduler.py\", line 4004, in _init\n    self.nodes = [self.create_scheduler_node(n) for n in nodes]\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/scheduler.py\", line 4004, in <listcomp>\n    self.nodes = [self.create_scheduler_node(n) for n in nodes]\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/scheduler.py\", line 4337, in create_scheduler_node\n    return SchedulerNode(self, node)\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/scheduler.py\", line 2187, in __init__\n    self._compute_attrs()\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/scheduler.py\", line 2195, in _compute_attrs\n    self._sizes, body = self.node.simplify_and_reorder(\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/ir.py\", line 5283, in simplify_and_reorder\n    ) = self.get_default_sizes_body()\n  File \"<string>\", line 6, in get_default_sizes_body_cache_on_self\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/ir.py\", line 5236, in get_default_sizes_body\n    body = LoopBody(\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/loop_body.py\", line 143, in __init__\n    self._init_with_tracing(fn, args)\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/loop_body.py\", line 173, in _init_with_tracing\n    self.root_block = LoopBodyBlock(self, fn, args)  # traces\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/loop_body.py\", line 609, in __init__\n    ops.output(fn(*args))\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/ir.py\", line 1161, in store_output\n    return ops.store(output_name or \"unnamed\", indexer(vars), loader(vars))\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/lowering.py\", line 5649, in fn\n    grad_part = grad_loader(grad_index)\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/ir.py\", line 3147, in loader\n    return inner(reindex(idx))\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/ir.py\", line 3147, in loader\n    return inner(reindex(idx))\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/ir.py\", line 3803, in loader\n    tmp_loader = ops.load(self.get_name(), indexer(index))\n  File \"<string>\", line 224, in load\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/virtualized.py\", line 337, in _default\n    return OpsWrapper._wrap(getattr(_ops, name)(*new_args, **new_kwargs))\n  File \"<string>\", line 224, in load\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/index_propagation.py\", line 302, in _default\n    return self.fallback(name, args, kwargs)\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/index_propagation.py\", line 277, in fallback\n    return self.wrap(getattr(self._inner, name)(*new_args, **new_kwargs))\n  File \"<string>\", line 224, in load\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/loop_body.py\", line 675, in _default\n    return getattr(self._inner, name)(*args, **kwargs)\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/loop_body.py\", line 703, in load\n    index = self._simplify(index)\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/loop_body.py\", line 700, in _simplify\n    return V.graph.sizevars.simplify_with_ranges(expr, self.body.var_ranges)\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/sizevars.py\", line 299, in simplify_with_ranges\n    result = self._simplify_with_ranges(expr, var_ranges)\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/sizevars.py\", line 411, in _simplify_with_ranges\n    expr = expr.replace(\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/sympy/core/basic.py\", line 1749, in replace\n    rv = walk(self, rec_replace)\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/sympy/core/basic.py\", line 1724, in walk\n    newargs = tuple([walk(a, F) for a in args])\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/sympy/core/basic.py\", line 1724, in <listcomp>\n    newargs = tuple([walk(a, F) for a in args])\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/sympy/core/basic.py\", line 1724, in walk\n    newargs = tuple([walk(a, F) for a in args])\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/sympy/core/basic.py\", line 1724, in <listcomp>\n    newargs = tuple([walk(a, F) for a in args])\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/sympy/core/basic.py\", line 1734, in walk\n    rv = F(rv)\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/sympy/core/basic.py\", line 1742, in rec_replace\n    v = _value(expr, result)\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/sympy/core/basic.py\", line 1694, in <lambda>\n    _value = lambda expr, result: (value(**\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/sizevars.py\", line 402, in visit_modular_indexing\n    can_remove_mod = statically_known(base >= 0) and statically_known(\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/_inductor/sizevars.py\", line 363, in statically_known\n    evaluated = self.shape_env._maybe_evaluate_static(\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/fx/experimental/symbolic_shapes.py\", line 2767, in wrapper\n    return fn_cache(self, *args, **kwargs)\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/fx/experimental/symbolic_shapes.py\", line 7109, in _maybe_evaluate_static\n    expr = self.simplify(expr, size_oblivious)\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/fx/experimental/symbolic_shapes.py\", line 2767, in wrapper\n    return fn_cache(self, *args, **kwargs)\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/fx/experimental/symbolic_shapes.py\", line 7230, in simplify\n    if a == 0 and self._maybe_evaluate_static(sympy.Ge(b, 0)):\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/fx/experimental/symbolic_shapes.py\", line 2767, in wrapper\n    return fn_cache(self, *args, **kwargs)\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/fx/experimental/symbolic_shapes.py\", line 7168, in _maybe_evaluate_static\n    r = _maybe_evaluate_static_worker(\n  File \"/root/miniforge3/envs/jianyi/lib/python3.10/site-packages/torch/fx/experimental/symbolic_shapes.py\", line 2542, in _maybe_evaluate_static_worker\n    raise AssertionError(f\"vr must not be None for symbol {k}\")\ntorch._inductor.exc.InductorError: AssertionError: vr must not be None for symbol q3\nTorchDynamo optimized model failed to run because of following error\n\n\n### Versions\n\nboth xpu and cuda will have this error on 0531 nightly, also in 2.13 release\n\ncc @chauhang @penguinwu @ezyang @bobrenjc93 @aditvenk @laithsakka @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @aakhundov @coconutruben @jataylo",
+      "comments": [
+        {
+          "author": "wdziurdz",
+          "created_at": "2026-06-19T08:14:11Z",
+          "updated_at": "2026-06-19T08:14:11Z",
+          "body": "Have same issue : https://github.com/intel/intel-xpu-backend-for-triton/actions/runs/27757847093/job/82124179912",
+          "url": "https://github.com/pytorch/pytorch/issues/187337#issuecomment-4749745590"
+        }
+      ]
+    }
+  ]
+}
