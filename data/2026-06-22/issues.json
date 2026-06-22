@@ -1,0 +1,277 @@
+{
+  "metadata": {
+    "repo": "pytorch/pytorch",
+    "keywords": [
+      "compile",
+      "inductor",
+      "dynamo"
+    ],
+    "generated_at": "2026-06-22T04:00:01.191429+00:00",
+    "since": "2026-06-21T04:00:01.191429+00:00",
+    "lookback_hours": 24.0,
+    "timezone": "Asia/Shanghai",
+    "report_date": "2026-06-22",
+    "issue_count": 6
+  },
+  "issues": [
+    {
+      "number": 185886,
+      "title": "[torch.compile] Clarification/regression: Dynamo cache lookup guard eval is much slower in 2.12 vs 2.7 after `inline_inbuilt_nn_modules` became always True",
+      "url": "https://github.com/pytorch/pytorch/issues/185886",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/185886",
+      "state": "open",
+      "author": "mihudaner",
+      "created_at": "2026-06-02T03:58:29Z",
+      "updated_at": "2026-06-22T02:47:20Z",
+      "closed_at": null,
+      "labels": [
+        "high priority",
+        "module: performance",
+        "triaged",
+        "module: regression",
+        "oncall: pt2",
+        "module: dynamo",
+        "module: guards",
+        "bot-triaged"
+      ],
+      "comments_count": 11,
+      "matched_keywords": [
+        "compile",
+        "dynamo"
+      ],
+      "body": "### 🐛 Describe the bug\n\nWe are investigating a TorchDynamo cache lookup / guard evaluation performance regression when moving a large inference model from PyTorch 2.7 to a 2.12-based build.\n\nThis is not currently a correctness issue. The compiled model runs, but the runtime overhead before entering compiled regions is noticeably higher. From `TORCH_LOGS=\"+guards\"` and local profiling, the hot frame guard evaluation / cache lookup cost increased from roughly 1 ms in 2.7 to roughly 3-4 ms in 2.12 for our large decoder-style inference workload.\n\nWe also noticed that `torch._dynamo.config.inline_inbuilt_nn_modules` is deprecated in newer PyTorch and effectively always True:\n\n```python\ninline_inbuilt_nn_modules = Config(\n    default=True,\n    justknob=\"pytorch/compiler:inline_inbuilt_nn_modules\",\n    deprecated=True,\n    deprecation_message=\"does not do anything, inline_inbuilt_nn_modules is always True\",\n)\n```\n\nThe related commit message says:\n\n```text\ninline_inbuilt_nn_modules has defaulted to True and the False path is legacy.\nThis makes the config a no-op (always True), emits a deprecation warning when\nusers set it to False, and removes all dead False-path code from runtime.\n```\n\nHowever, we could not find a detailed public issue or design note explaining the full motivation and expected behavior changes from this deprecation. We would like to confirm whether the cache lookup / guard eval regression we observe is expected, and what guard strategy changes may explain it.\n\n### Error logs\n\n\nNo Python exception is required to reproduce the performance issue.\n\nRepresentative guard log summary:\n\n<img width=\"500\" height=\"250\" alt=\"Image\" src=\"https://github.com/user-attachments/assets/c98f6604-81c3-4f42-a177-ea91ef8c82df\" />\n\n\n### Versions\n2.7.1 and 2.12.0\n#### Observed behavior\n\nFor the same large inference workload and similar Dynamo configs:\n\n```python\ntorch._dynamo.config.guard_nn_modules = False\ntorch._dynamo.config.inline_inbuilt_nn_modules = True\n```\n\nwe observed approximately:\n\n```text\nPyTorch 2.7:\n  hot frame Guard eval latency: ~1.36 ms\n\nPyTorch 2.12:\n  hot frame Guard eval latency: ~5.65 ms\n```\n\nThe additional 2.12 `LAMBDA_GUARD`s appear \n\nIn 2.7, similar object aliasing relations were logged as `OBJECT_ALIASING`, for example:\n\n```text\nOBJECT_ALIASING: L['self']._modules['layers']._modules['0'].stream_prefetch is ...\n```\n\n#### Minimal reproducer direction\n\nWe can provide a small reproducer that imitates the workload pattern:\n\n1. Many repeated `nn.Module` layers.\n2. Repeated module attributes used in shape computations, such as `top_k`, `spec_len`, `block_size`, `num_heads`, `head_dim`.\n3. Module tensor attributes similar to `block_table`, `fa_norm_residual`, `cur_topk_list`.\n4. Shared Python objects across layers to trigger alias identity guards.\n\n#### Questions\n\n1. What was the full motivation for deprecating `torch._dynamo.config.inline_inbuilt_nn_modules` and making it effectively always True?\n2. Is the intended guidance that users should no longer try `inline_inbuilt_nn_modules=False` as a performance workaround?\n3. Besides `inline_inbuilt_nn_modules` becoming deprecated/no-op, what other Dynamo guard or cache lookup changes between 2.7 and 2.12 could increase runtime guard eval / cache lookup overhead for large inference graphs?\n\n4. If no config can safely recover 2.7-like lookup overhead in 2.12, what is the recommended mitigation for large repeated-module inference models? Should users refactor code to avoid reading Python/module attributes inside compiled regions, or is there a compiler-side way to reduce repeated guards?\n\n\n\ncc @ezyang @gchanan @kadeng @msaroufim @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @amjames @jataylo @azahed98",
+      "comments": [
+        {
+          "author": "zou3519",
+          "created_at": "2026-06-08T14:27:03Z",
+          "updated_at": "2026-06-08T14:27:03Z",
+          "body": "@williamwen42 do you want to take the questions?",
+          "url": "https://github.com/pytorch/pytorch/issues/185886#issuecomment-4650009249"
+        },
+        {
+          "author": "williamwen42",
+          "created_at": "2026-06-08T19:34:01Z",
+          "updated_at": "2026-06-08T19:34:01Z",
+          "body": "1. We deprecated `inline_inbuilt_nn_modules` so that we don't have to continue to maintain 2 tracing paths.\n2. Yes - we deemed the cost of reducing recompilations to be worth the slight additional overhead. We rewrote many guards to C++, and guard eval time hasn't been a significantly reported problem for a long time `inline_inbuilt_nn_modules` was defaulted to true.\n3. Can you try enabling the config `use_recursive_dict_tags_for_guards`? It's not enabled by default since it can potentially cause segfaults, but it should reduce the overhead of looking up attributes.\n4. `inline_inbuilt_nn_modules` only affects `nn.Module`s that are defined within PyTorch - are you adding attributes to those layers? Would it be possible to move this data to outside the inbuilt `nn.Module`?\n\nIf you could write up an actual reproducer, that would also be helpful. It is odd to me that so many `LAMBDA_GUARD`s are being created - are you able to share what they're guarding on?\n\ncc @anijain2305 but he's away for the next month.",
+          "url": "https://github.com/pytorch/pytorch/issues/185886#issuecomment-4652710115"
+        },
+        {
+          "author": "mihudaner",
+          "created_at": "2026-06-09T08:15:55Z",
+          "updated_at": "2026-06-09T08:23:49Z",
+          "body": "\n```\nself.layers = nn.ModuleList([\n    DecoderLayer(config, **{**kwargs, \"layer_idx\": layer_idx})\n    for layer_idx in range(config.num_hidden_layers)\n])\n```\nThank you for the detailed explanation. I have two follow-up questions:\n1: Is guard evaluation indeed the dominant cost in TorchDynamo cache lookup? Are there any tools or methods to analyze the time distribution of TorchDynamo cache lookup?\n2: Our model uses nn.ModuleList to hold multiple decoder layers. I'm not sure if this is related.\nLooking forward to your advice. Thanks!",
+          "url": "https://github.com/pytorch/pytorch/issues/185886#issuecomment-4657704785"
+        },
+        {
+          "author": "williamwen42",
+          "created_at": "2026-06-09T19:06:27Z",
+          "updated_at": "2026-06-09T19:06:27Z",
+          "body": "1. Guard eval is the dominant cost in dynamo cache lookup. We don't have any specialized tools to measure performance other than standard C/C++ methods of doing so (an agent could probably just do this for you).\n2. ModuleList doesn't immediately stand out as problematic to me - your DecoderLayer is a user-defined nn.Module right? If you can provide what LAMBDA_GUARDS are being generated or report on whether `use_recursive_dict_tags_for_guards` helps or not, I can try to provide more guidance.",
+          "url": "https://github.com/pytorch/pytorch/issues/185886#issuecomment-4663124279"
+        },
+        {
+          "author": "mihudaner",
+          "created_at": "2026-06-10T03:14:36Z",
+          "updated_at": "2026-06-10T03:18:39Z",
+          "body": "Yes, DecoderLayer is a user-defined nn.Module, and the ModuleList contains 82 DecoderLayer instances.\n\nI tested:\n\n  `  torch._dynamo.config.use_recursive_dict_tags_for_guards = True`\n\nbut it did not produce a measurable improvement. Dynamo cache lookup remained around 4 ms, approximately the same as with the default value False.\n\nA note on the analysis below: I am not deeply familiar with Dynamo's internal guard representation, so parts of my interpretation may be incomplete. I used an AI coding agent to help classify the full guard logs and then checked the counts and representative expressions against the original logs. Please correct me if I have misunderstood the meaning or runtime cost of any guard category.\n\nFor the production model's hot graph, I obtained:\n\n               \n<img width=\"465\" height=\"531\" alt=\"Image\" src=\"https://github.com/user-attachments/assets/f5a5d38a-8f9f-41d4-895c-c64fef5ab1d1\" />\n      \n\nThe total leaf guard count increased by only about 12%, while LAMBDA_GUARD increased by 12.4x and guard evaluation latency increased by\n4.15x.\n\nI classified the 1,755 LAMBDA_GUARDs in 2.12 into:\n\n-   676 tensor shape/layout relationships\n-   660 scalar module-attribute checks\n-   418 object identity/alias relationships\n-     1 ambient guard\n\nRepresentative expressions include:\n\n```\n    layer.input_layernorm.variance_epsilon == 1e-6\n\n    layer.self_attn.scale_fa == 0.08838834764831843\n\n    layer.self_attn.fa_norm_residual.size()[0]\n        == input_ids._base.size()[0]\n\n    layer.self_attn.block_table.size()[0]\n        == input_ids._base.size()[0]\n\n    layer.mlp.gate.cur_topk_list.stride()[0]\n        == layer.mlp.gate.cur_topk_list.size()[1]\n\n    position_ids is kv_len\n```\n\nMy current interpretation is that ModuleList itself may not be the direct cause of the regression. Unrolling a large number of DecoderLayers leads to duplicated guards for nested module attributes, symbolic shapes and object relationships. It seems the performance degradation is more likely related to how these guards are represented and their evaluation overhead, rather than the total quantity of guards.\nSince enabling use_recursive_dict_tags_for_guards=True did not reduce the measured cache lookup time,  Could these root-level relational and symbolic LAMBDA_GUARDs be out of the scope of the optimization brought by recursive dict tags?",
+          "url": "https://github.com/pytorch/pytorch/issues/185886#issuecomment-4666106072"
+        },
+        {
+          "author": "isuruf",
+          "created_at": "2026-06-10T15:48:48Z",
+          "updated_at": "2026-06-10T15:50:34Z",
+          "body": "Can you try `torch._dynamo.config.use_lamba_guard_for_object_aliasing = False`?",
+          "url": "https://github.com/pytorch/pytorch/issues/185886#issuecomment-4671947021"
+        },
+        {
+          "author": "isuruf",
+          "created_at": "2026-06-10T15:49:32Z",
+          "updated_at": "2026-06-10T15:50:38Z",
+          "body": "and `torch._dynamo.config.enable_cpp_symbolic_shape_guards = True`",
+          "url": "https://github.com/pytorch/pytorch/issues/185886#issuecomment-4671952532"
+        },
+        {
+          "author": "mihudaner",
+          "created_at": "2026-06-11T07:06:53Z",
+          "updated_at": "2026-06-11T07:07:27Z",
+          "body": "I tried several configurations. Here are the results（TorchDynamo Cache Lookuptime）:\n\n- 2.7.1 inline_inbuilt_nn_modules=False:                                958us990ns\n- 2.7.1 inline_inbuilt_nn_modules=True:                                 2ms193us880ns\n- 2.12.0 inline_inbuilt_nn_modules=True:                               4ms212us360ns\n- 2.12.0 use_recursive_dict_tags_for_guards = True:               4ms428us450ns\n- 2.12.0 enable_cpp_symbolic_shape_guards = True:             5ms111us560ns\n- 2.12.0 enable_cpp_symbolic_shape_guards = True,\n     and  use_lambda_guard_for_object_aliasing = False:        5ms328us930ns\n\nIt seems that in 2.12.0, inline_inbuilt_nn_modulesis enabled by default. In 2.7.1, setting it to Trueincreased the time slightly from under 1ms to about 2ms, but still far from the >4ms seen in 2.12.0. I'm a bit confused – even with the same inline_inbuilt_nn_modules=Trueconfiguration, there is almost a doubling of latency between versions. I also tried enable_cpp_symbolic_shape_guards, but it appears that TorchDynamo Cache Lookuptime actually became longer instead.",
+          "url": "https://github.com/pytorch/pytorch/issues/185886#issuecomment-4678052354"
+        },
+        {
+          "author": "williamwen42",
+          "created_at": "2026-06-18T23:41:00Z",
+          "updated_at": "2026-06-18T23:41:00Z",
+          "body": "Thanks for the detailed breakdown. I reproduced this with a synthetic model (many repeated user-defined layers, per-layer scalar attrs, shared objects, dynamic shapes) - guard eval is basically identical to 2.7 at 1 layer but scales ~4x worse per layer, so it compounds with depth.\n\nThe total guard count barely changed; the problem is that guards that used to be evaluated in C++ are now Python `LAMBDA_GUARD`s, and they live at the root of the guard tree. Two main offenders: (1) float module attributes (`variance_epsilon`, `scale_fa`, ...) are now unspecialized symbolic floats, so each emits a `not math.isnan(...)` lambda — in 2.7 these were C++ `EQUALS_MATCH`; (2) object aliasing moved to a batched Python lambda. Both run at the root, which is why `use_recursive_dict_tags_for_guards` alone did nothing for you — it only speeds up the per-module subtree, not root lambdas.\n\nThings to try:\n\n1. Set `specialize_float = True` **and** `use_recursive_dict_tags_for_guards = True` together. This recovered ~60% in my repro (close to 2.7). The recursive flag only starts helping once `specialize_float` clears the float lambdas off the root and the cost moves back into the subtree. `specialize_float=True` is safe as long as your epsilon/scale floats are constant (it only recompiles if a float *value* changes, and doesn't affect dynamic shapes).\n\n2. Hoist the per-layer scalar config (`variance_epsilon`, `scale_fa`, `top_k`, etc.) to module-level/closure constants so they bake in instead of generating a guard per layer; avoid sharing one Python object across all layers (that's the `... is ...` aliasing guards); and pass contiguous tensors instead of views (the `_base.size()` relations come from view inputs).\n\nOn our end, we will continue investigation to reduce guard eval time on the Dynamo side.\n\nIf you can try (1) and report the cache-lookup time, that'd be a great confirmation.",
+          "url": "https://github.com/pytorch/pytorch/issues/185886#issuecomment-4747016410"
+        },
+        {
+          "author": "isuruf",
+          "created_at": "2026-06-19T02:39:27Z",
+          "updated_at": "2026-06-19T02:39:27Z",
+          "body": "@williamwen42 do you mind sharing the script?",
+          "url": "https://github.com/pytorch/pytorch/issues/185886#issuecomment-4747989469"
+        },
+        {
+          "author": "mihudaner",
+          "created_at": "2026-06-22T02:47:11Z",
+          "updated_at": "2026-06-22T02:47:11Z",
+          "body": "> Thanks for the detailed breakdown. I reproduced this with a synthetic model (many repeated user-defined layers, per-layer scalar attrs, shared objects, dynamic shapes) - guard eval is basically identical to 2.7 at 1 layer but scales ~4x worse per layer, so it compounds with depth.\n> \n> The total guard count barely changed; the problem is that guards that used to be evaluated in C++ are now Python `LAMBDA_GUARD`s, and they live at the root of the guard tree. Two main offenders: (1) float module attributes (`variance_epsilon`, `scale_fa`, ...) are now unspecialized symbolic floats, so each emits a `not math.isnan(...)` lambda — in 2.7 these were C++ `EQUALS_MATCH`; (2) object aliasing moved to a batched Python lambda. Both run at the root, which is why `use_recursive_dict_tags_for_guards` alone did nothing for you — it only speeds up the per-module subtree, not root lambdas.\n> \n> Things to try:\n> \n> 1. Set `specialize_float = True` **and** `use_recursive_dict_tags_for_guards = True` together. This recovered ~60% in my repro (close to 2.7). The recursive flag only starts helping once `specialize_float` clears the float lambdas off the root and the cost moves back into the subtree. `specialize_float=True` is safe as long as your epsilon/scale floats are constant (it only recompiles if a float _value_ changes, and doesn't affect dynamic shapes).\n> 2. Hoist the per-layer scalar config (`variance_epsilon`, `scale_fa`, `top_k`, etc.) to module-level/closure constants so they bake in instead of generating a guard per layer; avoid sharing one Python object across all layers (that's the `... is ...` aliasing guards); and pass contiguous tensors instead of views (the `_base.size()` relations come from view inputs).\n> \n> On our end, we will continue investigation to reduce guard eval time on the Dynamo side.\n> \n> If you can try (1) and report the cache-lookup time, that'd be a great confirmation.\n\nThank you for the detailed breakdown. I tried option (1) you suggested and here are my findings.\n```\nWith the following configuration:\nc.guard_nn_modules = False\nc.inline_inbuilt_nn_modules = True \nc.use_recursive_dict_tags_for_guards = True\nc.specialize_float = True\n```\nThe cache‑lookup time dropped to 3ms 566µs 60ns. For reference, on PyTorch 2.7.1 with inline_inbuilt_nn_modules=True(which is the default in 2.12 as well), the time was 2ms 193µs 880ns. So there is still roughly a 1ms+ gap​ compared to 2.7.1.\nIt seems there might be other attributes or variables causing similar overhead？ That said, compared to the situation before applying these configs (where times were around 4–5 ms and earlier suggestions had little effect), this change did bring about ~1 ms improvement, which is encouraging.\nThank you again for your thorough investigation and recommendations. If there are any further updates on reducing guard evaluation time on the Dynamo side, we would greatly appreciate it if you could share them in this issue. We will continue to follow this thread closely.",
+          "url": "https://github.com/pytorch/pytorch/issues/185886#issuecomment-4764261252"
+        }
+      ]
+    },
+    {
+      "number": 187335,
+      "title": "[Inductor][CPU] #180212 fix is incomplete — #178244 reproducer still fails identically on 2.12.0+cpu (workaround: assert_indirect_indexing=False)",
+      "url": "https://github.com/pytorch/pytorch/issues/187335",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/187335",
+      "state": "open",
+      "author": "michalkrompiec",
+      "created_at": "2026-06-15T12:57:38Z",
+      "updated_at": "2026-06-21T19:36:39Z",
+      "closed_at": null,
+      "labels": [
+        "high priority",
+        "module: cpu",
+        "triaged",
+        "module: regression",
+        "has workaround",
+        "oncall: pt2",
+        "module: inductor",
+        "module: sdpa",
+        "bot-triaged"
+      ],
+      "comments_count": 1,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "## TL;DR\n\nPR #180212 (\"[Inductor][CPP] Fix check_bounds for inductor cpp backend\")\nwas marked as closing #178244 and landed in 2.12.0, but the original\nreproducer from #178244 **still fails identically** on 2.12.0+cpu —\nsame generated CPP file, same source line, same column, same diagnostic.\n\n**Workaround**: set `torch._inductor.config.assert_indirect_indexing = False`\nBEFORE the first `torch.compile` call. This bypasses the broken bounds-check\ncodegen path entirely and the reproducer runs to completion.\n\nThe env var `TORCHINDUCTOR_DISABLE_CPP_BOUNDS_CHECK=1` does NOT work as a\nworkaround (still fails — kept here so others don't repeat the experiment).\n\n## Tested versions\n\n| Version    | Default config | `assert_indirect_indexing=False` |\n|------------|----------------|----------------------------------|\n| 2.11.0+cpu | FAILS          | (not tested, presumed works)     |\n| 2.12.0+cpu | FAILS          | **PASSES** — all decode steps OK |\n\nBoth default-config failures emit at line 78, column 62 of the generated\n`main.cpp`, on the `TORCH_CHECK` bounds-check for an indexed load in the\ndecode-step recompile:\n\n```\nmain.cpp:78:62: error: 'tmp2' was not declared in this scope; did you mean 'tm'?\n```\n\n## Reproducer\n\nIdentical to #178244. Copied here for self-contained reference:\n\n```python\nimport torch\nimport torch.nn.functional as F\n\n\ndef causal_fn(b, h, q, kv):\n    return kv <= q\n\n\ndef padding_fn(padding_mask):\n    def inner(b, h, q, kv):\n        return padding_mask[b, kv]\n    return inner\n\n\ndef and_masks(f1, f2):\n    def combined(b, h, q, kv):\n        return f1(b, h, q, kv) & f2(b, h, q, kv)\n    return combined\n\n\ndef make_mask(batch_size, q_len, kv_len, q_offset, padding_mask):\n    fn = and_masks(causal_fn, padding_fn(padding_mask))\n    b = torch.arange(batch_size)[:, None, None, None]\n    h = torch.arange(1)[None, :, None, None]\n    q = (torch.arange(q_len) + q_offset)[None, None, :, None]\n    kv = torch.arange(kv_len)[None, None, None, :]\n    return fn(b, h, q, kv).expand(batch_size, 1, q_len, kv_len)\n\n\nclass Model(torch.nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.proj = torch.nn.Linear(32, 32, bias=False)\n\n    def forward(self, x, past_k, past_v, padding_mask, q_offset):\n        B, S, _ = x.shape\n        q = self.proj(x).view(B, S, 4, 8).transpose(1, 2)\n        k = x.view(B, S, 4, 8).transpose(1, 2)\n        v = k.clone()\n        if past_k is not None:\n            k = torch.cat([past_k, k], dim=2)\n            v = torch.cat([past_v, v], dim=2)\n        mask = make_mask(B, S, k.shape[2], q_offset, padding_mask)\n        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)\n        return out.transpose(1, 2).reshape(B, S, 32), k, v\n\n\nif __name__ == \"__main__\":\n    # Uncomment to apply the workaround:\n    # torch._inductor.config.assert_indirect_indexing = False\n\n    print(f\"torch {torch.__version__}\")\n    torch._dynamo.reset()\n    compiled = torch.compile(Model().eval())\n    pad = torch.ones(1, 8, dtype=torch.bool)\n    pad[0, :2] = False\n    with torch.no_grad():\n        out, pk, pv = compiled(torch.randn(1, 8, 32), None, None, pad, 0)\n        print(\"Prefill kv=8: OK\")\n        for step in range(3):\n            pad = torch.cat([pad, torch.ones(1, 1, dtype=torch.bool)], dim=1)\n            out, pk, pv = compiled(torch.randn(1, 1, 32), pk, pv, pad, pk.shape[2])\n            print(f\"Decode step {step + 1} kv={pk.shape[2]}: OK\")\n```\n\n## Verification matrix\n\n```\ntorch 2.12.0+cpu, default config:\n  Prefill kv=8: OK\n  Decode step 1: FAILED — InductorError: CppCompileError\n  main.cpp:78:62: error: 'tmp2' was not declared in this scope\n\ntorch 2.12.0+cpu, assert_indirect_indexing=False:\n  Prefill kv=8: OK\n  Decode step 1 kv=9: OK\n  Decode step 2 kv=10: OK\n  Decode step 3 kv=11: OK\n```\n\n## Environment\n\n- Platform: Linux x86_64, CPU only (gcc 13 system default)\n- PyTorch: 2.11.0+cpu (FAILS) and 2.12.0+cpu (also FAILS)\n- Python: 3.12\n\n## Suggestion\n\nEither re-open #178244 or treat this as a regression of the same code path\nthat #180212 attempted to fix. The bounds-check emit for closure-composed\nmask + SDPA on CPU dynamic-shape recompile is the common root.\n\ncc @ezyang @gchanan @kadeng @msaroufim @jgong5 @mingfeima @XiaobingSuper @sanchitintel @ashokei @jingxu10 @aditew01 @chauhang @penguinwu @voznesenskym @EikanWang @Guobing-Chen @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @muchulee8 @amjames @aakhundov @coconutruben @jataylo @drisspg @liangel-02 @howardzhang-cv @CaoE (closing-PR authors)",
+      "comments": [
+        {
+          "author": "jiqing-feng",
+          "created_at": "2026-06-17T02:55:43Z",
+          "updated_at": "2026-06-17T02:55:43Z",
+          "body": "Please try the nightly build pytorch by `pip3 install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cpu`. BYW,  the issue should be fixed in the next release version (2.13)",
+          "url": "https://github.com/pytorch/pytorch/issues/187335#issuecomment-4725466179"
+        }
+      ]
+    },
+    {
+      "number": 187728,
+      "title": "[vllm] [2.13 regression][Inductor] FxGraphCache._save_graph calls ShapeEnv.produce_guards_expression_with_source_info, missing on custom ShapeEnv",
+      "url": "https://github.com/pytorch/pytorch/issues/187728",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/187728",
+      "state": "closed",
+      "author": "atalman",
+      "created_at": "2026-06-19T15:00:28Z",
+      "updated_at": "2026-06-21T16:20:09Z",
+      "closed_at": "2026-06-21T16:20:09Z",
+      "labels": [
+        "triage review",
+        "module: crash",
+        "module: bc-breaking",
+        "module: regression",
+        "oncall: pt2",
+        "module: inductor",
+        "module: vllm",
+        "bot-triaged"
+      ],
+      "comments_count": 1,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "## Summary\nOn torch 2.13.0, `vllm/compilation` standalone-compile path crashes during engine init because `FxGraphCache._save_graph` calls a ShapeEnv method that does not exist on vLLM's custom `AlwaysHitShapeEnv`:\n\n```\nAttributeError: 'AlwaysHitShapeEnv' object has no attribute 'produce_guards_expression_with_source_info'\n```\nTorch-side call site:\n```\nFile \".../torch/_inductor/compile_fx.py\", line 1088, in _compile_fx_inner\n    FxGraphCache._save_graph(\nFile \".../torch/_inductor/codecache.py\", line 2180, in _save_graph\n    ) = shape_env.produce_guards_expression_with_source_info(\n```\nThis crashes the EngineCore (`Engine core initialization failed ... Server exited unexpectedly`), failing `tests/compile/test_aot_compile.py::test_standalone_compile_correctness`.\n\n`produce_guards_expression_with_source_info` appears to be new/renamed on the torch 2.13 `ShapeEnv`; `FxGraphCache._save_graph` now unconditionally calls it, so any custom/subclassed ShapeEnv that doesn't provide it breaks. Passes on `main` (torch 2.11), where this code path doesn't require the method.\n\n## Environment\n- torch **2.13.0**, torchvision **0.28.0**, triton **3.7.1** (PyTorch **test** channel)\n- CUDA **13.0**, Python **3.12**\n- vLLM test PR: vllm-project/vllm#45731 (branch `atalman:test-pytorch-2.13.0-test`)\n- Umbrella: pytorch/pytorch#187473\n\n## Failing test / job\n`tests/compile/test_aot_compile.py::test_standalone_compile_correctness` — [PyTorch Compilation Unit Tests](https://buildkite.com/vllm/ci/builds/72925#019edfeb-1722-47fa-9981-23d8547e0fd4)\n\n**Note (avoid confusion):** the same-named job *also* fails on recent `main` builds (73052, 72995) but with a **different** signature — `AttributeError: 'NoneType' object has no attribute 'model'` at `vllm/compilation/backends.py:994` (a separate vLLM-main regression). This issue is specifically the 2.13 `produce_guards_expression_with_source_info` failure, which does **not** occur on `main`.\n\n## Reproducibility\nNew on torch 2.13; **passes on `main` (torch 2.11)** across 5 recent Full CI builds (73052, 72995, 72843, 72766, 72616). Reproduces with the **same signature on two consecutive fresh 2.13 builds**:\n- 2026-06-15 — build [#72241](https://buildkite.com/vllm/ci/builds/72241)\n- 2026-06-18 — build [#72925](https://buildkite.com/vllm/ci/builds/72925)\n\n## Question / routing\nShould `FxGraphCache._save_graph` tolerate a ShapeEnv without `produce_guards_expression_with_source_info` (back-compat), or is vLLM's `AlwaysHitShapeEnv` expected to implement the new API? Flagging the 2.13 internal-API change.\n\n\ncc @ezyang @gchanan @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @aakhundov @coconutruben @jataylo",
+      "comments": [
+        {
+          "author": "jansel",
+          "created_at": "2026-06-21T16:20:08Z",
+          "updated_at": "2026-06-21T16:20:08Z",
+          "body": "My agent says this is fixed by https://github.com/pytorch/pytorch/pull/187581, which reverted the FX graph cache guard provenance change that introduced the unconditional source-info ShapeEnv calls. Current main no longer calls produce_guards_expression_with_source_info in FxGraphCache._save_graph, and I verified the legacy ShapeEnv save path no longer crashes.",
+          "url": "https://github.com/pytorch/pytorch/issues/187728#issuecomment-4762569350"
+        }
+      ]
+    },
+    {
+      "number": 187781,
+      "title": "[RFC] Topology-aware nn.Module primitives for memory optimization in torch.compile",
+      "url": "https://github.com/pytorch/pytorch/issues/187781",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/187781",
+      "state": "open",
+      "author": "teerthsharma",
+      "created_at": "2026-06-21T07:28:22Z",
+      "updated_at": "2026-06-21T07:39:47Z",
+      "closed_at": null,
+      "labels": [
+        "feature",
+        "module: nn",
+        "module: memory usage",
+        "triaged",
+        "needs design",
+        "oncall: pt2",
+        "module: compile ux",
+        "bot-triaged"
+      ],
+      "comments_count": 0,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "\n\nHi PyTorch team,\n\nI am working on a research prototype called `TopologyAwareJointOptimizer`. I would like feedback on whether topology-aware memory optimization is a direction that should be explored around `torch.compile`, `torch.nn`, `torchao`, or an out-of-tree PyTorch backend.\n\nThe problem I am trying to address is training-time memory pressure in transformer models. AMP, activation checkpointing, quantization, and low-rank factorization are all useful, but they are usually applied through local dtype or tensor-shape decisions. My prototype asks a different question: can PyTorch expose an experimental path for module rewrites that are gated by the topology of the model state, such as spectral decay, token co-occurrence graph structure, attention cluster structure, and stability after a short warmup?\n\nIn the prototype, a model first runs normally for a calibration window. After that, topology-aware guards decide whether individual modules should remain dense or be replaced by compressed equivalents. The important part is the gate: a transformation is only allowed when the measured structure suggests that compression should preserve behavior.\n\nThe current experimental primitives are:\n\n- `TopologyGatedLowRankLinear`: replaces eligible `nn.Linear` layers with a low-rank form only when the weight spectrum has enough decay to make the replacement both meaningful and memory-saving.\n- `SpectralPrototypeEmbedding`: builds a token co-occurrence graph, uses graph Laplacian structure to identify vocabulary communities, and compresses embeddings inside those communities with learned prototypes.\n- `TopologicalSpectralAttention`: keeps dense attention for short or unstructured sequences, but allows a cheaper clustered attention path when sequence length and spectral cluster checks justify it.\n- `LyapunovSpectralGuard`: tracks stability during and after warmup and rejects or rolls back compression if loss movement or spectral energy suggests the model is becoming unstable.\n\nI have benchmarked the stack on a single NVIDIA RTX 4060 Laptop GPU with GPT-2-small (124M parameters, batch size 2, sequence length 512). Measurements use `torch.cuda.max_memory_allocated()` after a full training step and compare against AMP plus gradient checkpointing.\n\n| Configuration | Peak Memory (MB) | Time/step (ms) | Loss | Memory change | Time change | Loss change |\n|---------------|------------------|----------------|------|---------------|-------------|-------------|\n| Baseline (AMP + gradient checkpointing) | 3123.74 | 244.04 | 10.8975 | - | - | - |\n| TopoStack (best memory) | 1873.29 | 231.49 | 11.0354 | -40.02% | -5.25% | +1.27% |\n| TopoStack (best loss) | 1897.82 | 230.12 | 10.9907 | -39.24% | -5.82% | +0.86% |\n\nI do not want to overstate these numbers. This is a small model on a consumer GPU, and the implementation is research-grade. The reason I think it is worth raising upstream is that the method appears most relevant at larger scales: larger vocabularies give the embedding graph more useful community structure, longer contexts make attention structure more important, and larger MLP blocks create more opportunities for guarded structural compression.\n\nWhat I am asking for is guidance on the right integration boundary:\n\n1. Is this kind of topology-gated module rewrite better explored as an out-of-tree `torch.compile` backend first?\n2. Is there an existing experimental namespace or project, such as `torchao`, where topology-aware memory primitives would fit better?\n3. Does Dynamo/FX currently have a recommended way to preserve custom module identity long enough for this kind of guarded rewrite?\n\n\nI can share the prototype repository and benchmark scripts once I know the right place to put them for review. I am mainly looking for feedback on whether the direction is technically interesting to PyTorch and what kind of evidence would make it actionable.\n\n### Alternatives\n\nThe alternatives I have considered are:\n\n- Continue developing this fully out of tree as a research backend.\n- Frame the work as `torchao`-adjacent because it overlaps with memory, precision, and representation changes.\n- Treat the pieces separately as low-rank layers, embedding compression, and attention approximations, although that loses the main idea that topology is the decision mechanism.\n- Avoid compiler integration and expose only explicit `nn.Module` replacements, which is simpler but less useful for existing models.\n\n\n\n",
+      "comments": []
+    },
+    {
+      "number": 187780,
+      "title": "[RFC] Topology-aware nn.Module primitives for memory optimization in torch.compile",
+      "url": "https://github.com/pytorch/pytorch/issues/187780",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/187780",
+      "state": "closed",
+      "author": "KarmicDaoist",
+      "created_at": "2026-06-21T07:24:04Z",
+      "updated_at": "2026-06-21T07:25:57Z",
+      "closed_at": "2026-06-21T07:25:48Z",
+      "labels": [
+        "triage review",
+        "feature",
+        "oncall: pt2",
+        "module: compile ux",
+        "bot-triaged"
+      ],
+      "comments_count": 0,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "### 🚀 The feature, motivation and pitch\n\nHi PyTorch team,\n\nI am experimenting with a prototype called `TopologyAwareJointOptimizer`, and I would like feedback on whether topology-aware memory optimization belongs anywhere in the PyTorch stack, especially around `torch.compile`, `torch.nn`, `torchao`, or an external backend prototype.\n\nThe core idea is to treat parts of a neural network as structured objects with measurable spectral/topological invariants. After a short calibration or warmup window, the optimizer scans modules for stable structure and only applies compression when a guard says the replacement should preserve the model's behavior closely enough.\n\nThe experimental primitives I have built are:\n\n- `TopologyGatedLowRankLinear`: replaces eligible `nn.Linear` weights with a low-rank factorization when the weight spectrum has enough decay. The gate avoids applying the replacement when the matrix is not actually low-rank enough to save memory.\n- `SpectralPrototypeEmbedding`: builds a token co-occurrence graph, clusters the vocabulary using graph Laplacian structure, and compresses token embeddings inside each community with learned prototypes.\n- `TopologicalSpectralAttention`: a sequence-length-gated attention replacement that looks for spectral cluster structure before trying to use a cheaper attention path. The intent is to preserve dense attention for short or unstructured sequences.\n- `LyapunovSpectralGuard`: a stability guard that tracks spectral energy / loss movement after warmup and rejects or rolls back compression when the model appears unstable.\n\nThe pitch is not that these exact Python modules should be merged as-is. I am asking whether PyTorch would be interested in an experimental path for topology-aware module transformations: for example, a `torch.compile` pass, a `torch.nn.experimental` primitive set, or a documented out-of-tree backend interface that preserves these module identities through tracing.\n\nI have tested the prototype on a single NVIDIA RTX 4060 Laptop GPU with GPT-2-small (124M parameters, batch size 2, sequence length 512). Measurements use `torch.cuda.max_memory_allocated()` after a full training step and compare against AMP + gradient checkpointing.\n\n| Configuration | Peak Memory (MB) | Time/step (ms) | Loss | Memory Δ | Time Δ | Loss Δ |\n|---------------|------------------|----------------|------|----------|--------|--------|\n| Baseline (AMP + gradient checkpointing) | 3123.74 | 244.04 | 10.8975 | - | - | - |\n| TopoStack (best memory) | 1873.29 | 231.49 | 11.0354 | -40.02% | -5.25% | +1.27% |\n| TopoStack (best loss) | 1897.82 | 230.12 | 10.9907 | -39.24% | -5.82% | +0.86% |\n\nThese numbers are from a small consumer GPU and should be treated as prototype evidence, not a final benchmark. The reason I think this is worth discussing upstream is that the method should scale better on larger models where embedding tables, MLP blocks, and attention memory dominate more strongly. On models with larger vocabularies and longer context windows, the same topology-aware decisions should have more structure to exploit.\n\nA possible upstream shape could be:\n\n```python\nmodel = torch.compile(\n    model,\n    backend=\"inductor\",\n    options={\n        \"topology_memory_optimization\": True,\n        \"topology_warmup_steps\": 200,\n        \"topology_guard\": \"lyapunov_spectral\",\n    },\n)\n```\n\nor, if this should not live directly in `torch.compile`, something closer to:\n\n```python\nfrom torch.nn.experimental import TopologyGatedLowRankLinear, SpectralPrototypeEmbedding\n```\n\nThe most important design requirement for my use case is that the concept remains explicit as topology-aware optimization, rather than being collapsed into generic low-rank or quantization passes. The topology part is the gate: the transformations are only supposed to happen when the graph/spectrum/stability checks say the model has structure worth exploiting.\n\n### Alternatives\n\nThe existing alternatives I have considered are:\n\n- AMP / BF16 training: useful, but does not use graph or spectral structure.\n- Gradient checkpointing: reduces activation memory, but trades compute for memory and does not compress weights or embeddings.\n- Quantization / `torchao`: relevant for precision and storage, but this prototype is more about topology-gated structural replacement.\n- Low-rank adapters or factorized layers: similar in implementation to one primitive, but usually applied manually or uniformly rather than selected by spectral/topological diagnostics.\n- Out-of-tree `torch.compile` backend: probably the safest place for further research, but I would like guidance on what compiler hooks are stable enough for this kind of module transformation.\n\n### Additional context\n\nI am looking for feedback on the right integration boundary, not requesting immediate acceptance of a large feature. Specific questions:\n\n1. Should topology-aware module rewrites be explored as an out-of-tree `torch.compile` backend first?\n2. Is there an existing place in PyTorch where experimental `nn.Module` replacements like these should live?\n3. Is preserving custom module identity through Dynamo/FX the right direction for this work?\n4. Would maintainers prefer this to be framed as a `torchao` research prototype instead of a `torch.compile` proposal?\n\nI can share the prototype repository and benchmark scripts for review if this direction is useful. The current implementation is research-grade, but the early results suggest that topology-gated memory optimization may be worth investigating for larger transformer workloads.\n\ncc @chauhang @penguinwu @albanD @ezyang @janeyx99 @cpuhrsch if this is in the right area for compiler / nn / training-memory design feedback.",
+      "comments": []
+    },
+    {
+      "number": 181243,
+      "title": "Dynamo shouldn't assume modules are reimportable",
+      "url": "https://github.com/pytorch/pytorch/issues/181243",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/181243",
+      "state": "closed",
+      "author": "ezyang",
+      "created_at": "2026-04-23T14:19:52Z",
+      "updated_at": "2026-06-21T06:45:21Z",
+      "closed_at": "2026-06-21T06:45:21Z",
+      "labels": [
+        "triaged",
+        "oncall: pt2",
+        "module: dynamo",
+        "dynamo-triage-dec2025"
+      ],
+      "comments_count": 1,
+      "matched_keywords": [
+        "dynamo"
+      ],
+      "body": "Repro:\n\n```\n\"\"\"Repro: torch._dynamo fails when tracing a function defined in a module\nloaded via importlib that is NOT registered in sys.modules.\n\nDynamo's symbolic_convert tries to re-import the module by name during\nLOAD_GLOBAL resolution (see symbolic_convert.py import_source / _import_module).\nIf the module isn't in sys.modules, it raises ModuleNotFoundError.\n\nExpected: Dynamo should handle functions from modules not in sys.modules\ngracefully (or at least give a clear error).\n\nActual: InternalTorchDynamoError wrapping ModuleNotFoundError.\n\"\"\"\n\nimport importlib.util\nimport tempfile\nimport textwrap\nfrom pathlib import Path\n\nimport torch\n\n\ndef load_module_by_path(path: Path):\n    \"\"\"Load a module by path WITHOUT registering in sys.modules.\"\"\"\n    spec = importlib.util.spec_from_file_location(path.stem, path)\n    assert spec is not None and spec.loader is not None\n    mod = importlib.util.module_from_spec(spec)\n    # NOTE: intentionally not doing sys.modules[path.stem] = mod\n    spec.loader.exec_module(mod)\n    return mod\n\n\n# Write a trivial module to a temp file\ntmpdir = tempfile.mkdtemp()\nmod_path = Path(tmpdir) / \"my_op.py\"\nmod_path.write_text(textwrap.dedent(\"\"\"\\\n    import functools\n    import torch\n    import torch.nn.functional as F\n\n    def _helper(x: torch.Tensor, scale: int) -> torch.Tensor:\n        return F.normalize(x, dim=-1) * scale\n\n    def my_fn(x: torch.Tensor, scale: int) -> torch.Tensor:\n        return _helper(x, scale)\n\n    fn = functools.partial(my_fn, scale=2)\n\"\"\"))\n\n# Load the module (not in sys.modules)\nmod = load_module_by_path(mod_path)\nfn = mod.fn\n\n# This triggers the bug: Dynamo traces fn, sees fn.__module__ == \"my_op\",\n# tries importlib.import_module(\"my_op\"), fails.\nx = torch.randn(4, 4, device=\"cuda\")\ncompiled = torch.compile(fn)\nresult = compiled(x)\nprint(f\"Success: {result.shape}\")\n\n```\n\nThis prints:\n\n```\n\n    File \".../torch/_dynamo/eval_frame.py\", line 926, in compile_wrapper\n      return fn(*args, **kwargs)\n             ^^^^^^^^^^^^^^^^^^^\n    File \".../torch/_dynamo/convert_frame.py\", line 2194, in __call__\n      result = self._torchdynamo_orig_backend(\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    File \".../torch/_dynamo/convert_frame.py\", line 1937, in __call__\n      result = self._inner_convert(\n               ^^^^^^^^^^^^^^^^^^^^\n    File \".../torch/_dynamo/convert_frame.py\", line 706, in __call__\n      result = _compile(\n               ^^^^^^^^^\n    File \".../torch/_dynamo/convert_frame.py\", line 1807, in _compile\n      raise InternalTorchDynamoError(\n    File \".../torch/_dynamo/convert_frame.py\", line 1744, in _compile\n      guarded_code, tracer_output = compile_inner(code, one_graph, hooks)\n                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    File \".../torch/_utils_internal.py\", line 97, in wrapper_function\n      return function(*args, **kwargs)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^\n    File \".../torch/_dynamo/convert_frame.py\", line 1425, in compile_inner\n      return _compile_inner(code, one_graph, hooks)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    File \".../torch/_dynamo/convert_frame.py\", line 1459, in _compile_inner\n      dynamo_output = compile_frame(\n                      ^^^^^^^^^^^^^^\n    File \".../torch/_dynamo/convert_frame.py\", line 1341, in compile_frame\n      bytecode, tracer_output = transform_code_object(code, transform)\n                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    File \".../torch/_dynamo/bytecode_transformation.py\", line 1600, in transform_code_object\n      tracer_output = transformations(instructions, code_options)\n                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    File \".../torch/_dynamo/convert_frame.py\", line 1313, in transform\n      tracer_output = trace_frame(\n                      ^^^^^^^^^^^^\n    File \".../torch/_dynamo/convert_frame.py\", line 328, in _fn\n      return fn(*args, **kwargs)\n             ^^^^^^^^^^^^^^^^^^^\n    File \".../torch/_dynamo/convert_frame.py\", line 837, in trace_frame\n      run_tracer()\n    File \".../torch/_dynamo/convert_frame.py\", line 818, in run_tracer\n      tracer.run()\n    File \".../torch/_dynamo/symbolic_convert.py\", line 1643, in run\n      while self.step():\n            ^^^^^^^^^^^\n    File \".../torch/_dynamo/symbolic_convert.py\", line 1323, in step\n      self.dispatch_table[inst.opcode](self, inst)\n    File \".../torch/_dynamo/symbolic_convert.py\", line 858, in wrapper\n      return inner_fn(self, inst)\n             ^^^^^^^^^^^^^^^^^^^^\n    File \".../torch/_dynamo/symbolic_convert.py\", line 2565, in CALL_FUNCTION_EX\n      self.call_function(fn, argsvars.items, kwargsvars)\n    File \".../torch/_dynamo/symbolic_convert.py\", line 1229, in call_function\n      self.push(fn.call_function(self, args, kwargs))  # type: ignore[arg-type]\n                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    File \".../torch/_dynamo/variables/lazy.py\", line 218, in realize_and_forward\n      return getattr(self.realize(), name)(*args, **kwargs)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    File \".../torch/_dynamo/variables/functions.py\", line 2325, in call_function\n      return self.func.call_function(tx, merged_args, merged_kwargs)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    File \".../torch/_dynamo/variables/functions.py\", line 678, in call_function\n      return super().call_function(tx, args, kwargs)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    File \".../torch/_dynamo/variables/functions.py\", line 394, in call_function\n      return tx.inline_user_function_return(self, [*self.self_args(), *args], kwargs)  # type:\n  ignore[attr-defined]\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    File \".../torch/_dynamo/symbolic_convert.py\", line 1251, in inline_user_function_return\n      return InliningInstructionTranslator.inline_call(self, fn, args, kwargs)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    File \".../torch/_dynamo/symbolic_convert.py\", line 4727, in inline_call\n      return tracer.inline_call_()\n             ^^^^^^^^^^^^^^^^^^^^^\n    File \".../torch/_dynamo/symbolic_convert.py\", line 4944, in inline_call_\n      self.run()\n    File \".../torch/_dynamo/symbolic_convert.py\", line 1643, in run\n      while self.step():\n            ^^^^^^^^^^^\n    File \".../torch/_dynamo/symbolic_convert.py\", line 1323, in step\n      self.dispatch_table[inst.opcode](self, inst)\n    File \".../torch/_dynamo/symbolic_convert.py\", line 1819, in LOAD_GLOBAL\n      self._load_global(inst)\n    File \".../torch/_dynamo/symbolic_convert.py\", line 5154, in _load_global\n      _, fglobals_vt, global_source = self.get_globals_source_and_value(name)\n                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    File \".../torch/_dynamo/symbolic_convert.py\", line 5115, in get_globals_source_and_value\n      module_source = self.import_source(module_name)\n                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    File \".../torch/utils/_functools.py\", line 43, in wrap\n      value = f(self, *args, **kwargs)\n              ^^^^^^^^^^^^^^^^^^^^^^^^\n    File \".../torch/_dynamo/symbolic_convert.py\", line 1854, in import_source\n      value = _import_module(module_name)\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    File \".../torch/_dynamo/symbolic_convert.py\", line 232, in _import_module\n      return importlib.import_module(name)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    File \".../importlib/__init__.py\", line 90, in import_module\n      return _bootstrap._gcd_import(name[level:], package, level)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    File \"<frozen importlib._bootstrap>\", line 1381, in _gcd_import\n    File \"<frozen importlib._bootstrap>\", line 1354, in _find_and_load\n    File \"<frozen importlib._bootstrap>\", line 1318, in _find_and_load_unlocked\n  torch._dynamo.exc.InternalTorchDynamoError: ModuleNotFoundError: No module named 'my_op'\n```\n\nWe shouldn't assume modules are importable! With importlib you can construct modules that are not.\n\nI am not blocked by this but put this on the CPython fidelity list. cc @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @kadeng @amjames @Lucaskabela @jataylo @azahed98 @anijain2305 \n\n",
+      "comments": [
+        {
+          "author": "ezyang",
+          "created_at": "2026-04-23T20:05:12Z",
+          "updated_at": "2026-04-23T20:05:12Z",
+          "body": "cc @williamwen42 ",
+          "url": "https://github.com/pytorch/pytorch/issues/181243#issuecomment-4307564502"
+        }
+      ]
+    }
+  ]
+}
