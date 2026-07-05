@@ -1,0 +1,311 @@
+{
+  "metadata": {
+    "repo": "pytorch/pytorch",
+    "keywords": [
+      "compile",
+      "inductor",
+      "dynamo"
+    ],
+    "generated_at": "2026-07-05T04:00:03.264815+00:00",
+    "since": "2026-07-04T04:00:03.264815+00:00",
+    "lookback_hours": 24.0,
+    "timezone": "Asia/Shanghai",
+    "report_date": "2026-07-05",
+    "issue_count": 3
+  },
+  "issues": [
+    {
+      "number": 173232,
+      "title": "error C2872: 'std': ambiguous symbol when compiling `csrc/dynamo/compiled_autograd.h`",
+      "url": "https://github.com/pytorch/pytorch/issues/173232",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/173232",
+      "state": "open",
+      "author": "JulianKnodt",
+      "created_at": "2026-01-24T02:23:05Z",
+      "updated_at": "2026-07-05T03:28:25Z",
+      "closed_at": null,
+      "labels": [
+        "module: windows",
+        "triaged",
+        "oncall: pt2",
+        "module: compiled autograd"
+      ],
+      "comments_count": 14,
+      "matched_keywords": [
+        "compile",
+        "dynamo"
+      ],
+      "body": "I've been trying to compile simple-knn which is a submodule of gaussian splatting, and have been hitting a compile bug inside of pytorch.\n\nWhen running `pip install submodules/simple-knn` (https://gitlab.inria.fr/bkerbl/simple-knn.git), I am running into a compile error in the following file:\n\nhttps://github.com/pytorch/pytorch/blob/3ac92f2d1330d75799d3ee6cfe8e509615fb1854/torch/csrc/dynamo/compiled_autograd.h#L1142\n\nI don't think it matters the specific thing I'm trying to compile, but for reproducibility thought it may be useful.\n\nThe error is\n\n```\nspatial.cu\n      tmpxft_0000106c_00000000-7_spatial.cudafe1.cpp\n      C:/Users/Julian/Desktop/projects/python/gaussian-splatting/.venv/Lib/site-packages/torch/include\\torch/csrc/dynamo/compiled_autograd.h(1136): error C2872: 'std': ambiguous symbol\n      C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.50.35717/include\\valarray(20): note: could be 'std'\n      C:/Users/Julian/Desktop/projects/python/gaussian-splatting/.venv/Lib/site-packages/torch/include\\torch/csrc/dynamo/compiled_autograd.h(1136): note: or       'std'\n      C:/Users/Julian/Desktop/projects/python/gaussian-splatting/.venv/Lib/site-packages/torch/include\\torch/csrc/dynamo/compiled_autograd.h(1136): note: the template instantiation context (the oldest one\n      first) is\n      C:/Users/Julian/Desktop/projects/python/gaussian-splatting/.venv/Lib/site-packages/torch/include\\torch/csrc/dynamo/compiled_autograd.h(1183): note: see reference to class template instantiation\n      'torch::dynamo::autograd::IValuePacker<__int64>' being compiled\n      C:/Users/Julian/Desktop/projects/python/gaussian-splatting/.venv/Lib/site-packages/torch/include\\torch/csrc/dynamo/compiled_autograd.h(1110): note: while compiling class template member function\n      'c10::TypePtr torch::dynamo::autograd::IValuePacker<__int64>::packed_type(void)'\n      C:/Users/Julian/Desktop/projects/python/gaussian-splatting/.venv/Lib/site-packages/torch/include\\torch/csrc/dynamo/compiled_autograd.h(1183): note: see the first reference to\n      'torch::dynamo::autograd::IValuePacker<__int64>::packed_type' in 'torch::dynamo::autograd::IValuePacker<unsigned __int64>::packed_type'\n      ninja: build stopped: subcommand failed.\n```\n\nIf I delete the line with `std::string`, or change `std::string` to another type without the `::std` or `std` prefix, the compile error goes away. In this case, I think just deleting is fine because these are compile time checks and if this code was actually being hit it would fail compilation. I don't know why I'm hitting this where others aren't (it's on a fresh install of windows and with a more recent possibly unsupported version of visual studios), but thought it was worth pointing it out.\n\n\ncc @peterjc123 @mszhanyi @skyline75489 @nbcsm @iremyux @Blackhex @chauhang @penguinwu @xmfan @aditvenk",
+      "comments": [
+        {
+          "author": "lakshayg",
+          "created_at": "2026-01-26T19:10:49Z",
+          "updated_at": "2026-01-26T19:10:49Z",
+          "body": "Looks related to https://github.com/pytorch/pytorch/pull/144707#issuecomment-2692282551",
+          "url": "https://github.com/pytorch/pytorch/issues/173232#issuecomment-3801276235"
+        },
+        {
+          "author": "zou3519",
+          "created_at": "2026-01-26T19:35:15Z",
+          "updated_at": "2026-01-26T19:35:15Z",
+          "body": "I'm not very good with windows or C++ `if constexpr` but please feel free to submit PRs and I can test them out",
+          "url": "https://github.com/pytorch/pytorch/issues/173232#issuecomment-3801371506"
+        },
+        {
+          "author": "JulianKnodt",
+          "created_at": "2026-01-26T21:39:19Z",
+          "updated_at": "2026-01-26T21:41:17Z",
+          "body": "One of the commenters simply suggested that those lines be commented/removed. For this specific case, I agree with the commenter, since this is only a compile time check and it doesn't seem like the branch was ever being hit. Of course, only the original author could explain why they were added in the first place. Are all those checks required?\n\nI can't really speak to why the error occurs in the first place. I do wonder if it's something specific to the compiler (since it works on other OSes)\n\nI can submit a PR to just delete it, but before understanding why it's there, there's not much point",
+          "url": "https://github.com/pytorch/pytorch/issues/173232#issuecomment-3801884734"
+        },
+        {
+          "author": "zou3519",
+          "created_at": "2026-01-26T22:06:32Z",
+          "updated_at": "2026-01-26T22:06:32Z",
+          "body": "I'm the author of the PR that introduced the checks. The [check](https://github.com/pytorch/pytorch/blob/abfe9ef77e239194833a03481bbf1f3ff2de8ee2/torch/csrc/dynamo/compiled_autograd.h#L1153-L1163) is there to give a nice error message if someone adds a new type. If we remove the check then I expect if someone adds a new type they'll just get a compilation error. So I'm OK with deleting it (also requesting a sanity check from @xmfan)",
+          "url": "https://github.com/pytorch/pytorch/issues/173232#issuecomment-3801981342"
+        },
+        {
+          "author": "xmfan",
+          "created_at": "2026-01-27T22:18:50Z",
+          "updated_at": "2026-01-27T22:18:50Z",
+          "body": "i'm not sure i fully understand, does this mean that any usage of `std` in a pytorch header would cause this issue? what is the other \"std\" namespace that we are conflicting with?",
+          "url": "https://github.com/pytorch/pytorch/issues/173232#issuecomment-3807805386"
+        },
+        {
+          "author": "JulianKnodt",
+          "created_at": "2026-01-27T23:04:04Z",
+          "updated_at": "2026-01-27T23:15:26Z",
+          "body": "My guess/understanding at this point is that when this template is instantiated somewhere by nvcc, at that point the namespace has been polluted with `std`, and that conflicts with the usage of `std` from the header file.\n\nAs an experiment, I tried:\n- replacing `std::string` with just string, then this fails to compile.\n- replacing `std::string` with `int32_t`, this compiles fine.\n- replacing `std::string` with `std::int32_t`, this fails to compile.\nI would imagine that std::is_same works fine since it's also instantiated outside of the context which pollutes the namespace (I'm not positive about this but it would make sense)\n\nOther comments on this issue that I saw also note that it's fine if passing additional flags (I think `-Dpermissive` or something like it), since both `std` are the same (I imagine), but are introduced twice.\n",
+          "url": "https://github.com/pytorch/pytorch/issues/173232#issuecomment-3807988491"
+        },
+        {
+          "author": "lakshayg",
+          "created_at": "2026-01-27T23:24:19Z",
+          "updated_at": "2026-01-27T23:24:19Z",
+          "body": "This file does not include `<string>`, could you try including that and check if it compiles?",
+          "url": "https://github.com/pytorch/pytorch/issues/173232#issuecomment-3808087908"
+        },
+        {
+          "author": "JulianKnodt",
+          "created_at": "2026-01-28T00:00:18Z",
+          "updated_at": "2026-01-28T00:00:18Z",
+          "body": "Tried it, still doesn't compile",
+          "url": "https://github.com/pytorch/pytorch/issues/173232#issuecomment-3808184589"
+        },
+        {
+          "author": "guilhermeleobas",
+          "created_at": "2026-01-30T19:37:19Z",
+          "updated_at": "2026-01-30T19:53:55Z",
+          "body": "I have fixed some C++ compile errors in the past on Windows, and I'm happy to take a look at this one as well. @JulianKnodt Is this the only compiler error MSVC reports? And the version of MSVC that you're using.",
+          "url": "https://github.com/pytorch/pytorch/issues/173232#issuecomment-3825397532"
+        },
+        {
+          "author": "woct0rdho",
+          "created_at": "2026-02-05T07:55:56Z",
+          "updated_at": "2026-02-05T07:55:56Z",
+          "body": "Hi, there are also some discussions in https://github.com/pytorch/pytorch/issues/148317#issuecomment-3344732754 . I think it's an issue about how to pass flags when nvcc calls MSVC.",
+          "url": "https://github.com/pytorch/pytorch/issues/173232#issuecomment-3851634228"
+        },
+        {
+          "author": "JulianKnodt",
+          "created_at": "2026-02-05T18:17:01Z",
+          "updated_at": "2026-02-05T18:17:01Z",
+          "body": "I added a check that it's window and nvcc and skip compiling that branch if so, but I'm not sure whether that's what the maintainers want, and currently it seems that @guilhermeleobas wants to take ownership of this.",
+          "url": "https://github.com/pytorch/pytorch/issues/173232#issuecomment-3855375910"
+        },
+        {
+          "author": "hfassold",
+          "created_at": "2026-04-10T10:04:08Z",
+          "updated_at": "2026-04-10T10:04:08Z",
+          "body": "powershell -Command \"(Get-Content '%HEADER_FILE%') -replace '(?<!:)\\bstd::', '::std::' | Set-Content '%HEADER_FILE%'\"",
+          "url": "https://github.com/pytorch/pytorch/issues/173232#issuecomment-4222725894"
+        },
+        {
+          "author": "Sahil170595",
+          "created_at": "2026-07-04T16:26:30Z",
+          "updated_at": "2026-07-04T16:26:30Z",
+          "body": "I reproduced this on a fresh setup and validated a fix end to end. Happy to submit the PR per @zou3519's earlier offer to test, unless @guilhermeleobas is still working on it.\n\n**Repro (vanilla flags, no special config):** MSVC 14.42.34433 (cl 19.42.34444), CUDA 13.0 (nvcc V13.0.88), torch 2.11.0+cu128, Python 3.13, Windows 11. Minimal extension: a `.cu` containing only `#include <torch/extension.h>` plus a trivial kernel, built via `torch.utils.cpp_extension.load()`. Result:\n\n```\ntorch/csrc/dynamo/compiled_autograd.h(1143): error C2872: 'std': ambiguous symbol\n  note: could be 'std' (valarray(20))\n  note: the template instantiation context is ... IValuePacker<__int64>::packed_type\n```\n\n(line 1143 in the torch 2.11.0 release headers; the same branch is at line 1145 on current main)\n\n**Why the existing carve-out never fires** (measured with a macro probe compiled under the same nvcc flags, host and device passes):\n\n| macro | device pass | host pass |\n|---|---|---|\n| `_WIN32` | defined | defined |\n| `__CUDACC__` | defined | defined |\n| `USE_CUDA` | undefined | undefined |\n| `USE_ROCM` | undefined | undefined |\n\n`USE_CUDA` / `USE_ROCM` are libtorch build-config defines that downstream extension builds never set, so `#if defined(_WIN32) && (defined(USE_CUDA) || defined(USE_ROCM))` is false for every Windows CUDA extension build and the if-constexpr chain compiles under nvcc. (Downstream projects have been working around exactly this, e.g. by manually passing `-DUSE_CUDA` to their extension builds.)\n\n**Fix validated on the failing box** (patched the installed header, re-ran the identical build):\n\n1. Primary: add an explicit `IValuePacker<std::string>` specialization (mirroring the existing `size_t` and `std::vector<at::SymInt>` specializations) and drop the `else if constexpr (::std::is_same_v<T, ::std::string>)` branch from the primary-template chain. That branch is the only one in the chain whose right-hand type lives in namespace `std`, and it trips C2872 for every instantiation of the chain, which matches @JulianKnodt's earlier observation that altering that exact line unblocks the build. Semantically identical on all platforms; strings still pack as `at::StringType`. Builds clean, verified.\n2. Also verified as a diagnostic: extending the guard with `|| defined(__CUDACC__)` fixes this config too. I would not ship that as the fix, since it routes extension TUs into the not-implemented carve-out (masking capability) and is macro-dependent, but it corroborates the mechanism.\n\nIf that shape sounds right I will put up the PR with the failing/passing logs and the macro table. cc @malfet @xmfan\n",
+          "url": "https://github.com/pytorch/pytorch/issues/173232#issuecomment-4883049373"
+        },
+        {
+          "author": "guilhermeleobas",
+          "created_at": "2026-07-05T03:28:21Z",
+          "updated_at": "2026-07-05T03:28:21Z",
+          "body": "> I reproduced this on a fresh setup and validated a fix end to end. Happy to submit the PR per @zou3519's earlier offer to test, unless @guilhermeleobas is still working on it.\n\nPlease, feel free to work on this one.",
+          "url": "https://github.com/pytorch/pytorch/issues/173232#issuecomment-4884702779"
+        }
+      ]
+    },
+    {
+      "number": 148317,
+      "title": "compile SageAttention faing error C2872: “std” for latest torch nightly",
+      "url": "https://github.com/pytorch/pytorch/issues/148317",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/148317",
+      "state": "open",
+      "author": "NOFOX",
+      "created_at": "2025-03-03T09:26:12Z",
+      "updated_at": "2026-07-05T01:14:46Z",
+      "closed_at": null,
+      "labels": [
+        "module: windows",
+        "triaged",
+        "module: regression",
+        "oncall: pt2"
+      ],
+      "comments_count": 16,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "ENV: Win11 ,VS2022, Torch:\nprint(torch.version)\n2.7.0.dev20250302+cu128\nprint(torchvision.version)\n0.22.0.dev20250302+cu128\nprint(torch.cuda.is_available())\nTrue\nprint(torch.cuda.get_device_name(0))\nNVIDIA GeForce RTX 5080\nprint(torch.cuda.get_device_capability(0))\n(12, 0)\n\ncompile SageAttention faing error C2872: “std”\nC:/tools/AI/ComfyUI-aki-v1.4/python/lib/site-packages/torch/include\\torch/csrc/dynamo/compiled_autograd.h(1076): error C2872: “std”: 不明确的符号\nC:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.43.34808/include\\valarray(20): note: 可能是“std”\nC:/tools/AI/ComfyUI-aki-v1.4/python/lib/site-packages/torch/include\\torch/csrc/dynamo/compiled_autograd.h(1076): note: 或  “std”\nC:/tools/AI/ComfyUI-aki-v1.4/python/lib/site-packages/torch/include\\torch/csrc/dynamo/compiled_autograd.h(1076): note: 模板实例化上下文(最早的实例化上下文)为\nC:/tools/AI/ComfyUI-aki-v1.4/python/lib/site-packages/torch/include\\torch/csrc/dynamo/compiled_autograd.h(1121): note: 查看对正在编译的 类 模板 实例化“torch::dynamo::autograd::IValuePacker<__int64>”的引用\nC:/tools/AI/ComfyUI-aki-v1.4/python/lib/site-packages/torch/include\\torch/csrc/dynamo/compiled_autograd.h(1059): note: 在编译 类 模板 成员函数“c10::TypePtr torch::dynamo::autograd::IValuePacker<__int64>::packed_type(void)”时\nC:/tools/AI/ComfyUI-aki-v1.4/python/lib/site-packages/torch/include\\torch/csrc/dynamo/compiled_autograd.h(1121): note: 请参阅 \"torch::dynamo::autograd::IValuePacker<unsigned __int64>::packed_type\" 中对 \"torch::dynamo::autograd::IValuePacker<__int64>::packed_type\" 的第一个引用\nninja: build stopped: subcommand failed.\n\n\n\n\ncc @peterjc123 @mszhanyi @skyline75489 @nbcsm @iremyux @Blackhex @chauhang @penguinwu",
+      "comments": [
+        {
+          "author": "malfet",
+          "created_at": "2025-03-03T16:12:48Z",
+          "updated_at": "2025-03-03T16:12:48Z",
+          "body": "Interesting, looks like yet another manifestation of https://github.com/pytorch/audio/issues/3877",
+          "url": "https://github.com/pytorch/pytorch/issues/148317#issuecomment-2694893096"
+        },
+        {
+          "author": "NOFOX",
+          "created_at": "2025-03-04T19:21:48Z",
+          "updated_at": "2025-03-04T19:21:48Z",
+          "body": "> Interesting, looks like yet another manifestation of [pytorch/audio#3877](https://github.com/pytorch/audio/issues/3877)\n\nYes. I tried use the latest audio build success breach :36815ef914216a61307477ccff3ee6fb0d7fda20\nalso has same issue facing cause by pytorch code:\n\n![Image](https://github.com/user-attachments/assets/0e50c59a-32e2-4dbc-b396-f8e5139f5c42)\n",
+          "url": "https://github.com/pytorch/pytorch/issues/148317#issuecomment-2698684282"
+        },
+        {
+          "author": "SirJackYang",
+          "created_at": "2025-03-05T01:33:23Z",
+          "updated_at": "2025-03-05T01:33:23Z",
+          "body": "试试这个链接里边的torch2.6以及torchvision2.6，支持NVIDIA GeForce RTX 5080\nhttps://huggingface.co/w-e-w/torch-2.6.0-cu128.nv",
+          "url": "https://github.com/pytorch/pytorch/issues/148317#issuecomment-2699484676"
+        },
+        {
+          "author": "cyyever",
+          "created_at": "2025-03-05T01:42:39Z",
+          "updated_at": "2025-03-05T01:42:39Z",
+          "body": "Add ``#include <type_traits>`` to torch/csrc/dynamo/compiled_autograd.h              ",
+          "url": "https://github.com/pytorch/pytorch/issues/148317#issuecomment-2699506581"
+        },
+        {
+          "author": "NOFOX",
+          "created_at": "2025-03-05T07:47:55Z",
+          "updated_at": "2025-03-05T07:47:55Z",
+          "body": "> Add `#include <type_traits>` to torch/csrc/dynamo/compiled_autograd.h\nAfter add this header file Issue still there ：\n\n![Image](https://github.com/user-attachments/assets/6984ee5d-6545-4cc2-b295-fb5b4f4b44a2)\n\nAnd I don't thing it will working. It not about missing header.it related the std naming pollution:\n\n![Image](https://github.com/user-attachments/assets/b13c27af-f9e8-427f-ae0b-b8f3043392f1)",
+          "url": "https://github.com/pytorch/pytorch/issues/148317#issuecomment-2700121563"
+        },
+        {
+          "author": "NOFOX",
+          "created_at": "2025-03-05T07:51:52Z",
+          "updated_at": "2025-03-05T07:51:52Z",
+          "body": "> 试试这个链接里边的torch2.6以及torchvision2.6，支持NVIDIA GeForce RTX 5080 https://huggingface.co/w-e-w/torch-2.6.0-cu128.nv\n谢谢，这个包一早就试过了，不过因为一些其它原因需要切抱到2.7。",
+          "url": "https://github.com/pytorch/pytorch/issues/148317#issuecomment-2700131032"
+        },
+        {
+          "author": "cyyever",
+          "created_at": "2025-03-05T10:07:58Z",
+          "updated_at": "2025-03-05T10:15:21Z",
+          "body": "![Image](https://github.com/user-attachments/assets/3fc1df32-0e8d-4ec1-8888-ebb97ebc4f4a)\nNotice that Windows should go to the upper branch. I have no idea why the else branch was triggered, a quick fix is to remove that branch.\n\n我建议你直接修改C:/tools/AI/ComfyUI-aki-v1.4/python/lib/site-packages/torch/include\\torch/csrc/dynamo/compiled_autograd.h，把那些有问题的行删掉。",
+          "url": "https://github.com/pytorch/pytorch/issues/148317#issuecomment-2700450525"
+        },
+        {
+          "author": "malfet",
+          "created_at": "2025-03-07T00:44:26Z",
+          "updated_at": "2025-03-07T00:44:26Z",
+          "body": "> Add `#include <type_traits>` to torch/csrc/dynamo/compiled_autograd.h\n\nI've tried that already, didn't really help...",
+          "url": "https://github.com/pytorch/pytorch/issues/148317#issuecomment-2705259694"
+        },
+        {
+          "author": "cyyever",
+          "created_at": "2025-03-07T01:00:14Z",
+          "updated_at": "2025-03-07T01:01:04Z",
+          "body": "@malfet The problematic lines are wrapped inside not _WIN32 branch, no idea why they were compiled by MSVC. Is it possible that the macro isn't correct?",
+          "url": "https://github.com/pytorch/pytorch/issues/148317#issuecomment-2705276903"
+        },
+        {
+          "author": "malfet",
+          "created_at": "2025-03-07T01:08:25Z",
+          "updated_at": "2025-03-07T01:08:25Z",
+          "body": "> [@malfet](https://github.com/malfet) The problematic lines are wrapped inside not _WIN32 branch, no idea why they were compiled by MSVC. Is it possible that the macro isn't correct?\n\nDoes ComfyUI uses cygwin build environment? Or may be it has not reached nightlies yet. I can see that indeed it fixed torch/audio compilation problem\nhttps://hud.pytorch.org/hud/pytorch/audio/68d3725f0223f5a646f191103f0c90f58d6597c7/1?per_page=50&name_filter=Build%20Windows%20wheels",
+          "url": "https://github.com/pytorch/pytorch/issues/148317#issuecomment-2705285899"
+        },
+        {
+          "author": "woct0rdho",
+          "created_at": "2025-09-29T03:36:46Z",
+          "updated_at": "2026-03-02T02:08:39Z",
+          "body": "> Notice that Windows should go to the upper branch. I have no idea why the else branch was triggered, a quick fix is to remove that branch.\n\nThis can be caused by nvcc, not MSVC. I guess we need something like `#if defined(_WIN32) || defined(__WIN32__)` to guard it.\n\nWhen building an extension, we can do a quick fix like https://github.com/woct0rdho/SageAttention/commit/914fe0ed304c3db4a27735d394ae23c5d5e79701 :\n```python3\nif os.name == \"nt\":\n    NVCC_FLAGS += [\n        \"-D_WIN32=1\",\n        \"-DUSE_CUDA=1\",\n    ]\n```\n\nOr if it's preferable to modify the source before building, we can comment out the following lines in `torch/include/torch/csrc/dynamo/compiled_autograd.h`:\n```cpp\n    } else if constexpr (::std::is_same_v<T, ::std::string>) {\n      return at::StringType::get();\n```\n\nThis issue still exists as of torch 2.10.0 .",
+          "url": "https://github.com/pytorch/pytorch/issues/148317#issuecomment-3344732754"
+        },
+        {
+          "author": "woct0rdho",
+          "created_at": "2026-05-14T15:49:20Z",
+          "updated_at": "2026-07-05T01:14:46Z",
+          "body": "Update: When compiling with CUDA 13.2, we need\n```python3\nif os.name == \"nt\":\n    NVCC_FLAGS += [\n        \"-Xcompiler=/Zc:preprocessor\",\n        \"-D_WIN32=1\",\n        \"-DUSE_CUDA=1\",\n    ]\n```\nOtherwise the non-standard preprocessor in MSVC called by nvcc will have trouble with `std`.\n\nBy the way, if we see\n```python3\nABI = 1 if torch._C._GLIBCXX_USE_CXX11_ABI else 0\nCXX_FLAGS += [f\"-D_GLIBCXX_USE_CXX11_ABI={ABI}\"]\nNVCC_FLAGS_COMMON += [f\"-D_GLIBCXX_USE_CXX11_ABI={ABI}\"]\n```\nwe need to replace with\n```python3\nif os.name != \"nt\":\n    ABI = 1 if torch._C._GLIBCXX_USE_CXX11_ABI else 0\n    CXX_FLAGS += [f\"-D_GLIBCXX_USE_CXX11_ABI={ABI}\"]\n    NVCC_FLAGS_COMMON += [f\"-D_GLIBCXX_USE_CXX11_ABI={ABI}\"]\n```\nBecause CXX11 ABI does not make sense on Windows, and it seems to cause nvcc going into some wrong codepath.\n\nThis issue still exists as of torch 2.12.0 . It's not strictly a bug of torch, but non-standard default behavior of MSVC, and we need the workaround anyway.",
+          "url": "https://github.com/pytorch/pytorch/issues/148317#issuecomment-4452274860"
+        },
+        {
+          "author": "Sahil170595",
+          "created_at": "2026-07-04T16:27:00Z",
+          "updated_at": "2026-07-04T16:27:00Z",
+          "body": "Reproduced on MSVC 14.42 + CUDA 13.0 + torch 2.11.0 with vanilla `torch.utils.cpp_extension` flags, and validated a specialization-based fix end to end (macro probe shows `USE_CUDA`/`USE_ROCM` are never defined in extension builds, so the existing carve-out cannot fire). Details, macro table, and fix shape in https://github.com/pytorch/pytorch/issues/173232#issuecomment-4883049373 - PR incoming.",
+          "url": "https://github.com/pytorch/pytorch/issues/148317#issuecomment-4883050735"
+        },
+        {
+          "author": "malfet",
+          "created_at": "2026-07-04T17:09:53Z",
+          "updated_at": "2026-07-04T17:09:53Z",
+          "body": "> Reproduced on MSVC 14.42\n\n@Sahil170595 I'm not very fluent in MSVC version numbers, but 14.42 seems to be coming from VS 2022. Any reason why you must use such an old compiler? VC++ is full of bugs, and I don't think PyTorch should strive to be compilable with every buggy version one can find",
+          "url": "https://github.com/pytorch/pytorch/issues/148317#issuecomment-4883175492"
+        },
+        {
+          "author": "Sahil170595",
+          "created_at": "2026-07-04T19:34:56Z",
+          "updated_at": "2026-07-04T19:34:56Z",
+          "body": "No attachment to 14.42, it is just what `vcvars64` picked. The version dependence is testable though, so I tested it. The same one-line repro (details in the PR) fires identically on every MSVC line I can find a data point for:\n\n| MSVC toolset | cl | ships with | source | result |\n|---|---|---|---|---|\n| 14.42.34433 | 19.42 | VS 2022 17.12 | my box | C2872 |\n| 14.43.34808 | 19.43 | VS 2022 17.13 | this issue's original traceback above | C2872 |\n| 14.44.35217 | 19.44 | VS 2022 17.14, current | my box, just verified | C2872 |\n| 14.50.35717 | 19.50 | VS 18 Community | #173232's traceback | C2872 |\n\nSo it does not look like an old-compiler artifact: the current VS 2022 toolset and the newest VS 18 toolset both hit it.\n\nOne more constraint on the \"use a newer compiler\" path: CUDA 13.0's `crt/host_config.h` hard-errors on `_MSC_VER >= 1950`, so VS 2022 toolsets (14.2x to 14.4x) are the newest host compilers nvcc officially supports there (newer toolkits may raise the ceiling), and per #173232 the 14.50 toolset reproduces anyway.\n\nAgreed that PyTorch should not chase every buggy MSVC. The reason I would still fix this one: it fires on all currently supported host compilers for the default `torch.utils.cpp_extension` path, and the fix is a semantics-preserving rearrangement rather than a compiler workaround: the construct just moves out of the always-instantiated template path.\n",
+          "url": "https://github.com/pytorch/pytorch/issues/148317#issuecomment-4883576162"
+        },
+        {
+          "author": "woct0rdho",
+          "created_at": "2026-07-05T01:05:15Z",
+          "updated_at": "2026-07-05T01:11:06Z",
+          "body": "@malfet FYI, the official torch Windows wheels are actually built with VS 2022. It seems to provide necessary ABI compatibility for users who use an older vcredist. vcredist is like glibc on Windows. Although in principle vcredist should be updated with Windows Update, there are always people who don't update.\n\nIt's just like the official torch Linux wheels are built with manylinux 2.28, which corresponds to glibc 2.28 and Ubuntu 18.10 .",
+          "url": "https://github.com/pytorch/pytorch/issues/148317#issuecomment-4884353213"
+        }
+      ]
+    },
+    {
+      "number": 188955,
+      "title": "rms_norm autocast fp32 policy (2.12) materializes standalone cast kernels under torch.compile when dtypes already match. Peak-memory and throughput regression for bf16 models",
+      "url": "https://github.com/pytorch/pytorch/issues/188955",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/188955",
+      "state": "open",
+      "author": "abhishek-patnia-nu",
+      "created_at": "2026-07-04T19:31:19Z",
+      "updated_at": "2026-07-04T22:31:37Z",
+      "closed_at": null,
+      "labels": [
+        "triage review",
+        "module: performance",
+        "module: memory usage",
+        "module: regression",
+        "oncall: pt2",
+        "module: inductor",
+        "bot-triaged"
+      ],
+      "comments_count": 1,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "### 🐛 Describe the bug\n\ntorch 2.12 registered `rms_norm` under autocast's `fp32` cast policy ([#174824](https://github.com/pytorch/pytorch/pull/174824)). The policy applies unconditionally, including when input and weight are already both bf16. On torch 2.11 the op had no autocast registration, so in this configuration it ran bf16-in/bf16-out and autocast played no role.\n\n```python\n# torch 2.12.1, bf16 input AND bf16 weight:\nwith torch.autocast('cuda', dtype=torch.bfloat16):\n    y = norm(x_bf16)     # y.dtype == torch.float32  <- promoted regardless\nwith torch.autocast('cuda', enabled=False):\n    y = norm(x_bf16)     # y.dtype == torch.bfloat16\n```\n\nThe promotion inserts an fp32 upcast of the activation before every norm and leaves an fp32 output\nthat is downcast by the next `lower_precision_fp` op. Under `torch.compile`, these casts are graph\nnodes with multiple consumers (the promoted input feeds both the statistic reduction and the\nelementwise normalize). Some fuse into the generated norm kernels, but a large fraction are emitted\nas standalone `triton_poi_fused__to_copy*` kernels, each writing a full-size buffer — a full fp32\ncopy of the activation per cast.\n\nThe promotion also provides no numerical benefit in this configuration: `rms_norm` upcasts\ninternally regardless (`rms_norm_composite`: `input.to(opmath_t)`; generated kernels accumulate the\nstatistic in fp32 registers), and upcasting a bf16-stored weight recovers no information.\n\nAt scale this is a significant delta. \n\n### Minimal reproduction\n\nA single `Linear(4096, 4096)` followed by `RMSNorm(4096)`, model cast\nto bf16, compiled, forward+backward under bf16 autocast, input (8, 4096, 4096). The only\ndifference between the two modes is whether the norm call is wrapped in\n`torch.autocast(enabled=False)`:\n\n<details>\n<summary>repro.py</summary>\n\n```python\n# ruff: noqa\n\"\"\"Repro: rms_norm autocast fp32 policy materializes cast kernels under\ntorch.compile when input and weight are already bf16 (torch 2.12 vs 2.11).\n\nMinimal setup: Linear -> RMSNorm, model cast to bf16, compiled,\nforward+backward under bf16 autocast.\n\ntorch 2.11: rms_norm has no autocast registration; with matched bf16 dtypes\nthe compiled step emits no standalone copy kernels.\ntorch 2.12: rms_norm is registered under autocast's fp32 cast policy\n(pytorch#174824), which promotes unconditionally; the promotion casts\nmaterialize as standalone `triton_poi_fused__to_copy*` kernels and raise\npeak memory.\n\nRun (single GPU):\n    python repro.py            # autocast-wrapped norm (regression path)\n    python repro.py exempt     # norm under autocast(enabled=False) (workaround)\n\"\"\"\n\nimport sys\nimport time\n\nimport torch\nimport torch.nn as nn\n\nD, BATCH, SEQ, ITERS = 4096, 8, 4096, 20\nEXEMPT = len(sys.argv) > 1 and sys.argv[1] == \"exempt\"\n\n\nclass Net(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.linear = nn.Linear(D, D, bias=False)\n        self.norm = nn.RMSNorm(D, eps=1e-6)\n\n    def forward(self, x):\n        h = self.linear(x)\n        if EXEMPT:\n            with torch.autocast(x.device.type, enabled=False):\n                return self.norm(h)\n        return self.norm(h)\n\n\nmodel = Net().to(\"cuda\", torch.bfloat16)\nmodel = torch.compile(model)\n\n\ndef step():\n    x = torch.randn(BATCH, SEQ, D, device=\"cuda\", dtype=torch.bfloat16, requires_grad=True)\n    with torch.autocast(\"cuda\", dtype=torch.bfloat16):\n        out = model(x)\n    out.float().sum().backward()\n\n\nfor _ in range(3):  # warmup + compile\n    step()\ntorch.cuda.synchronize()\ntorch.cuda.reset_peak_memory_stats()\n\nt0 = time.perf_counter()\nfor _ in range(ITERS):\n    step()\ntorch.cuda.synchronize()\nstep_ms = (time.perf_counter() - t0) / ITERS * 1000\npeak_gib = torch.cuda.max_memory_allocated() / 2**30\n\nfrom torch.profiler import ProfilerActivity, profile\n\nwith profile(activities=[ProfilerActivity.CUDA]) as prof:\n    step()\n    torch.cuda.synchronize()\n\nkernels = copies = 0\nfor ev in prof.key_averages():\n    if getattr(ev, \"device_time_total\", 0) <= 0 or ev.key.startswith((\"aten::\", \"Prof\", \"cuda\")):\n        continue\n    kernels += ev.count\n    if \"to_copy\" in ev.key or \"convert_element_type\" in ev.key:\n        copies += ev.count\n\nprint(\n    f\"torch={torch.__version__} mode={'exempt' if EXEMPT else 'autocast'} \"\n    f\"peak_gib={peak_gib:.2f} step_ms={step_ms:.2f} kernels/step={kernels} cast_kernels/step={copies}\"\n)\n```\n\n</details>\n\n```bash\npython repro.py            # autocast-wrapped norm (regression path)\npython repro.py exempt     # norm under autocast(enabled=False) (workaround path)\n```\n\nOutput on torch 2.12.1+cu130, single B200 (the LayerNorm line is the same script with\n`nn.LayerNorm` substituted):\n\n```\ntorch=2.12.1+cu130 RMSNorm   mode=autocast peak_gib=1.97 step_ms=7.01 kernels/step=15 cast_kernels/step=3\ntorch=2.12.1+cu130 RMSNorm   mode=exempt   peak_gib=1.47 step_ms=7.43 kernels/step=16 cast_kernels/step=0\ntorch=2.12.1+cu130 LayerNorm mode=autocast peak_gib=2.00 step_ms=7.67 kernels/step=19 cast_kernels/step=4\n```\n\nOne norm costs +0.5 GiB peak (+34%): exactly one materialized fp32 copy of the (8, 4096, 4096)\nbf16 activation (512 MiB), plus standalone cast kernels. The cost scales linearly with the number\nof norm sites (see the at-scale numbers above). LayerNorm pays the same under autocast, confirming\nthe general Inductor behavior; for `rms_norm` this is new in 2.12 (no autocast registration on\n2.11, where the two modes behave identically).\n\n### Expected behavior\nThe `fp32` cast policy for `rms_norm` skips promotion when input and weight dtypes already\n   match (the fused path dispatches fine and accumulates in fp32 internally)\n\n### Workaround\n\nRun the norm outside autocast; internal fp32 accumulation provides the same protection the policy\nwas adding externally:\n\n```python\nclass AutocastExemptRMSNorm(nn.RMSNorm):\n    def forward(self, x):\n        with torch.autocast(x.device.type, enabled=False):\n            return super().forward(x)\n```\n\nMeasured at scale, this is faster and leaner than both the 2.12 default and the 2.11 baseline,\nsince the norm runs at bf16 I/O width on top of the improved 2.12 codegen.\n\n### Versions\n\n<details>\n<summary>collect_env (regression env)</summary>\n\n```\nCollecting environment information...\nPyTorch version: 2.12.1+cu130\nIs debug build: False\nCUDA used to build PyTorch: 13.0\nROCM used to build PyTorch: N/A\n\nOS: Ubuntu 24.04.3 LTS (x86_64)\nGCC version: (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0\nClang version: Could not collect\nCMake version: version 3.31.6\nLibc version: glibc-2.39\n\nPython version: 3.11.15 (main, Jun 23 2026, 15:19:43) [Clang 22.1.3 ] (64-bit runtime)\nPython platform: Linux-6.12.68+-x86_64-with-glibc2.39\nIs CUDA available: True\nCUDA runtime version: 13.0.88\nCUDA_MODULE_LOADING set to: LAZY\nGPU models and configuration: \nGPU 0: NVIDIA B200\nGPU 1: NVIDIA B200\nGPU 2: NVIDIA B200\nGPU 3: NVIDIA B200\nGPU 4: NVIDIA B200\nGPU 5: NVIDIA B200\nGPU 6: NVIDIA B200\nGPU 7: NVIDIA B200\n\nNvidia driver version: 580.126.09\ncuDNN version: Probably one of the following:\n/usr/lib/x86_64-linux-gnu/libcudnn.so.9.15.0\n/usr/lib/x86_64-linux-gnu/libcudnn_adv.so.9.15.0\n/usr/lib/x86_64-linux-gnu/libcudnn_cnn.so.9.15.0\n/usr/lib/x86_64-linux-gnu/libcudnn_engines_precompiled.so.9.15.0\n/usr/lib/x86_64-linux-gnu/libcudnn_engines_runtime_compiled.so.9.15.0\n/usr/lib/x86_64-linux-gnu/libcudnn_graph.so.9.15.0\n/usr/lib/x86_64-linux-gnu/libcudnn_heuristic.so.9.15.0\n/usr/lib/x86_64-linux-gnu/libcudnn_ops.so.9.15.0\nIs XPU available: False\nHIP runtime version: N/A\nMIOpen runtime version: N/A\nIs XNNPACK available: True\nCaching allocator config: N/A\n\nCPU:\nArchitecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           52 bits physical, 57 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  224\nOn-line CPU(s) list:                     0-223\nVendor ID:                               GenuineIntel\nModel name:                              INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.10GHz\nCPU family:                              6\nModel:                                   207\nThread(s) per core:                      2\nCore(s) per socket:                      56\nSocket(s):                               2\nStepping:                                2\nBogoMIPS:                                4200.00\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid tsc_known_freq pni pclmulqdq monitor ssse3 fma cx16 pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch ssbd ibrs ibpb stibp ibrs_enhanced fsgsbase tsc_adjust bmi1 hle avx2 smep bmi2 erms invpcid rtm avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 wbnoinvd arat avx512vbmi umip avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid cldemote movdiri movdir64b fsrm md_clear serialize tsxldtrk amx_bf16 avx512_fp16 amx_tile amx_int8 arch_capabilities\nHypervisor vendor:                       KVM\nVirtualization type:                     full\nL1d cache:                               5.3 MiB (112 instances)\nL1i cache:                               3.5 MiB (112 instances)\nL2 cache:                                224 MiB (112 instances)\nL3 cache:                                520 MiB (2 instances)\nNUMA node(s):                            2\nNUMA node0 CPU(s):                       0-55,112-167\nNUMA node1 CPU(s):                       56-111,168-223\nVulnerability Gather data sampling:      Not affected\nVulnerability Indirect target selection: Mitigation; Aligned branch/return thunks\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI SW loop, KVM SW loop\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected\n\nVersions of relevant libraries:\n[pip3] numpy==2.2.6\n[pip3] nvidia-cublas==13.4.1.1\n[pip3] nvidia-cuda-cupti==13.0.85\n[pip3] nvidia-cuda-nvrtc==13.0.88\n[pip3] nvidia-cuda-runtime==13.0.96\n[pip3] nvidia-cudnn-cu13==9.20.0.48\n[pip3] nvidia-cufft==12.0.0.61\n[pip3] nvidia-curand==10.4.0.35\n[pip3] nvidia-cusolver==12.0.4.66\n[pip3] nvidia-cusparse==12.6.3.3\n[pip3] nvidia-cusparselt-cu13==0.8.1\n[pip3] nvidia-nccl-cu13==2.29.7\n[pip3] nvidia-nvjitlink==13.0.88\n[pip3] nvidia-nvtx==13.0.85\n[pip3] onnx==1.22.0\n[pip3] onnx-ir==0.2.1\n[pip3] onnxscript==0.7.0\n[pip3] pytorch-lightning==2.6.5\n[pip3] torch==2.12.1+cu130\n[pip3] torch_c_dlpack_ext==0.1.5\n[pip3] torchmetrics==1.9.0\n[pip3] torchvision==0.27.1+cu130\n[pip3] transformer_engine_torch==2.16.1\n[pip3] triton==3.7.1\n[conda] No relevant packages\n```\n\n</details>\n\nBaseline env: torch 2.11.0+cu130, triton 3.6.0, CUDA 13.0, same machine.\n",
+      "comments": [
+        {
+          "author": "abhishek-patnia-nu",
+          "created_at": "2026-07-04T22:31:37Z",
+          "updated_at": "2026-07-04T22:31:37Z",
+          "body": "Does it make sense to move _(rms_norm) from AT_FORALL_FP32 (aten/src/ATen/autocast_mode.h L878 on main) to AT_FORALL_PROMOTE (L948). Matched dtypes should be safe to pass through, since the fused kernel already accumulates in fp32 internally and mixed dtypes are still promoted, so the #167308 fix should keep working. If yes, I can open a PR in the coming week. ",
+          "url": "https://github.com/pytorch/pytorch/issues/188955#issuecomment-4884007778"
+        }
+      ]
+    }
+  ]
+}
