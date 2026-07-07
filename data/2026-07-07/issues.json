@@ -1,0 +1,927 @@
+{
+  "metadata": {
+    "repo": "pytorch/pytorch",
+    "keywords": [
+      "compile",
+      "inductor",
+      "dynamo"
+    ],
+    "generated_at": "2026-07-07T04:00:03.336241+00:00",
+    "since": "2026-07-06T04:00:03.336241+00:00",
+    "lookback_hours": 24.0,
+    "timezone": "Asia/Shanghai",
+    "report_date": "2026-07-07",
+    "issue_count": 24
+  },
+  "issues": [
+    {
+      "number": 189121,
+      "title": "[inductor] Single-config reductions extended by _dynamic_scale_rblock are permanently uncacheable — re-benchmark {R0_BLOCK, R0_BLOCK/2} every process; near-tied winners flip perf and numerics",
+      "url": "https://github.com/pytorch/pytorch/issues/189121",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/189121",
+      "state": "open",
+      "author": "elad-inferize",
+      "created_at": "2026-07-07T03:39:09Z",
+      "updated_at": "2026-07-07T03:42:12Z",
+      "closed_at": null,
+      "labels": [
+        "triage review",
+        "module: performance",
+        "module: determinism",
+        "module: reductions",
+        "oncall: pt2",
+        "module: inductor",
+        "module: compile-time",
+        "bot-triaged"
+      ],
+      "comments_count": 0,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "\n### 🐛 Describe the bug\n\nFollow-up to #181789 (related: #172819 / #173391): one more case where\n`_dynamic_scale_rblock` mutates the autotune candidate set after the cache contract is\nfrozen, defeating `autotune_local_cache=True`. Verified on current nightly.\n\n`check_autotune_cache` only creates an `AutotuneCache` when there is more than one config\n(`torch/_inductor/runtime/triton_heuristics.py`):\n\n```python\nif (\n    not disabled\n    and filename is not None\n    and (len(configs) > 1 or inductor_meta.get(\"coordinate_descent_tuning\"))\n    and os.environ.get(\"TRITON_INTERPRET\", \"0\") != \"1\"\n):\n    configs_hash = hash_configs(configs)\n    autotune_cache = AutotuneCache.create(inductor_meta, filename, configs_hash)\n```\n\nReduction kernels with `ReductionHint.INNER` (also `OUTER` / `OUTER_TINY`) get exactly\n**one** heuristic config from `_reduction_configs`, so `autotune_cache is None` and the\nautotuner's `save_cache_hook is None`. If the compiled kernel is register-pressure\nlimited, `_dynamic_scale_rblock` later appends a halved-`R0_BLOCK` candidate during\n`precompile()` → 2 launchers → the first hot call runs `autotune_to_one_config()`:\n\n- with **no cache to read** — so the #181789 \"skip `_dynamic_scale_rblock` when\n  `autotune_cache_state == \"hit\"`\" fix can never engage, because a hit is impossible; and\n- with **no save hook** — so a `.best_config` is never written.\n\nEvery process therefore re-benchmarks `{R0_BLOCK, R0_BLOCK/2}` forever. That is wasted\nwarm-start time, and worse: when the two candidates are near-tied, the winner flips from\nprocess to process — nondeterministic performance **and numerics** (R0_BLOCK changes the\nreduction split), with the local autotune cache enabled the whole time.\n\n### Minimal repro\n\n1×H200 (SM90), `2.14.0.dev20260706+cu130`, triton `3.8.0+git43422b04`. Driver runs 3\nfresh processes against one persistent `TORCHINDUCTOR_CACHE_DIR`; instrumentation is\nprint-only wrappers around stock functions.\n\n```python\n#!/usr/bin/env python3\n# Repro: single-heuristic-config reduction + _dynamic_scale_rblock =>\n# no AutotuneCache, re-benchmark {R0_BLOCK, R0_BLOCK/2} in EVERY process,\n# no .best_config ever written, despite autotune_local_cache=True.\n# Run: python repro.py   (driver: 3 fresh processes over one warm cache dir)\nimport glob\nimport os\nimport shutil\nimport subprocess\nimport sys\n\nCACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), \"repro_cache\")\nos.environ.setdefault(\"TORCHINDUCTOR_CACHE_DIR\", CACHE)\nos.environ.setdefault(\"TORCHINDUCTOR_COMPILE_THREADS\", \"1\")  # readable logs only\n\n\ndef instrument():\n    # observability only -- wrappers print what stock torch does\n    from torch._inductor.runtime import triton_heuristics as th\n\n    real_check = th.check_autotune_cache\n\n    def check(configs, filename, inductor_meta):\n        out = real_check(configs, filename, inductor_meta)\n        print(\n            f\"[AT] check n_configs={len(configs)} \"\n            f\"state={out[2].get('autotune_cache_state')}\",\n            flush=True,\n        )\n        return out\n\n    th.check_autotune_cache = check\n\n    real_dsr = th.CachingAutotuner._dynamic_scale_rblock\n\n    def dsr(self):\n        before = len(self.compile_results)\n        out = real_dsr(self)\n        if len(self.compile_results) != before:\n            print(f\"[AT] DSR-INJECT {before}->{len(self.compile_results)}\", flush=True)\n        return out\n\n    th.CachingAutotuner._dynamic_scale_rblock = dsr\n\n    real_bench = th.CachingAutotuner.benchmark_all_configs\n\n    def bench(self, *a, **kw):\n        out = real_bench(self, *a, **kw)\n        timings = sorted((t, l.config.kwargs.get(\"R0_BLOCK\")) for l, t in out.items())\n        print(\n            f\"[AT] AUTOTUNE save_hook={self.save_cache_hook is not None} \"\n            + \", \".join(f\"R0={r}:{t:.4f}ms\" for t, r in timings),\n            flush=True,\n        )\n        return out\n\n    th.CachingAutotuner.benchmark_all_configs = bench\n\n\ndef kernel(a, b, c, d, e, f, g, h):\n    # Single-heuristic-config reduction (ReductionHint.INNER, register_intensive)\n    # that triggers _dynamic_scale_rblock injection at precompile.\n    s = a + b + c + d + e + f + g + h\n    sf = s.float()\n    v = (sf * sf).mean(-1, keepdim=True)\n    y = (sf * torch.rsqrt(v + 1e-6)).to(torch.bfloat16)\n    return y, sf.sum(-1), sf.abs().amax(-1)\n\n\ndef phase():\n    import torch\n\n    globals()[\"torch\"] = torch\n    instrument()\n    torch.manual_seed(0)\n    args = tuple(\n        torch.randn(4096, 4096, device=\"cuda\", dtype=torch.bfloat16) for _ in range(8)\n    )\n    torch.compile(kernel, fullgraph=True, dynamic=False)(*args)\n    torch.cuda.synchronize()\n    n = len(glob.glob(os.path.join(CACHE, \"**\", \"*.best_config\"), recursive=True))\n    print(f\"[AT] best_config files on disk: {n}\", flush=True)\n\n\nif __name__ == \"__main__\":\n    if len(sys.argv) > 1:\n        phase()\n    else:\n        shutil.rmtree(CACHE, ignore_errors=True)\n        for i in range(3):\n            p = subprocess.run(\n                [sys.executable, __file__, \"phase\"], capture_output=True, text=True\n            )\n            print(f\"===== process {i} (rc={p.returncode}) =====\")\n            print(\n                \"\\n\".join(\n                    ln\n                    for ln in (p.stdout + p.stderr).splitlines()\n                    if ln.startswith(\"[AT]\")\n                )\n            )\n            if p.returncode != 0:\n                print((p.stdout + p.stderr)[-3000:])\n```\n\nOutput (verbatim):\n\n```\n===== process 0 (rc=0) =====\n[AT] check n_configs=1 state=only 1 config\n[AT] DSR-INJECT 1->2\n[AT] AUTOTUNE save_hook=False R0=1024:0.0947ms, R0=512:0.0990ms\n[AT] best_config files on disk: 0\n===== process 1 (rc=0) =====\n[AT] check n_configs=1 state=only 1 config\n[AT] check n_configs=1 state=only 1 config\n[AT] DSR-INJECT 1->2\n[AT] AUTOTUNE save_hook=False R0=1024:0.0945ms, R0=512:0.0991ms\n[AT] best_config files on disk: 0\n===== process 2 (rc=0) =====\n[AT] check n_configs=1 state=only 1 config\n[AT] check n_configs=1 state=only 1 config\n[AT] DSR-INJECT 1->2\n[AT] AUTOTUNE save_hook=False R0=1024:0.0944ms, R0=512:0.0992ms\n[AT] best_config files on disk: 0\n```\n\nProcesses 1 and 2 are warm starts (FXGraphCache hit; the static-autotuner\n`recheck_autotune_cache` also runs and reports `only 1 config`): they still re-inject and\nre-benchmark, and no `.best_config` can ever exist. A multi-config kernel compiled in the\nsame processes caches normally (hit on process 1+2, no re-benchmark) — the difference is\npurely the `len(configs) > 1` gate.\n\n### Real-world impact (measured)\n\nProduction LLM serving (vLLM 0.24.0, torch 2.11.0+cu130, gemma-4-31B NVFP4 on 1×H200):\nthe fused add+GEMM-epilogue+RMSNorm reduction\n(`triton_red_fused_add_marlin_gemm_mul_rms_norm_2`, r0_numel=5376, register-intensive,\none heuristic config `R0_BLOCK=1024`, injected `512`) re-tunes on **every server boot**.\nIn the synthetic repro above the winner happens to be stable; on this production kernel\nthe two candidates are near-tied and boots land on either side — median single-stream\ndecode throughput flips ~3.4% (242.6 vs 250.9 tok/s) and greedy numerics shift\n(speculative-decode acceptance 3.897 vs 3.985 accepted tokens/step) across *identical*\ndeployments with warm caches. We currently work around it by pinning the config through a\npatched-in env override to get deterministic serving.\n\n### Suggested fix\n\nMake the cache contract cover any kernel that can reach `autotune_to_one_config`:\n\n- create the `AutotuneCache` when the kernel is `_dynamic_scale_rblock`-eligible\n  (`_could_rblock_scale`) even if `len(configs) == 1`, or\n- when `_dynamic_scale_rblock` actually extends a single-config kernel, create the cache\n  at that point (hashing the extended candidate list) so the winner is persisted and\n  re-read on the next process.\n\n### Related (appears already fixed on nightly, noting for 2.11/2.12 users)\n\nOn 2.11.0 we also hit the sibling case: statically-launchable autotuners whose serialized\n`compile_results` include the *injected* config recompute `hash_configs` over N+1 configs\nin `recheck_autotune_cache`, never match the N-config hash stored in `.best_config`, and\nre-benchmark + rewrite (with the old hash) on every warm boot — 15 of 38 multi-config\nkernels on the model above. On `2.14.0.dev20260706` we could not reproduce this: the\ninjected config no longer reaches the bundle (recheck sees the original list, hash\nmatches, hit), so it looks fixed by the #181789-era changes.\n\n### Versions\n\n- repro: torch `2.14.0.dev20260706+cu130` nightly, triton `3.8.0+git43422b04`, CUDA 13.0,\n  1×H200 (SM90), Ubuntu 24.04, Python 3.12\n- production measurements: torch `2.11.0+cu130`, triton `3.6.0`, same machine\n\ncc @mruberry @kurtamohler @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @aakhundov @coconutruben @jataylo @oulgen @jamesjwu @aorenste @anijain2305 @laithsakka @masnesral @aditvenk @bobrenjc93 @shunting314 @jansel\n",
+      "comments": []
+    },
+    {
+      "number": 135089,
+      "title": "Inplace addmm within Inductor",
+      "url": "https://github.com/pytorch/pytorch/issues/135089",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/135089",
+      "state": "closed",
+      "author": "Chillee",
+      "created_at": "2024-09-04T04:08:46Z",
+      "updated_at": "2026-07-07T03:06:19Z",
+      "closed_at": "2026-07-07T03:06:19Z",
+      "labels": [
+        "triaged",
+        "actionable",
+        "oncall: pt2",
+        "module: inductor"
+      ],
+      "comments_count": 7,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "### 🚀 The feature, motivation and pitch\r\n\r\n```\r\nimport torch\r\na = torch.randn(8, 8)\r\nb = torch.randn(8, 8)\r\nc = torch.randn(8, 8)\r\nprint(torch.addmm(a,b,c))\r\nprint(torch.addmm_(a,b,c))\r\n```\r\n\r\n### Alternatives\r\n\r\n_No response_\r\n\r\n### Additional context\r\n\r\n_No response_\r\n\r\ncc @ezyang @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @yf225 @chenyang78 @kadeng @muchulee8 @ColinPeppler @amjames @desertfire",
+      "comments": [
+        {
+          "author": "Chillee",
+          "created_at": "2024-09-04T04:28:03Z",
+          "updated_at": "2024-09-04T04:28:03Z",
+          "body": "In general, we seem to have pretty pathological behavior for a pattern like\r\n```\r\nimport torch\r\n@torch.compile\r\ndef f(x, ws):\r\n    buf = torch.zeros_like(x)\r\n    for w in ws:\r\n        buf = torch.addmm(buf, w, w)\r\n        buf = torch.cos(buf)\r\n    return buf\r\n\r\nf(torch.randn(1024, 1024), [torch.randn(1024, 1024) for _ in range(3)])\r\n```\r\n\r\n```\r\nwith torch.cuda._DeviceGuard(0):\r\n        torch.cuda.set_device(0)\r\n        buf0 = empty_strided_cuda((1024, 1024), (1024, 1), torch.float32)\r\n        # Topologically Sorted Source Nodes: [], Original ATen: []\r\n        extern_kernels.mm(arg1_1, arg1_1, out=buf0)\r\n        del arg1_1\r\n        buf1 = empty_strided_cuda((1024, 1024), (1024, 1), torch.float32)\r\n        # Topologically Sorted Source Nodes: [], Original ATen: []\r\n        extern_kernels.mm(arg2_1, arg2_1, out=buf1)\r\n        del arg2_1\r\n        buf2 = empty_strided_cuda((1024, 1024), (1024, 1), torch.float32)\r\n        # Topologically Sorted Source Nodes: [], Original ATen: []\r\n        extern_kernels.mm(arg3_1, arg3_1, out=buf2)\r\n        del arg3_1\r\n        buf3 = buf0; del buf0  # reuse\r\n        # Topologically Sorted Source Nodes: [buf, buf_2, buf_4, buf_6], Original ATen: [aten.zeros_like, aten.cos]\r\n        stream0 = get_raw_stream(0)\r\n        triton_poi_fused_cos_zeros_like_0.run(buf3, buf2, buf1, 1048576, grid=grid(1048576), stream=stream0)\r\n        del buf1\r\n        del buf2\r\n    return (buf3, )\r\n```\r\n\r\nNamely, we unfuse all of the add from the mm, and then delay all of the pointwise ops until the end. I think it would be a good idea to restrict our fusions/reordering to never surpass the eager memory usage.\r\n\r\ncc: @eellison ",
+          "url": "https://github.com/pytorch/pytorch/issues/135089#issuecomment-2327889385"
+        },
+        {
+          "author": "isuruf",
+          "created_at": "2024-09-05T15:27:37Z",
+          "updated_at": "2024-09-05T15:27:37Z",
+          "body": "Interestingly, using `torch.cos_` gives a nicer graph.",
+          "url": "https://github.com/pytorch/pytorch/issues/135089#issuecomment-2332013338"
+        },
+        {
+          "author": "eellison",
+          "created_at": "2024-09-12T19:41:53Z",
+          "updated_at": "2024-09-12T19:41:53Z",
+          "body": "What is your use case for inplace addmm ? This would only work with really small tensors. \r\n\r\nFor the example above, unfusing the bias add makes this example 10% faster. If the pattern occurs not at high water mark memory, then we are doing the correct thing here. Otherwise, yea, the additional memory use could be an issue. Related issue: https://github.com/pytorch/pytorch/issues/135305#issuecomment-2344062273",
+          "url": "https://github.com/pytorch/pytorch/issues/135089#issuecomment-2347102102"
+        },
+        {
+          "author": "Chillee",
+          "created_at": "2024-09-12T19:48:30Z",
+          "updated_at": "2024-09-12T19:48:30Z",
+          "body": "https://github.com/linkedin/Liger-Kernel/issues/227\r\n\r\nIn this case it kinda is related to peak memory, but if it's not actually faster then 🤔 ",
+          "url": "https://github.com/pytorch/pytorch/issues/135089#issuecomment-2347112486"
+        },
+        {
+          "author": "eellison",
+          "created_at": "2024-09-12T21:24:20Z",
+          "updated_at": "2024-09-12T21:24:20Z",
+          "body": "> This would only work with really small tensors.\r\n\r\nTo clarify - for non 1-D bias we can inplace it. This is pretty uncommon in my experience.",
+          "url": "https://github.com/pytorch/pytorch/issues/135089#issuecomment-2347274340"
+        },
+        {
+          "author": "kiddyboots216",
+          "created_at": "2024-09-13T16:54:20Z",
+          "updated_at": "2024-09-13T16:54:20Z",
+          "body": "> non 1-D bias is pretty uncommon in my experience\r\n\r\nMaybe I am misunderstanding, but isn't there non 1-D bias in every Transformer...? ",
+          "url": "https://github.com/pytorch/pytorch/issues/135089#issuecomment-2349419392"
+        },
+        {
+          "author": "eellison",
+          "created_at": "2024-09-13T18:37:13Z",
+          "updated_at": "2024-09-13T18:37:13Z",
+          "body": "By 1-D bias I mean the shape of the bias, not the shape it is broadcasting to. Pytorch [linear bias](https://github.com/pytorch/pytorch/blob/b6d6aa49b839b11c6bb01688975d2ef77c3936d0/torch/nn/modules/linear.py#L109) is by default 1D. Also, we can't inplace a parameter, because that would affect the results for the next iteration.\r\n\r\nIf there is a real repro that demonstrates this use case happy to take a look.",
+          "url": "https://github.com/pytorch/pytorch/issues/135089#issuecomment-2349839136"
+        }
+      ]
+    },
+    {
+      "number": 151945,
+      "title": "standalone compile FakeTensor from_graph detection with tensor subclass outputs",
+      "url": "https://github.com/pytorch/pytorch/issues/151945",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/151945",
+      "state": "closed",
+      "author": "zou3519",
+      "created_at": "2025-04-22T21:17:05Z",
+      "updated_at": "2026-07-07T03:04:43Z",
+      "closed_at": "2026-07-07T03:04:43Z",
+      "labels": [
+        "triaged",
+        "oncall: pt2"
+      ],
+      "comments_count": 0,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "See https://github.com/pytorch/pytorch/pull/151788#discussion_r2054755043\n\ncc @chauhang @penguinwu",
+      "comments": []
+    },
+    {
+      "number": 177655,
+      "title": "Significant runtime overhead for standalone_compile",
+      "url": "https://github.com/pytorch/pytorch/issues/177655",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/177655",
+      "state": "closed",
+      "author": "zou3519",
+      "created_at": "2026-03-17T15:59:45Z",
+      "updated_at": "2026-07-07T02:09:47Z",
+      "closed_at": "2026-07-07T02:09:47Z",
+      "labels": [
+        "module: performance",
+        "triaged",
+        "enhancement",
+        "oncall: pt2",
+        "vllm-compile",
+        "module: vllm",
+        "bot-triaged",
+        "bot-mislabeled"
+      ],
+      "comments_count": 8,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "to repro:\n```\nMODEL=\"meta-llama/meta-llama-3-8b\"\nvllm serve $MODEL \\\n  -cc.cudagraph_mode=none \\\n  --profiler-config.profiler=torch \\\n  --profiler-config.torch_profiler_dir=./trace \\\n  --profiler-config.torch_profiler_with_stack=false \\\n  --port 2345\n  \nvllm bench serve \\\n  --dataset-name random \\\n  --ignore-eos \\\n  --input-len 512 \\\n  --output-len 4 \\\n  --profile \\\n  --model $MODEL \\\n  --max-concurrency 8 \\\n  --num-prompts 8 \\\n  --port 2345\n```\n\nWe have turned off cudagraphs to demonstrate the overhead. Empirically we have seen the overhead sometimes in models with cudagraphs on (but we are beyond the max cudagraph size), which has been surprising to me.\n\nZooming into the decode sections, this gives a trace that looks like the following (on my 8xH100 machine):\n\n<img width=\"303\" height=\"388\" alt=\"Image\" src=\"https://github.com/user-attachments/assets/78847b46-afa2-47f9-9dd8-8ee85bc183b3\" />\n\nThe space between the blue bars is entirely cpu-side work. We're looking at 89us.\n\nSetting torch_profiler_with_stack=true gives us some more visibility into what is going on. The region looks a bit larger due to profiler overhead (138us):\n\n<img width=\"772\" height=\"470\" alt=\"Image\" src=\"https://github.com/user-attachments/assets/2c7fb93a-87b5-47e0-b24a-a3e658e3e479\" />\n\nbut getting from the invoking the compiled artifact returned by standalone_compile to the first kernel call in the inductor output code takes a significant part of that time, 83us:\n\n<img width=\"615\" height=\"388\" alt=\"Image\" src=\"https://github.com/user-attachments/assets/2068183c-53de-42d6-aa33-c9c28bd7e7a4\" />\n\naot autograd runtime wrappers taking some time (19us), though not a lot of it:\n\n<img width=\"658\" height=\"429\" alt=\"Image\" src=\"https://github.com/user-attachments/assets/a5ac1f08-0a8b-4f0f-89e6-eae8e2a68d63\" />\n\nSome links if you work at meta:\n- [torch_profiler_with_stack=true](https://www.internalfb.com/intern/kernelhub/perfetto/?bucket=gpu_traces&trace_path=tree%2Frzou%2Frank0.1773690645527098107.pt.trace.json.gz)\n- [torch_profiler_with_stack=false](https://www.internalfb.com/intern/kernelhub/perfetto/?bucket=gpu_traces&trace_path=tree%2Frzou%2Frank0.1773691344451504480.pt.trace.json.gz)\n- [tlparse](https://manifold.edge.x2p.facebook.net/v0/read/tree/logs/.tmpF6X6eb/index.html?bucketName=tlparse_reports&apiKey=tlparse_reports-key&withPayload=1&timeoutMsec=10000)\n\n\ncc @jerryzh168 @chauhang @penguinwu @avikchaudhuri @zhxchen17 @tugsbayasgalan @angelayi @suo @ydwu4 @desertfire @yushangdi @benjaminglass1 @jataylo @iupaikov-amd",
+      "comments": [
+        {
+          "author": "yushangdi",
+          "created_at": "2026-03-17T20:01:33Z",
+          "updated_at": "2026-03-17T20:01:42Z",
+          "body": "bot label oncall:export is wrong. this should be vllm-compile\n\nalso cc @zhxchen17  for standalone_compile",
+          "url": "https://github.com/pytorch/pytorch/issues/177655#issuecomment-4077665354"
+        },
+        {
+          "author": "zou3519",
+          "created_at": "2026-03-17T20:55:33Z",
+          "updated_at": "2026-03-17T21:00:36Z",
+          "body": "more thoughts\n\non the inductor side:\n- copy_misaligned_inputs is in the hot-path, maybe should refactor the list return or move to C++: https://github.com/pytorch/pytorch/blob/1667a5fc61490d778c81f9081d073941975741c9/torch/_inductor/utils.py#L3456-L3459\n- assert_size_stride seems costly (if you call it a lot), can we remove them? Alternatively, might be better to assert on first use instead of assert them all at the beginning of the output_code.py ?\n- [longer term] we should probably codegen python bindings for torch.ops.aten.*\n- some sort of tensor arena allocator? we'd have Tensor objects alive for everything Inductor needs but then allocate their storages as needed\n",
+          "url": "https://github.com/pytorch/pytorch/issues/177655#issuecomment-4077956362"
+        },
+        {
+          "author": "trichmo",
+          "created_at": "2026-03-17T21:01:58Z",
+          "updated_at": "2026-03-17T21:05:36Z",
+          "body": "@zou3519 I started looking into this and have tested creating a new assert_size_stride_grouped function as well to reduce launch overhead. It takes the asserts from ~28 -> ~4 us. Does this sound reasonable to you? This is even faster than the c++ function just returning true (takes about 10us just for the call overhead.\n\nI haven't compared to assert on first use, but can look at that if you think it's a better direction.\n\n<img width=\"402\" height=\"332\" alt=\"Image\" src=\"https://github.com/user-attachments/assets/34b377a7-d09b-4c26-9686-08cb9a399e86\" />\n\nSee highlighted section for assert_size_stride_grouped\n<img width=\"501\" height=\"305\" alt=\"Image\" src=\"https://github.com/user-attachments/assets/7c405dca-719d-4635-901b-57ad31c50499\" />",
+          "url": "https://github.com/pytorch/pytorch/issues/177655#issuecomment-4077988238"
+        },
+        {
+          "author": "zou3519",
+          "created_at": "2026-03-17T21:12:12Z",
+          "updated_at": "2026-03-17T21:12:12Z",
+          "body": "I am wondering if it's better to have the asserts on during warmup in vLLM but off during all other times (e.g. runtime serving). Maybe that's too complicated to implement",
+          "url": "https://github.com/pytorch/pytorch/issues/177655#issuecomment-4078035958"
+        },
+        {
+          "author": "tianrengao",
+          "created_at": "2026-03-17T21:12:56Z",
+          "updated_at": "2026-03-17T21:12:56Z",
+          "body": "> [@zou3519](https://github.com/zou3519) I started looking into this and have tested creating a new assert_size_stride_grouped function as well to reduce launch overhead. It takes the asserts from ~28 -> ~4 us. Does this sound reasonable to you? This is even faster than the c++ function just returning true (takes about 10us just for the call overhead.\n> \n> I haven't compared to assert on first use, but can look at that if you think it's a better direction.\n> \n> <img alt=\"Image\" width=\"402\" height=\"332\" src=\"https://private-user-images.githubusercontent.com/4399891/565121299-34b377a7-d09b-4c26-9686-08cb9a399e86.png?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3NzM3ODIxNTgsIm5iZiI6MTc3Mzc4MTg1OCwicGF0aCI6Ii80Mzk5ODkxLzU2NTEyMTI5OS0zNGIzNzdhNy1kMDliLTRjMjYtOTY4Ni0wOGNiOWEzOTllODYucG5nP1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI2MDMxNyUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNjAzMTdUMjExMDU4WiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9ODM3NzYzMWJjYzNlOGI3ZGE0NWNmNWU2Y2FiMjA3YmZhNTA4ZDQ4ZGNhYzFlOTA5MGU4MWM3NDIwNGM4MjU5MCZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QifQ.Hfi_EKzeHLsFmsVtT26_IQRj81DalltKRuASJfCPFgg\">\n> See highlighted section for assert_size_stride_grouped <img alt=\"Image\" width=\"501\" height=\"305\" src=\"https://private-user-images.githubusercontent.com/4399891/565120929-7c405dca-719d-4635-901b-57ad31c50499.png?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3NzM3ODIxNTgsIm5iZiI6MTc3Mzc4MTg1OCwicGF0aCI6Ii80Mzk5ODkxLzU2NTEyMDkyOS03YzQwNWRjYS03MTlkLTQ2MzUtOTAxYi01N2FkMzFjNTA0OTkucG5nP1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI2MDMxNyUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNjAzMTdUMjExMDU4WiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9M2E3N2ZjYzA0Mzc0OGJlZDhiNTVhYWY3NTcwNTZhNzVhYmU5MWU4OTQ5MTMxNWUwMjVjODE3ZGZkZjVjN2M4OSZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QifQ.oWxVfwJYSpN9qEcNKiaP7ayd0uxMi_EgoRCVq6i4k6w\">\n\nThis looks nice, could you please share more on the `assert_size_stride_grouped`. I am happy to test your solution on my side if there is a public PR or repro instruction. Thanks!",
+          "url": "https://github.com/pytorch/pytorch/issues/177655#issuecomment-4078039331"
+        },
+        {
+          "author": "trichmo",
+          "created_at": "2026-03-17T21:30:17Z",
+          "updated_at": "2026-03-17T21:30:17Z",
+          "body": "@tianrengao I added a draft pr here for your reference\nBut I could definitely see limiting the asserts to warmup would be a better solution.\n\nLet me know if you'd like me to polish the PR and add tests if it seems reasonable. Happy to look into any other components as well. \nI'll also note I saw [previous considerations](https://github.com/pytorch/pytorch/pull/154442#issue-3094816975) around copy_misaligned_inputs",
+          "url": "https://github.com/pytorch/pytorch/issues/177655#issuecomment-4078116686"
+        },
+        {
+          "author": "zou3519",
+          "created_at": "2026-03-17T21:32:37Z",
+          "updated_at": "2026-03-17T21:32:37Z",
+          "body": "On the aotautograd side:\n- [probably don't need to increment_version if we're under inference_mode](https://github.com/pytorch/pytorch/blob/4da4292846ed8e7734d7d454f444b65cef09a550/torch/_functorch/_aot_autograd/runtime_wrappers.py#L549)\n\nI'm not sure there are other opportunities, most of the trace is just profiler overhead \n",
+          "url": "https://github.com/pytorch/pytorch/issues/177655#issuecomment-4078127611"
+        },
+        {
+          "author": "tianrengao",
+          "created_at": "2026-03-18T06:28:34Z",
+          "updated_at": "2026-03-18T06:28:34Z",
+          "body": "> more thoughts\n> \n> on the inductor side:\n> \n> * copy_misaligned_inputs is in the hot-path, maybe should refactor the list return or move to C++: \n>     \n>       \n>         [pytorch/torch/_inductor/utils.py](https://github.com/pytorch/pytorch/blob/1667a5fc61490d778c81f9081d073941975741c9/torch/_inductor/utils.py#L3456-L3459)\n>       \n>       \n>           Lines 3456 to 3459\n>         in\n>         [1667a5f](/pytorch/pytorch/commit/1667a5fc61490d778c81f9081d073941975741c9)\n>       \n>     \n>     \n>       \n>   \n>           \n>             \n>              def run(new_inputs: list[InputType]) -> Any: \n>           \n>   \n>           \n>             \n>                  old_tensors, new_tensors = copy_misaligned_inputs( \n>           \n>   \n>           \n>             \n>                      new_inputs, inputs_to_check, mutated_input_idxs \n>           \n>   \n>           \n>             \n>                  )\n> * assert_size_stride seems costly (if you call it a lot), can we remove them? Alternatively, might be better to assert on first use instead of assert them all at the beginning of the output_code.py ?\n> * [longer term] we should probably codegen python bindings for torch.ops.aten.*\n> * some sort of tensor arena allocator? we'd have Tensor objects alive for everything Inductor needs but then allocate their storages as needed\n\nRemoving assert_size_stride on the inductor side is very helpful. There is already an env flag `TORCHINDUCTOR_ALIGNMENT_ASSERTS`, and by default it is on. For vllm inference on deepseek, we should consider disable it by default. (It should be safe I think) I created a discussion issue here https://github.com/pytorch/pytorch/issues/177719 with more details",
+          "url": "https://github.com/pytorch/pytorch/issues/177655#issuecomment-4080071393"
+        }
+      ]
+    },
+    {
+      "number": 185702,
+      "title": "[Inductor] CPU backend produces incorrect numerical outputs when combining tensor slices and torch.stack",
+      "url": "https://github.com/pytorch/pytorch/issues/185702",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/185702",
+      "state": "closed",
+      "author": "xyt66665000",
+      "created_at": "2026-05-30T10:00:54Z",
+      "updated_at": "2026-07-07T02:09:17Z",
+      "closed_at": "2026-07-07T02:09:17Z",
+      "labels": [
+        "module: cpu",
+        "module: correctness (silent)",
+        "module: special",
+        "oncall: pt2",
+        "module: inductor",
+        "oncall: cpu inductor",
+        "bot-triaged"
+      ],
+      "comments_count": 0,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "### 🐛 Describe the bug\n\nWhen running a function that takes a slice of a larger tensor (`l_c[..., 16]`) and passes the results through several math operations before applying `torch.stack(..., dim=-1)`, `torch.compile` with the inductor CPU backend produces incorrect numerical results. \n\nThe eager mode and compiled mode outputs show a significant absolute difference (~0.2).\n\n### Error logs\n\n```text\n(torch-nightly) xyt19@Oasis:/tmp$ python bug.py\nPyTorch Inductor CPU Correctness Repro\n----------------------------------------\nPyTorch version : 2.13.0.dev20260521+cu130\nResult shape    : (4, 8, 3)\nMax abs error   : 0.211432158947\n\nMismatch Details:\nFlat Index [33]:\n  Eager value    :  0.007949173450\n  Compiled value :  0.219381332397\n\n[VERDICT] BUG REPRODUCED: torch.compile produces wrong CPU output.\n```\n\n### Reproduction Script\n\n```python\nimport torch\nimport torch.nn.functional as F\n\ndef fn(l_c, y, alpha, beta):\n    x = l_c[..., 16]\n\n    positive = F.softplus(x) + 0.0001\n    rates = F.softplus(y) + 0.0001\n\n    gammaln_term = torch.special.gammaln(positive + alpha.view(1, -1))\n    erf_term = torch.special.erf(x * beta.view(1, -1))\n\n    xlogy_term = torch.special.xlogy(positive, rates)\n    logadd = torch.logaddexp(gammaln_term, xlogy_term)\n\n    centered = logadd - logadd.mean(dim=-1, keepdim=True)\n\n    return torch.stack([centered, erf_term, centered * erf_term], dim=-1)\n\ndef main():\n    torch.manual_seed(20592561)\n\n    l_c = torch.randn([4, 8, 64], dtype=torch.float32) * 0.1\n    y = torch.randn([4, 8], dtype=torch.float32) * 0.1\n    alpha = torch.randn([8], dtype=torch.float32) * 0.1\n    beta = torch.zeros([8], dtype=torch.float32)\n\n    def get_cloned_args():\n        return (\n            l_c.detach().clone(),\n            y.detach().clone(),\n            alpha.detach().clone(),\n            beta.detach().clone()\n        )\n\n    with torch.no_grad():\n        eager_out = fn(*get_cloned_args())\n\n    compiled_fn = torch.compile(fn, backend=\"inductor\")\n    with torch.no_grad():\n        compiled_out = compiled_fn(*get_cloned_args())\n\n    diff = (eager_out - compiled_out).abs()\n    max_abs = diff.max().item()\n\n    print(\"PyTorch Inductor CPU Correctness Repro\")\n    print(\"-\" * 40)\n    print(f\"PyTorch version : {torch.__version__}\")\n    print(f\"Result shape    : {tuple(eager_out.shape)}\")\n    print(f\"Max abs error   : {max_abs:.12f}\")\n\n    if max_abs > 1e-3:\n        max_idx = diff.argmax().item()\n        eager_val = eager_out.flatten()[max_idx].item()\n        compiled_val = compiled_out.flatten()[max_idx].item()\n\n        print(\"\\nMismatch Details:\")\n        print(f\"Flat Index [{max_idx}]:\")\n        print(f\"  Eager value    :  {eager_val:.12f}\")\n        print(f\"  Compiled value :  {compiled_val:.12f}\")\n        print(\"\\n[VERDICT] BUG REPRODUCED: torch.compile produces wrong CPU output.\")\n    else:\n        print(\"\\n[VERDICT] BUG NOT REPRODUCED.\")\n\nif __name__ == \"__main__\":\n    main()\n```\n\n### Expected Behavior\n\nThe values returned by the compiled function should be identical to the eager execution outputs within normal floating-point tolerance.\n\n\n### Versions\n\nPyTorch version: 2.13.0.dev20260521+cu130\nIs debug build: False\nCUDA used to build PyTorch: 13.0\nROCM used to build PyTorch: N/A\n\nOS: Ubuntu 24.04.4 LTS (x86_64)\nGCC version: (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0\nClang version: 18.1.3 (1ubuntu1)\nCMake version: version 3.28.3\nLibc version: glibc-2.39\n\nPython version: 3.10.20 (main, Mar 11 2026, 17:46:40) [GCC 14.3.0] (64-bit runtime)\nPython platform: Linux-5.15.167.4-microsoft-standard-WSL2-x86_64-with-glibc2.39\nIs CUDA available: True\n\ncc @jgong5 @mingfeima @XiaobingSuper @sanchitintel @ashokei @jingxu10 @aditew01 @mruberry @kshitij12345 @voznesenskym @penguinwu @EikanWang @Guobing-Chen @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @chauhang @aakhundov @coconutruben @jataylo",
+      "comments": []
+    },
+    {
+      "number": 129131,
+      "title": "Torch compile initialises CUDA context, even compiling CPU functions",
+      "url": "https://github.com/pytorch/pytorch/issues/129131",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/129131",
+      "state": "closed",
+      "author": "hct-synth",
+      "created_at": "2024-06-20T11:43:45Z",
+      "updated_at": "2026-07-07T02:02:24Z",
+      "closed_at": "2026-07-07T02:02:24Z",
+      "labels": [
+        "triaged",
+        "oncall: pt2",
+        "module: dynamo",
+        "module: pt2-dispatcher"
+      ],
+      "comments_count": 5,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "### 🐛 Describe the bug\r\n**When trying to compile a simple function that uses `cpu` tensors, torch inductor initialises a context on `cuda:0`**.\r\n\r\nIf used in a multiprocessing context (E.G.) a torch dataloader, this quickly results in OOM (simple repro example allocates 500MB of VRAM per process). \r\n\r\n`CUDA_VISIBLE_DEVICES=\"\"` works as a workaround, however disables all use of CUDA in that process, which is undesirable. Default device context has no effect.\r\n\r\nThis issue appears to stem from both torch dynamo and inductor not respecting the default device: \r\n\r\nhttps://github.com/pytorch/pytorch/blob/main/torch/_inductor/fx_passes/pad_mm.py#L636\r\nhttps://github.com/pytorch/pytorch/blob/main/torch/_dynamo/convert_frame.py#L172\r\n\r\n(Logic refers to issue https://github.com/pytorch/pytorch/issues/97894)\r\n\r\n### Minified repro\r\n```\r\nimport torch\r\n\r\n@torch.compile\r\ndef some_fn(x):\r\n    return torch.pow(x, 0.1) / 2\r\n\r\nwith torch.device(\"cpu\"):\r\n    x = torch.ones([3, 1920, 1080], device=\"cpu\")\r\n    some_fn(x)\r\n\r\npass # At a breakpoint here 400MB+ of VRAM will be in use due to initialisation of a CUDA context\r\n```\r\n### Versions\r\n\r\ntorch==2.3.0\r\ntriton==2.3.0\r\n\r\n\r\ncc @chauhang @penguinwu @zou3519 @bdhirsh @ezyang @anijain2305 @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @peterbell10 @ipiszy @yf225 @chenyang78 @kadeng @muchulee8 @ColinPeppler @amjames @desertfire",
+      "comments": [
+        {
+          "author": "lezcano",
+          "created_at": "2024-06-21T11:03:55Z",
+          "updated_at": "2024-06-21T11:03:55Z",
+          "body": "There's this abandoned PR: https://github.com/pytorch/pytorch/pull/124722\r\nThe current approach in the PR is too intrusive. It'd be better to just check whether there's any global dtype on, and if so, then use that. In the general case, you don't want to be passing around the `input_dtype`, but simply take the logic in\r\n```\r\n    inputs_devices = list(\r\n        {i.device for i in pytree.tree_flatten(aot_example_inputs)[0]}\r\n    ) + [None]\r\n    assert len(inputs_devices) > 0\r\n    lazy_init(input_device=next(iter(inputs_devices)))\r\n```\r\nand wrap the `lazy_init` into a `with torch.dtype...` construct.\r\n\r\nWould you like to send a fix?",
+          "url": "https://github.com/pytorch/pytorch/issues/129131#issuecomment-2182533863"
+        },
+        {
+          "author": "lezcano",
+          "created_at": "2024-06-21T11:04:22Z",
+          "updated_at": "2024-06-21T11:04:22Z",
+          "body": "Also, dupe of https://github.com/pytorch/pytorch/pull/124722",
+          "url": "https://github.com/pytorch/pytorch/issues/129131#issuecomment-2182534568"
+        },
+        {
+          "author": "lee-bin",
+          "created_at": "2024-12-28T12:12:46Z",
+          "updated_at": "2024-12-28T12:12:46Z",
+          "body": "@hct-synth Where do you set `CUDA_VISIBLE_DEVICES=\"\"` for the dataloader processes?",
+          "url": "https://github.com/pytorch/pytorch/issues/129131#issuecomment-2564310223"
+        },
+        {
+          "author": "StrongerXi",
+          "created_at": "2025-02-18T22:03:14Z",
+          "updated_at": "2025-02-18T22:03:14Z",
+          "body": "Doing old issue scrubbing; I think this still repros, @eellison should we leave it open?\n\n```python\nimport torch\n\n@torch.compile\ndef some_fn(x):\n    return torch.pow(x, 0.1) / 2\n\nprint(torch.cuda._initialized) # False\nwith torch.device(\"cpu\"):\n    x = torch.ones([3, 1920, 1080], device=\"cpu\")\n    print(torch.cuda._initialized) # False\n    some_fn(x)\n    print(torch.cuda._initialized) # True\n\nprint(torch.cuda._initialized) # True\n# At a breakpoint here 400MB+ of VRAM will be in use due to initialisation of a CUDA context\n```",
+          "url": "https://github.com/pytorch/pytorch/issues/129131#issuecomment-2667024617"
+        },
+        {
+          "author": "eellison",
+          "created_at": "2025-02-19T16:41:46Z",
+          "updated_at": "2025-02-19T16:42:41Z",
+          "body": "Yes, worth keeping open i think. repros with backend=\"eager\". although I'm sure there will be subsequent fixes later in the stack once \"eager\" is fixed.",
+          "url": "https://github.com/pytorch/pytorch/issues/129131#issuecomment-2669187069"
+        }
+      ]
+    },
+    {
+      "number": 187173,
+      "title": "[Inductor] max_unpool2d backward produces incorrect output strides on CPU",
+      "url": "https://github.com/pytorch/pytorch/issues/187173",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/187173",
+      "state": "closed",
+      "author": "Arindamsamanta2004",
+      "created_at": "2026-06-12T12:09:20Z",
+      "updated_at": "2026-07-06T18:28:14Z",
+      "closed_at": "2026-07-06T18:28:14Z",
+      "labels": [
+        "module: cpu",
+        "triaged",
+        "module: memory format",
+        "oncall: pt2",
+        "module: decompositions",
+        "module: inductor",
+        "oncall: cpu inductor",
+        "bot-triaged"
+      ],
+      "comments_count": 1,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "## Bug\n\nThe `_max_unpoolnd` decomposition used by Inductor always produces contiguous output, but the native CPU kernel (`aten/src/ATen/native/MaxUnpooling.cpp`) preserves the input's memory format via `suggest_memory_format()`. When the input is channels-last, Inductor outputs contiguous strides instead of channels-last strides, causing `Significant strides mismatch` assertion failures.\n\n## Tests affected\n\n```\ntest/inductor/test_torchinductor_opinfo.py::TestInductorOpInfoCPU::test_comprehensive_nn_functional_max_unpool2d_grad_cpu_float32\ntest/inductor/test_torchinductor_opinfo.py::TestInductorOpInfoCPU::test_comprehensive_nn_functional_max_unpool2d_grad_cpu_float64\n```\n\n## Repro\n\n```bash\npython test/inductor/test_torchinductor_opinfo.py TestInductorOpInfoCPU.test_comprehensive_nn_functional_max_unpool2d_grad_cpu_float32 -v\n```\n\n### Minimal standalone repro\n\n```python\nimport torch\nimport torch.nn.functional as F\n\npool_input = torch.randn(1, 2, 3, 6).to(memory_format=torch.channels_last)\npooled, indices = F.max_pool2d(pool_input, kernel_size=3, padding=1, return_indices=True)\n\neager = F.max_unpool2d(pooled, indices, kernel_size=3, stride=3, padding=1, output_size=(1, 2, 3, 6))\n\n@torch.compile\ndef fn(x, idx):\n    return F.max_unpool2d(x, idx, kernel_size=3, stride=3, padding=1, output_size=(1, 2, 3, 6))\n\ncompiled = fn(pooled, indices)\n\nprint(f\"eager strides:    {eager.stride()}\")    # (36, 1, 12, 2) — channels-last\nprint(f\"compiled strides: {compiled.stride()}\")  # (36, 18, 6, 1) — contiguous (WRONG)\nassert eager.stride() == compiled.stride()       # Fails\n```\n\n## Error\n\n```\nAssertionError: Significant strides mismatch at leaf 0, dim 1:\n  (36, 18, 6, 1) != (36, 1, 12, 2) for shape torch.Size([1, 2, 3, 6])\n```\n\n- Compiled (Inductor): `(36, 18, 6, 1)` — contiguous\n- Eager (expected):     `(36, 1, 12, 2)` — channels-last\n\nValues are correct; only the stride layout is wrong.\n\n## Root cause\n\nThe `_max_unpoolnd` decomposition in `torch/_decomp/decompositions.py` constructs the output via:\n\n```python\noutput = self.new_zeros(output_shape)             # always contiguous\nreturn aten._unsafe_index_put(\n    output.reshape(-1), [indices_flat], ...\n).view(output.shape)                              # also contiguous\n```\n\nThe native CPU kernel does:\n\n```cpp\nauto memory_format = self_.suggest_memory_format();\noutput.resize_({numBatch, numChannels, oheight, owidth}, memory_format);\n```\n\nThe decomposition ignores the input's memory format entirely.\n\nNote: the CUDA native kernel (`MaxUnpooling.cu`) always produces contiguous output (no `memory_format` arg to `resize_()`), so this is a CPU-only mismatch.\n\n## Fix\n\nPreserve `suggest_memory_format()` in `_max_unpoolnd` (`torch/_decomp/decompositions.py`), CPU-only to match native kernel behavior.\n\n## Versions\n\n- PyTorch: main (`b71eaf9`)\n- Python: 3.12, Linux x86_64\n\ncc @jgong5 @mingfeima @XiaobingSuper @sanchitintel @ashokei @jingxu10 @aditew01 @jamesr66a @voznesenskym @penguinwu @EikanWang @Guobing-Chen @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @chauhang @aakhundov @coconutruben @jataylo @jansel @eellison @isuruf\n",
+      "comments": [
+        {
+          "author": "Arindamsamanta2004",
+          "created_at": "2026-06-12T12:10:13Z",
+          "updated_at": "2026-06-12T12:10:13Z",
+          "body": "I am working on it.",
+          "url": "https://github.com/pytorch/pytorch/issues/187173#issuecomment-4691137759"
+        }
+      ]
+    },
+    {
+      "number": 189054,
+      "title": "[Compile, 2.10 and 2.11, but not in 2.12.1] Compile with `\"max-autotune-no-cudagraphs\"` could overflow when shape is large",
+      "url": "https://github.com/pytorch/pytorch/issues/189054",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/189054",
+      "state": "open",
+      "author": "HanGuo97",
+      "created_at": "2026-07-06T17:59:20Z",
+      "updated_at": "2026-07-06T18:03:22Z",
+      "closed_at": null,
+      "labels": [],
+      "comments_count": 0,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "### 🐛 Describe the bug\n\nFor PyTorch versions before the latest version (e.g., 2.10 and 2.11), if the `M x N` shape is large, matrix multiplication with `mode=\"max-autotune-no-cudagraphs\"` could lead to wrong results. This seems to be related to int32 addressing. It seems to be fixed in 2.12, but I'm not 100% sure.\n\n```python\nimport torch\n\nM, K = 32768, 1024\n\ntorch.manual_seed(0)\nfor N in (65536, 131072):\n    x = torch.randn(M, K, device=\"cuda\", dtype=torch.bfloat16)\n    w = torch.randn(N, K, device=\"cuda\", dtype=torch.bfloat16)\n    ref = x[-64:] @ w.mT\n    for mode in (None, \"max-autotune-no-cudagraphs\"):\n        torch._dynamo.reset()\n        mm = torch.compile(lambda a, b: a @ b.mT, dynamic=False, fullgraph=True, mode=mode)\n        err = (mm(x, w)[-64:] - ref).abs().max().item()\n        print(f\"out.numel() = 2**{(M * N).bit_length() - 1}, mode = {str(mode):28s} max_abs_err = {err}\")\n        torch.cuda.empty_cache()\n```\n\nwith 2.11:\n```\nout.numel() = 2**31, mode = None                         max_abs_err = 0.0\nout.numel() = 2**31, mode = max-autotune-no-cudagraphs   max_abs_err = 0.0\nout.numel() = 2**32, mode = None                         max_abs_err = 0.0\nout.numel() = 2**32, mode = max-autotune-no-cudagraphs   max_abs_err = 187.0\n```\n\nwith 2.12.1\n```\nout.numel() = 2**31, mode = None                         max_abs_err = 0.0\nout.numel() = 2**31, mode = max-autotune-no-cudagraphs   max_abs_err = 0.0\nout.numel() = 2**32, mode = None                         max_abs_err = 0.0\nout.numel() = 2**32, mode = max-autotune-no-cudagraphs   max_abs_err = 0.0\n```\n\nWith these in mind, I have two questions:\n- Is `max-autotune-no-cudagraphs` usable in PyTorch versions before 2.12 (looks like no)?\n- Is this fixed in PyTorch version 2.12? (Seems like so, but can't confirm).\n\n### Versions\n\nPyTorch 2.10 and 2.11",
+      "comments": []
+    },
+    {
+      "number": 186220,
+      "title": "torch._inductor \"duplicate template name\" / \"duplicate extern kernel\" AssertionError on 2.11.0+cu130 (Blackwell sm_120): templates double-registered in a single process",
+      "url": "https://github.com/pytorch/pytorch/issues/186220",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/186220",
+      "state": "closed",
+      "author": "recessionist",
+      "created_at": "2026-06-04T09:53:02Z",
+      "updated_at": "2026-07-06T17:48:33Z",
+      "closed_at": "2026-07-06T17:48:33Z",
+      "labels": [
+        "module: crash",
+        "triaged",
+        "oncall: pt2",
+        "module: inductor",
+        "bot-triaged"
+      ],
+      "comments_count": 1,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "### 🐛 Describe the bug\n\n\nOn the `torch==2.11.0+cu130` build (CUDA 13, for Blackwell / sm_120, RTX 5090), `torch._inductor`\nregisters the **same** Triton template **and** the same extern kernel **twice within a single\nprocess**, hitting the hard asserts in `torch/_inductor/select_algorithm.py`:\n\n- L1775: `assert name not in self.all_templates, \"duplicate template name\"`\n- L2264: `assert not hasattr(extern_kernels, name), f\"duplicate extern kernel: {name}\"`  (name=`_grouped_mm`)\n\nIt surfaces during vLLM 0.22.0 `ModelConfig` construction (pydantic) when the model architecture\nis inspected — i.e. at import time, before any weights load — and crashes startup for **any** model:\n\n- Qwen3-VL MoE AWQ (`Qwen3_5MoeForConditionalGeneration`)\n- the tiny `BAAI/bge-m3` embedding model (`XLMRobertaModel`)\n\nBoth fail identically, so it's not model-specific.\n\n### Versions\nPyTorch version: 2.11.0+cu130\nIs debug build: False\nCUDA used to build PyTorch: 13.0\nOS: Ubuntu 22.04.5 LTS (x86_64)\nPython version: 3.12.4\nPython platform: Linux-5.15.0-94-generic-x86_64-with-glibc2.35\nIs CUDA available: True\nGPU models and configuration: GPU 0: NVIDIA GeForce RTX 5090\nNvidia driver version: 595.58.03\ncuDNN version: 9.8.0\n\nVersions of relevant libraries:\n[pip3] torch==2.11.0+cu130\n[pip3] torchaudio==2.11.0+cu130\n[pip3] torchvision==0.26.0+cu130\n[pip3] triton==3.6.0\n[pip3] (vllm==0.22.0)\n\n### Repro\n\nvllm serve BAAI/bge-m3 --enforce-eager --trust-remote-code\n→ `pydantic_core.ValidationError: ... Assertion failed, duplicate template name` (then, once that\ntemplate assert is bypassed, the same happens for `duplicate extern kernel: _grouped_mm`).\n\n### Observations / what I ruled out\n- **Not** a duplicate triton/torch install, not transformers/pydantic versions, not a stale cache/.pyc.\n- A clean `--force-reinstall` of the **same** `torch==2.11.0+cu130` reproduces it.\n- Making both registrations **idempotent** (skip if the name is already registered, keeping the\n  first — they're identical on the double-import) lets vLLM load **and** generate correctly.\n- Appears specific to the `+cu130` build (Blackwell); standard CUDA builds presumably don't\n  double-register, which is likely why it's rarely reported.\n\n### Question\nIs the inductor template / extern-kernel module-level registration expected to run twice on this\nbuild (double-import)? Should `register_template` / extern-kernel registration be **idempotent**\n(skip-if-present) rather than a hard `assert`?\n\n\n### Versions\n\nPyTorch version: 2.11.0+cu130\nIs debug build: False\nCUDA used to build PyTorch: 13.0\nOS: Ubuntu 22.04.5 LTS (x86_64)\nPython version: 3.12.4\nPython platform: Linux-5.15.0-94-generic-x86_64-with-glibc2.35\nIs CUDA available: True\nGPU models and configuration: GPU 0: NVIDIA GeForce RTX 5090\nNvidia driver version: 595.58.03\ncuDNN version: 9.8.0\n\nVersions of relevant libraries:\n[pip3] torch==2.11.0+cu130\n[pip3] torchaudio==2.11.0+cu130\n[pip3] torchvision==0.26.0+cu130\n[pip3] triton==3.6.0\n[pip3] (vllm==0.22.0)\n\ncc @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @aakhundov @coconutruben @jataylo",
+      "comments": [
+        {
+          "author": "recessionist",
+          "created_at": "2026-06-04T09:58:08Z",
+          "updated_at": "2026-06-04T09:58:08Z",
+          "body": "**Workaround for `duplicate template name` / `duplicate extern kernel: _grouped_mm` on `torch==2.11.0+cu130` (Blackwell / sm_120, e.g. RTX 5090)**\n\nSymptom: `vllm serve <any model>` crashes during `ModelConfig` validation with a pydantic\n`AssertionError: duplicate template name` (and, once that's bypassed, `duplicate extern kernel:\n_grouped_mm`). Reproduces with both a Qwen3-VL MoE AWQ model and the tiny `BAAI/bge-m3`, so it's\nnot model-specific. `torch._inductor` registers the same Triton template / extern kernel **twice\nin one process** on this `+cu130` build and the hard `assert`s in `select_algorithm.py` make it\nfatal. Downgrading torch isn't an option (sm_120 needs 2.11.0+cu130).\n\nMaking the two registrations **idempotent** (keep the first — the double-import registers an\nidentical object) lets vLLM load *and* generate normally. In `torch/_inductor/select_algorithm.py`:\n\n1. Template registration — replace:\n```python\n        assert name not in self.all_templates, \"duplicate template name\"\n        TritonTemplate.all_templates[name] = self\n```\nwith:\n```python\n        if name not in self.all_templates:\n            TritonTemplate.all_templates[name] = self\n```\n\n2. Extern-kernel registration — replace:\n```python\n        assert not hasattr(extern_kernels, name), f\"duplicate extern kernel: {name}\"\n```\nwith:\n```python\n        pass  # skip duplicate-extern-kernel assert (cu130 double-registration)\n```\nand a few lines below make the setattr idempotent — replace:\n```python\n        setattr(extern_kernels, name, kernel)\n```\nwith:\n```python\n        if not hasattr(extern_kernels, name):\n            setattr(extern_kernels, name, kernel)\n```\n\nVerified on RTX 5090 / torch 2.11.0+cu130 / vLLM 0.22.0: model loads and serves correctly after\nboth edits.\n\n⚠️ This is a **stopgap** that silences the registry's duplicate guard, not a root-cause fix. The\nreal question is why `_inductor` registers these twice in a single process on the cu130 build (a\nsingle import should register once). To survive `pip` reinstalls I apply it via a small idempotent\nscript that locates `select_algorithm.py` via `import torch._inductor.select_algorithm` and patches\nit only if a marker comment is absent. If anyone knows the underlying double-import path, please share.",
+          "url": "https://github.com/pytorch/pytorch/issues/186220#issuecomment-4621049207"
+        }
+      ]
+    },
+    {
+      "number": 179883,
+      "title": "`torch.compile` crashes on `aten._assert_tensor_metadata.default`",
+      "url": "https://github.com/pytorch/pytorch/issues/179883",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/179883",
+      "state": "closed",
+      "author": "ar0ck",
+      "created_at": "2026-04-10T01:27:37Z",
+      "updated_at": "2026-07-06T17:33:17Z",
+      "closed_at": "2026-07-06T17:33:17Z",
+      "labels": [
+        "triaged",
+        "oncall: pt2",
+        "module: fakeTensor",
+        "module: pt2-dispatcher",
+        "bot-triaged"
+      ],
+      "comments_count": 1,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "### 🐛 Describe the bug\n\n```python\nimport torch\n\ndef f(x: torch.Tensor):\n    torch.ops.aten._assert_tensor_metadata.default(x, size=[10])\n\nx = torch.empty(10)\nf(x)                 # works\ntorch.compile(f)(x)  # crashes\n```\n\n### Error logs\n\n```python\nTraceback (most recent call last):\n  File \"bug.py\", line 8, in <module>\n    torch.compile(f)(x)  # crashes\n    ~~~~~~~~~~~~~~~~^^^\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/eval_frame.py\", line 1041, in compile_wrapper\n    return fn(*args, **kwargs)\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/convert_frame.py\", line 2432, in __call__\n    result = self._torchdynamo_orig_backend(\n        frame, cache_entry, self.hooks, frame_state, skip=1\n    )\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/convert_frame.py\", line 2150, in __call__\n    result = self._inner_convert(\n        frame, cache_entry, hooks, frame_state, skip=skip + 1\n    )\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/convert_frame.py\", line 735, in __call__\n    result = _compile(\n        frame.f_code,\n    ...<16 lines>...\n        convert_frame_box=self._box,\n    )\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/convert_frame.py\", line 1919, in _compile\n    guarded_code, tracer_output = compile_inner(code, one_graph, hooks)\n                                  ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/.../lib/python3.14/site-packages/torch/_utils_internal.py\", line 96, in wrapper_function\n    return function(*args, **kwargs)\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/convert_frame.py\", line 1535, in compile_inner\n    result = _compile_inner(code, one_graph, hooks)\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/convert_frame.py\", line 1594, in _compile_inner\n    dynamo_output = compile_frame(\n        code,\n    ...<11 lines>...\n        package=package,\n    )\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/convert_frame.py\", line 1442, in compile_frame\n    bytecode, tracer_output = transform_code_object(code, transform)\n                              ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/bytecode_transformation.py\", line 1626, in transform_code_object\n    tracer_output = transformations(instructions, code_options)\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/convert_frame.py\", line 1414, in transform\n    tracer_output = trace_frame(\n        code,\n    ...<14 lines>...\n        package=package,\n    )\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/convert_frame.py\", line 342, in _fn\n    return fn(*args, **kwargs)\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/convert_frame.py\", line 875, in trace_frame\n    run_tracer()\n    ~~~~~~~~~~^^\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/convert_frame.py\", line 856, in run_tracer\n    tracer.run()\n    ~~~~~~~~~~^^\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/symbolic_convert.py\", line 1704, in run\n    while self.step():\n          ~~~~~~~~~^^\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/symbolic_convert.py\", line 1371, in step\n    self.dispatch_table[inst.opcode](self, inst)\n    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/symbolic_convert.py\", line 908, in wrapper\n    return inner_fn(self, inst)\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/symbolic_convert.py\", line 4276, in CALL_KW\n    self._call(inst, call_kw=True)\n    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/symbolic_convert.py\", line 4052, in _call\n    self.call_function(fn, args, kwargs)\n    ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/symbolic_convert.py\", line 1272, in call_function\n    self.push(fn.call_function(self, args, kwargs))  # type: ignore[arg-type]\n              ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/variables/torch.py\", line 2600, in call_function\n    tensor_variable = wrap_fx_proxy(\n        tx=tx,\n    ...<4 lines>...\n        ),\n    )\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/variables/builder.py\", line 3073, in wrap_fx_proxy\n    return wrap_fx_proxy_cls(target_cls=TensorVariable, **kwargs)\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/variables/builder.py\", line 3148, in wrap_fx_proxy_cls\n    out: VTTypeAlias = _wrap_fx_proxy(\n                       ~~~~~~~~~~~~~~^\n        target_cls, tx, proxy, example_value, subclass_type, **options\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    )\n    ^\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/variables/builder.py\", line 3272, in _wrap_fx_proxy\n    example_value = get_fake_value(proxy.node, tx, allow_non_graph_fake=True)\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/utils.py\", line 3736, in get_fake_value\n    return _get_fake_value_impl(node, tx, allow_non_graph_fake)\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/utils.py\", line 3927, in _get_fake_value_impl\n    _wrap_graph_break_with_torch_runtime_err(\n    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^\n        lambda: unimplemented(\n        ^^^^^^^^^^^^^^^^^^^^^^\n    ...<5 lines>...\n        )\n        ^\n    )\n    ^\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/utils.py\", line 3725, in _wrap_graph_break_with_torch_runtime_err\n    raise exc.with_traceback(e.__traceback__) from None\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/utils.py\", line 3722, in _wrap_graph_break_with_torch_runtime_err\n    gb_fn()\n    ~~~~~^^\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/utils.py\", line 3928, in <lambda>\n    lambda: unimplemented(\n            ~~~~~~~~~~~~~^\n        gb_type=\"RuntimeError when making fake tensor call\",\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    ...<3 lines>...\n        from_exc=cause,\n        ^^^^^^^^^^^^^^^\n    )\n    ^\n  File \"/.../lib/python3.14/site-packages/torch/_dynamo/exc.py\", line 653, in unimplemented\n    raise Unsupported(\n        msg, gb_type, skip_frame, real_stack=past_real_stack\n    ) from from_exc\ntorch._dynamo.exc.TorchRuntimeError: RuntimeError when making fake tensor call\n  Explanation: Dynamo failed to run FX node with fake tensors: call_function aten._assert_tensor_metadata.default(*(FakeTensor(..., size=(10,)),), **{'size': [10]}): got AssertionError('Tensor sizes mismatch! Expected: [10], Got: torch.Size([10])')\n  Hint: Your code may result in an error when running in eager. Please double check that your code doesn't contain a similar error when actually running eager/uncompiled. You can do this by removing the `torch.compile` call, or by using `torch.compiler.set_stance(\"force_eager\")`. \n\n  Developer debug context: \n\n For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb4315.html\n\nfrom user code:\n   File \"bug.py\", line 4, in f\n    torch.ops.aten._assert_tensor_metadata.default(x, size=[10])\n```\n\n### Versions\n\n```\nCollecting environment information...\nPyTorch version: N/A\nIs debug build: N/A\nCUDA used to build PyTorch: N/A\nROCM used to build PyTorch: N/A\n\nOS: macOS 26.3.1 (arm64)\nGCC version: Could not collect\nClang version: 17.0.0 (clang-1700.6.3.2)\nCMake version: version 4.2.3\nLibc version: N/A\n\nPython version: 3.14.2 (v3.14.2:df793163d58, Dec  5 2025, 12:18:06) [Clang 16.0.0 (clang-1600.0.26.6)] (64-bit runtime)\nPython platform: macOS-26.3.1-arm64-arm-64bit-Mach-O\nIs CUDA available: N/A\nCUDA runtime version: Could not collect\nCUDA_MODULE_LOADING set to: N/A\nGPU models and configuration: Could not collect\nNvidia driver version: Could not collect\ncuDNN version: Could not collect\nIs XPU available: N/A\nHIP runtime version: N/A\nMIOpen runtime version: N/A\nIs XNNPACK available: N/A\nCaching allocator config: N/A\n\nCPU:\nApple M4 Pro\n\nVersions of relevant libraries:\n[pip3] No relevant packages\n[conda] Could not collect\n```\n\ncc @chauhang @penguinwu @eellison @aorenste @bdhirsh @bobrenjc93",
+      "comments": [
+        {
+          "author": "ar0ck",
+          "created_at": "2026-04-10T01:28:11Z",
+          "updated_at": "2026-04-10T01:28:11Z",
+          "body": "Will fix.",
+          "url": "https://github.com/pytorch/pytorch/issues/179883#issuecomment-4219222810"
+        }
+      ]
+    },
+    {
+      "number": 188835,
+      "title": "DistillGPT2 fails accuracy on A100 in inductor smoke test",
+      "url": "https://github.com/pytorch/pytorch/issues/188835",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/188835",
+      "state": "open",
+      "author": "frgossen",
+      "created_at": "2026-07-02T18:30:02Z",
+      "updated_at": "2026-07-06T17:32:29Z",
+      "closed_at": null,
+      "labels": [
+        "high priority",
+        "module: numerical-stability",
+        "triaged",
+        "module: regression",
+        "oncall: pt2",
+        "module: inductor",
+        "upstream triton",
+        "bot-triaged"
+      ],
+      "comments_count": 0,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "DistillGPT2 fails the accuracy check in the A100 `inductor_torchbench_smoketest_perf` warm-start loop (`accuracy=fail_accuracy`), which reds the whole job. It's A100/sm80-specific and doesn't reproduce elsewhere -- the dedicated `inductor_huggingface` accuracy job still passes it.\n\n#188750 excludes it from the smoke check as a stopgap; the underlying compiled-vs-eager divergence (RMSE ~0.19 vs ~0.008 eager) is unfixed and needs root-causing.\n\nFirst flagged during the Triton 3.8 pin work in #187401, which notes the A100 delta reproduces on both 3.8 pins -- i.e. it looks like a Triton 3.7->3.8 change rather than a specific pin.\n\ncc @ezyang @gchanan @kadeng @msaroufim @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @muchulee8 @amjames @aakhundov @coconutruben @jataylo @bertmaher @int3 @davidberard98 @nmacchioni @embg @peterbell10 @iupaikov-amd",
+      "comments": []
+    },
+    {
+      "number": 188332,
+      "title": "Inductor: allgather fusion creates rank-specific cache that crashes when loaded by other ranks",
+      "url": "https://github.com/pytorch/pytorch/issues/188332",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/188332",
+      "state": "open",
+      "author": "ppwwyyxx",
+      "created_at": "2026-06-27T11:35:52Z",
+      "updated_at": "2026-07-06T17:31:19Z",
+      "closed_at": null,
+      "labels": [
+        "high priority",
+        "triaged",
+        "oncall: pt2"
+      ],
+      "comments_count": 2,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "### 🐛 Describe the bug\n\nMinimal repro: Inductor FX graph cache reuses rank-specific code.\n\nRun twice with two GPUs. The first run cold-compiles and should pass; the second\nrun reloads the shared warm FX graph cache and should fail because one rank can\nload the other rank's device/rank-specific generated wrapper.\n\n    rm -rf /tmp/repro_fx_cache_rank_collision\n    TORCHINDUCTOR_COMPILE_THREADS=1 TORCH_COMPILE_DEBUG=1 \\\n      torchrun --nproc-per-node 2 repro_fx_cache_rank_collision.py\n    TORCHINDUCTOR_COMPILE_THREADS=1 TORCH_COMPILE_DEBUG=1 \\\n      torchrun --nproc-per-node 2 repro_fx_cache_rank_collision.py\n\nExpected warm-cache failure on torch 2.12.x:\n\n    RuntimeError: CUDA driver error: invalid argument\n\nor, with the static launcher disabled:\n\n    ValueError: Pointer argument cannot be accessed from Triton (cpu tensor?)\n\nThis requires bucketed all-gather lowering. The fused all-gather wrapper bakes in\nrank/device-specific details, but the FX graph cache key is shared across ranks.\n\n```python\nimport os\nimport tempfile\n\n# Fixed cache shared by all ranks and all invocations. The bug is that rank 0 and\n# rank 1 can hit the same FX graph cache entry even though generated code differs\n# by CUDA device, stream, and all-gather packing offset.\nos.environ[\"TORCHINDUCTOR_CACHE_DIR\"] = os.path.join(\n    tempfile.gettempdir(), \"repro_fx_cache_rank_collision\"\n)\n\nimport torch\nimport torch.distributed as dist\nfrom torch.distributed._tensor import Replicate, Shard, distribute_tensor, init_device_mesh\n\n\ndef two_all_gathers(xs):\n    return [x.redistribute(placements=[Replicate()]) for x in xs]\n\n\ndef main() -> None:\n    dist.init_process_group(\"nccl\")\n    rank = dist.get_rank()\n    world = dist.get_world_size()\n    torch.cuda.set_device(int(os.environ[\"LOCAL_RANK\"]))\n\n    dist.all_reduce(torch.ones((), device=\"cuda\"))\n    mesh = init_device_mesh(\"cuda\", (world,))\n\n    # Two adjacent same-dtype Shard->Replicate redistributes trigger Inductor's\n    # bucket_all_gathers_fx pass, producing one packed all_gather whose wrapper is\n    # rank-specific.\n    xs = [\n        distribute_tensor(torch.randn(world * 128, 256, device=\"cuda\"), mesh, [Shard(0)])\n        for _ in range(2)\n    ]\n\n    compiled = torch.compile(\n        two_all_gathers,\n        fullgraph=True,\n        options={\"bucket_all_gathers_fx\": \"all\"},\n    )\n    ys = compiled(xs)\n    torch.stack([y.to_local().sum() for y in ys]).sum().item()\n    torch.cuda.synchronize()\n\n    print(f\"OK rank={rank} pid={os.getpid()}\", flush=True)\n    dist.barrier()\n    dist.destroy_process_group()\n\n\nif __name__ == \"__main__\":\n    main()\n```\n\n### Versions\n\n2.14.0.dev20260625+cu126\n\ncc @ezyang @gchanan @kadeng @msaroufim @chauhang @penguinwu",
+      "comments": [
+        {
+          "author": "leonardHONG",
+          "created_at": "2026-06-28T12:27:00Z",
+          "updated_at": "2026-06-28T12:27:00Z",
+          "body": "Hi,@ppwwyyxx .Happy to take a crack at this if it's still up for grabs. Looks like the bucketed all-gather bakes a per-rank offset but the FxGraphCache key doesn't include rank, so a shared cache dir ends up colliding across ranks — mind if I pick  it up?",
+          "url": "https://github.com/pytorch/pytorch/issues/188332#issuecomment-4826088448"
+        },
+        {
+          "author": "IvanKobzarev",
+          "created_at": "2026-07-06T12:57:49Z",
+          "updated_at": "2026-07-06T12:57:49Z",
+          "body": "Can be reproduced deterministically locally. On Cache hit we gave to device 1 the code compiled previously on device 0. \n\nDTensor is agnostic to device indexes and AOTAutograd cache did not have device specialization, but FX Graph Cache underneath has device specialization.\n\ncc @aorenste ",
+          "url": "https://github.com/pytorch/pytorch/issues/188332#issuecomment-4893047880"
+        }
+      ]
+    },
+    {
+      "number": 188841,
+      "title": "triton 3.8 pin update regressing compile + float8 training numerics",
+      "url": "https://github.com/pytorch/pytorch/issues/188841",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/188841",
+      "state": "open",
+      "author": "vkuzo",
+      "created_at": "2026-07-02T19:26:57Z",
+      "updated_at": "2026-07-06T17:23:33Z",
+      "closed_at": null,
+      "labels": [
+        "high priority",
+        "module: numerical-stability",
+        "triaged",
+        "module: regression",
+        "oncall: pt2",
+        "module: inductor",
+        "upstream triton",
+        "module: floatx (formerly float8)",
+        "bot-triaged"
+      ],
+      "comments_count": 2,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "### 🐛 Describe the bug\n\nIt looks like the triton pin update from https://github.com/pytorch/pytorch/pull/188251 regressed compile + float8 training numerics.\n\n* standalone repro: https://gist.github.com/vkuzo/c8f9e13bc33e5612c08f1e938eea6710 .  This is Claude distilling the torchao CI failure from https://github.com/pytorch/ao/actions/runs/28482428560/job/84421535699 into a standalone script.\n* CLI output from running the repro: https://gist.github.com/vkuzo/fca63e4205c1b92954fd2b07ae9e9a8b . \n* Note that the repro can be fixed by manually installing the previously pinned triton version against a recent nightly torch.\n\n### Versions\n\nCollecting environment information...\nPyTorch version: 2.14.0.dev20260701+cu130\nIs debug build: False\nCUDA used to build PyTorch: 13.0\nROCM used to build PyTorch: N/A\n\nOS: Ubuntu 24.04.4 LTS (x86_64)\nGCC version: (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0\nClang version: Could not collect\nCMake version: version 4.3.2\nLibc version: glibc-2.39\n\nPython version: 3.12.12 | packaged by conda-forge | (main, Oct 22 2025, 23:25:55) [GCC 14.3.0] (64-bit runtime)\nPython platform: Linux-6.12.83-115.161.amzn2023.x86_64-x86_64-with-glibc2.39\nIs CUDA available: True\nCUDA runtime version: 13.2.78\nCUDA_MODULE_LOADING set to: \nGPU models and configuration: \nGPU 0: NVIDIA H100 80GB HBM3\nGPU 1: NVIDIA H100 80GB HBM3\n\nNvidia driver version: 595.71.05\ncuDNN version: Could not collect\nIs XPU available: False\nHIP runtime version: N/A\nMIOpen runtime version: N/A\nIs XNNPACK available: False\nCaching allocator config: N/A\n\nCPU:\nArchitecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           48 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  192\nOn-line CPU(s) list:                     0-191\nVendor ID:                               AuthenticAMD\nModel name:                              AMD EPYC 7R13 Processor\nCPU family:                              25\nModel:                                   1\nThread(s) per core:                      2\nCore(s) per socket:                      48\nSocket(s):                               2\nStepping:                                1\nBogoMIPS:                                5299.99\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid extd_apicid aperfmperf tsc_known_freq pni pclmulqdq monitor ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy cr8_legacy abm sse4a misalignsse 3dnowprefetch topoext perfctr_core ssbd ibrs ibpb stibp vmmcall fsgsbase bmi1 avx2 smep bmi2 invpcid rdseed adx smap clflushopt clwb sha_ni xsaveopt xsavec xgetbv1 clzero xsaveerptr rdpru wbnoinvd arat npt nrip_save vaes vpclmulqdq rdpid\nHypervisor vendor:                       KVM\nVirtualization type:                     full\nL1d cache:                               3 MiB (96 instances)\nL1i cache:                               3 MiB (96 instances)\nL2 cache:                                48 MiB (96 instances)\nL3 cache:                                384 MiB (12 instances)\nNUMA node(s):                            2\nNUMA node0 CPU(s):                       0-47,96-143\nNUMA node1 CPU(s):                       48-95,144-191\nVulnerability Gather data sampling:      Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Mitigation; Safe RET\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Retpolines; IBPB conditional; IBRS_FW; STIBP always-on; RSB filling; PBRSB-eIBRS Not affected; BHI Not affected\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Mitigation; Clear CPU buffers\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected\n\nVersions of relevant libraries:\n[pip3] numpy==2.4.1\n[pip3] nvidia-cublas==13.1.1.3\n[pip3] nvidia-cuda-cupti==13.0.85\n[pip3] nvidia-cuda-nvrtc==13.0.88\n[pip3] nvidia-cuda-runtime==13.0.96\n[pip3] nvidia-cudnn-cu13==9.23.1.3\n[pip3] nvidia-cufft==12.0.0.61\n[pip3] nvidia-curand==10.4.0.35\n[pip3] nvidia-cusolver==12.0.4.66\n[pip3] nvidia-cusparse==12.6.3.3\n[pip3] nvidia-cusparselt-cu13==0.8.1\n[pip3] nvidia-nccl-cu13==2.30.7\n[pip3] nvidia-nvjitlink==13.0.88\n[pip3] nvidia-nvtx==13.0.85\n[pip3] pytorch_sphinx_theme2==0.3.0\n[pip3] torch==2.14.0.dev20260701+cu130\n[pip3] torchao==0.18.0+gitc58dd8c2f\n[pip3] torchvision==0.29.0.dev20260702+cu130\n[pip3] triton==3.7.1+git5d6048aa\n[conda] numpy                            2.4.1                     pypi_0                pypi\n[conda] nvidia-cublas                    13.1.1.3                  pypi_0                pypi\n[conda] nvidia-cuda-cupti                13.0.85                   pypi_0                pypi\n[conda] nvidia-cuda-nvrtc                13.0.88                   pypi_0                pypi\n[conda] nvidia-cuda-runtime              13.0.96                   pypi_0                pypi\n[conda] nvidia-cudnn-cu13                9.23.1.3                  pypi_0                pypi\n[conda] nvidia-cufft                     12.0.0.61                 pypi_0                pypi\n[conda] nvidia-curand                    10.4.0.35                 pypi_0                pypi\n[conda] nvidia-cusolver                  12.0.4.66                 pypi_0                pypi\n[conda] nvidia-cusparse                  12.6.3.3                  pypi_0                pypi\n[conda] nvidia-cusparselt-cu13           0.8.1                     pypi_0                pypi\n[conda] nvidia-nccl-cu13                 2.30.7                    pypi_0                pypi\n[conda] nvidia-nvjitlink                 13.0.88                   pypi_0                pypi\n[conda] nvidia-nvtx                      13.0.85                   pypi_0                pypi\n[conda] pytorch-sphinx-theme2            0.3.0                     pypi_0                pypi\n[conda] torch                            2.14.0.dev20260701+cu130  pypi_0                pypi\n[conda] torchao                          0.18.0+gitc58dd8c2f       pypi_0                pypi\n[conda] torchvision                      0.29.0.dev20260702+cu130  pypi_0                pypi\n[conda] triton                           3.7.1+git5d6048aa         pypi_0                pypi\n\n\ncc @ezyang @gchanan @kadeng @msaroufim @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @muchulee8 @amjames @aakhundov @coconutruben @jataylo @bertmaher @int3 @davidberard98 @nmacchioni @embg @peterbell10 @iupaikov-amd",
+      "comments": [
+        {
+          "author": "vkuzo",
+          "created_at": "2026-07-02T19:36:40Z",
+          "updated_at": "2026-07-02T19:36:40Z",
+          "body": "p.s. additional context from the claude investigation: https://gist.github.com/vkuzo/c39600335b86f42eb8e4adb63d720b51\n\nthis line seems fishy to me:\n\n```\n  Failure signature                                                                                              \n                                                                                                                                                                                                                                 \n  For the grad_weight = x.t() @ grad_output GEMM (shapes M,K,N = 16,16,32 → grad_weight is 32×16):                                                                                                                               \n                                                                                                                                                                                                                                 \n  - Triton 3.8: 224/512 elements are exactly 0; the zeros form a regular stride-4 column lattice (every 4th column of grad_weight is dead). max_abs_diff vs eager ≈ 13.75.                                                       \n  - Triton 3.7.1: bit-identical to eager (0 zeros).                                                                                                                                                                              \n\n  The zeroing is purely positional (depends on column index mod 4, not on data values) — columns of similar magnitude are alternately correct/zeroed. This is the fingerprint of a wrong store mask/predicate on a strided\n  (transposed) store in the fused fp8-quantize + transpose + _scaled_mm kernel, not an fp8 scaling/underflow issue. The forward output and grad_input are correct; only grad_weight is affected.\n```",
+          "url": "https://github.com/pytorch/pytorch/issues/188841#issuecomment-4869810231"
+        },
+        {
+          "author": "vkuzo",
+          "created_at": "2026-07-02T19:37:09Z",
+          "updated_at": "2026-07-02T19:37:09Z",
+          "body": "synced with @warrendeng  offline, thank you for taking a look!",
+          "url": "https://github.com/pytorch/pytorch/issues/188841#issuecomment-4869813572"
+        }
+      ]
+    },
+    {
+      "number": 188492,
+      "title": "swin_base_patch4_window7_224 fails inductor accuracy (bf16 inference, H100) after Triton 3.8 pin bump",
+      "url": "https://github.com/pytorch/pytorch/issues/188492",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/188492",
+      "state": "open",
+      "author": "frgossen",
+      "created_at": "2026-06-29T22:47:57Z",
+      "updated_at": "2026-07-06T17:23:27Z",
+      "closed_at": null,
+      "labels": [
+        "high priority",
+        "module: dependency bug",
+        "module: cuda",
+        "triaged",
+        "module: regression",
+        "module: bfloat16",
+        "module: correctness (silent)",
+        "oncall: pt2",
+        "module: inductor",
+        "upstream triton",
+        "module: pt2 accuracy",
+        "bot-triaged"
+      ],
+      "comments_count": 1,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "### Summary\n\n`swin_base_patch4_window7_224` (timm_models) started failing the inductor **accuracy** check on **H100 / CUDA / bf16 / inference** after the Triton pin was bumped **3.7.1 → 3.8.0** in #188251 (re-land of #185453, landed in `530f5443d407`, 2026-06-26 21:41 UTC). The model still compiles and runs at full speed — this is a **numerical divergence** (`fail_accuracy`), not a crash or perf regression.\n\nThis looks like the same failure class tracked in #187401 as \"NVIDIA TIMM NaN/accuracy\" (root cause triton-lang/triton#9511, marked fixed in-pin by triton-lang/triton#10646) — but that fix does not appear to cover `swin` on H100.\n\n### Confirmed by controlled single-variable repro\n\nSame PyTorch build (`2e530925`), same H100, **only Triton swapped**:\n\n```bash\npython benchmarks/dynamo/timm_models.py \\\n  --accuracy --inductor --device cuda --bfloat16 --inference \\\n  --only swin_base_patch4_window7_224\n```\n\n| Triton | result |\n|---|---|\n| `3.7.1+git5d6048aa` | **pass** |\n| `3.8.0+git43422b04` (current pin, installed via `make triton`) | **fail_accuracy** |\n\nNothing but the Triton version changed between the two runs, so the regression is attributable to Triton 3.8 alone, not to any PyTorch-side commit.\n\n### Scope\n\n- Affects **all Triton-codegen inductor backends** (default, no_cudagraphs, with_cudagraphs, with_cudagraphs_freezing, dynamic, cpp_wrapper, aot_inductor). **`inductor_export` still passes** (it does not go through Triton kernel codegen).\n- Among the 18 timm models on this dashboard config, **only `swin` regressed** — the other vision transformers (`beit_base_patch16_224`, `deit_base_distilled_patch16_224`, `deit_tiny_patch16_224`, `vit_base_patch14_dinov2`, `vit_base_patch16_siglip_256`, `visformer_small`, `mobilevit_s`) all pass, so the earlier ViT-family Triton-3.8 fix landed for them.\n- On the compiler dashboard this shows as timm passrate **18/18 → 17/18 = 94.4%**, dropping under the 95% red threshold.\n- **Pre-merge CI (a10g) is unaffected** and `benchmarks/dynamo/ci_expected_accuracy/inductor_timm_inference.csv` still records `swin_base_patch4_window7_224,pass,0` — so this does **not** block merges; it is a dashboard-health / correctness signal specific to H100 bf16.\n\n### Dashboard evidence\n\n[TorchInductor Performance Dashboard — h100 / cuda / bf16 / inference](https://hud.pytorch.org/benchmark/compilers): compare `6e758bf93e31` (last green, 2026-06-26) vs `731a9d775a76` (first red, 2026-06-27). Clean 5-day-pass → fail cliff at the Triton landing; per-model speedup is flat across the flip (~1.5x), confirming the model still compiles and runs — only correctness diverges.\n\n### Asks\n\n1. Confirm whether this is an expected residual of the Triton 3.8 bump (if so, update the H100 expected-accuracy for `swin`), or a genuine Triton codegen bug to pursue upstream.\n2. If accepted/known, track it here so trunk health monitoring stops re-flagging it.\n\ncc @ezyang @gchanan @kadeng @msaroufim @ptrblck @eqy @tinglvv @nWEIdia @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @muchulee8 @amjames @aakhundov @coconutruben @jataylo @bertmaher @int3 @davidberard98 @nmacchioni @embg @peterbell10 @iupaikov-amd @warrendeng (Triton 3.8 pin #188251 / #185453, tracker #187401)\n",
+      "comments": [
+        {
+          "author": "warrendeng",
+          "created_at": "2026-07-01T18:11:20Z",
+          "updated_at": "2026-07-01T18:11:38Z",
+          "body": "I verified that this is caused by the LLVM SLP vectorizer which was introduced in a Triton LLVM bump (https://github.com/triton-lang/triton/pull/10503/). This is currently disabled for Ampere due to PTXAS bug, looking at potential ways we can mitigate upstream for Hopper",
+          "url": "https://github.com/pytorch/pytorch/issues/188492#issuecomment-4858792157"
+        }
+      ]
+    },
+    {
+      "number": 188358,
+      "title": "[Dynamo] Eager and torch.compile behavior mismatch in F.batch_norm with multidimensional bias",
+      "url": "https://github.com/pytorch/pytorch/issues/188358",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/188358",
+      "state": "open",
+      "author": "xyt66665000",
+      "created_at": "2026-06-28T09:43:35Z",
+      "updated_at": "2026-07-06T17:20:16Z",
+      "closed_at": null,
+      "labels": [
+        "high priority",
+        "triaged",
+        "oncall: pt2",
+        "module: pt2-dispatcher"
+      ],
+      "comments_count": 1,
+      "matched_keywords": [
+        "compile",
+        "dynamo"
+      ],
+      "body": "### 🐛 Describe the bug\n\n`F.batch_norm` executes successfully in eager mode when provided with a 3D `bias` tensor (where `bias.numel()` matches the channel size), but it fails with a `RuntimeError` when executed under `torch.compile(backend=\"aot_eager\")`. \n\n**Reproduction Script:**\n```python\nimport traceback\nimport torch\nimport torch.nn.functional as F\n\ndef target_function(x, running_mean, running_var, weight, bias_3d):\n    return F.batch_norm(\n        x,\n        running_mean,\n        running_var,\n        weight=weight,\n        bias=bias_3d,\n        training=False,\n        momentum=0.1,\n        eps=1e-5,\n    )\n\ndef main():\n    device = \"cuda\" if torch.cuda.is_available() else \"cpu\"\n    \n    C = 64\n    x = torch.randn(2, C, 4, 4, device=device, dtype=torch.float32)\n    running_mean = torch.zeros(C, device=device, dtype=torch.float32)\n    running_var = torch.ones(C, device=device, dtype=torch.float32)\n    weight = torch.ones(C, device=device, dtype=torch.float32)\n\n    # multidimensional bias where numel() == C\n    bias_3d = torch.randn(2, 4, 8, device=device, dtype=torch.float32)\n    \n    args = (x, running_mean, running_var, weight, bias_3d)\n\n    print(\"\\n[eager]\")\n    eager = target_function(*args)\n    print(\"eager OK:\", tuple(eager.shape))\n\n    print(\"\\n[torch.compile backend='aot_eager']\")\n    compiled = torch.compile(target_function, backend=\"aot_eager\")\n    \n    out = compiled(*args)\n    print(\"compiled OK:\", tuple(out.shape))\n\nif __name__ == \"__main__\":\n    main()\n```\n\n**Expected Behavior:**\n`torch.compile` should either execute successfully and produce the same output as Eager mode, or Eager mode should reject the multidimensional bias with a clear shape mismatch error.\n\n**Actual Behavior / Traceback:**\nEager mode passes, but compiled mode fails with:\n```text\n[eager]\neager OK: (2, 64, 4, 4)\n\n[torch.compile backend='aot_eager']\nTraceback (most recent call last):\n.......\nRuntimeError: TensorAccessor expected 1 dims but tensor has 3\n```\n\n\n### Versions\n\nPyTorch: 2.14.0.dev20260624+cu130\nCUDA used to build PyTorch: 13.0\nOS: Ubuntu 24.04.4 LTS (x86_64)\nIs CUDA available: True\nCUDA runtime version: 12.0.140\n\ncc @ezyang @gchanan @kadeng @msaroufim @chauhang @penguinwu @bdhirsh @bobrenjc93 @aorenste",
+      "comments": [
+        {
+          "author": "IvanKobzarev",
+          "created_at": "2026-07-06T12:26:06Z",
+          "updated_at": "2026-07-06T12:26:06Z",
+          "body": "Compile via decomposition uses different kernel than eager, that uses 1D accessor  on bias and fail\n```\n  # torch/_decomp/decompositions.py:2190\n  @aten.native_batch_norm.default.py_impl(DispatchKey.CompositeImplicitAutograd)\n  def native_batch_norm_decomposition(...):\n      ...\n      else:  # inference (line 2222)\n          return aten._native_batch_norm_legit_no_training(input, weight, bias, ...)\n```",
+          "url": "https://github.com/pytorch/pytorch/issues/188358#issuecomment-4892756342"
+        }
+      ]
+    },
+    {
+      "number": 188564,
+      "title": "rocm-navi31 gfx1100 test (default) jobs time out after 270 min on inductor/test_torchinductor (red since 2026-05-20)",
+      "url": "https://github.com/pytorch/pytorch/issues/188564",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/188564",
+      "state": "open",
+      "author": "frgossen",
+      "created_at": "2026-06-30T16:29:03Z",
+      "updated_at": "2026-07-06T17:19:11Z",
+      "closed_at": null,
+      "labels": [
+        "module: rocm",
+        "module: ci",
+        "module: convolution",
+        "triaged",
+        "oncall: pt2",
+        "module: inductor",
+        "module: compile-time",
+        "bot-triaged"
+      ],
+      "comments_count": 1,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "### 🐛 Describe the bug\n\nThe `rocm-navi31` (gfx1100 / RDNA3) `test (default)` jobs **time out at the 270-minute Test-step limit on every run** — the workflow has been continuously red for ~6 weeks. Both top-level shards are affected (`default, 1, 2` and `default, 2, 2`); e.g. in run [28429488646](https://github.com/pytorch/pytorch/actions/runs/28429488646) (2026-06-30) both timed out:\n- job 84244594720 — `test (default, 1, 2, linux.rocm.gpu.gfx1100)`\n- job 84244594739 — `test (default, 2, 2, linux.rocm.gpu.gfx1100)`\n\n**Final error (both):**\n```\n##[error]The action 'Test' has timed out after 270 minutes.\n```\nThis is a **wall-clock timeout, not a correctness failure**. Trailing `exit code 128` / `Permission denied` / `EACCES rmdir .additional_ci_files` lines are post-kill cleanup noise.\n\n### Root cause — the inductor suite doesn't fit the 270-min budget on gfx1100\n\n`inductor/test_torchinductor.py` dominates the Test step and is internally split into **34 sub-shards run sequentially** within the single job, each ~12–15 min:\n```\n... Finished inductor/test_torchinductor 20/34 ... took 12.32min\n... 22/34 ... took 14.55min\n... 24/34 ... took 12.52min\n... 26/34 ... took 14.82min   (still launching 28/34 when the 270-min Test timeout fired)\n```\nSo `test_torchinductor` alone needs **~7+ hours** on gfx1100, but the Test step is capped at 270 min → the job is killed around sub-shard ~28/34.\n\nA major contributor to the slowness is Triton autotuning compilation, especially the **69 `test_conv2d_backward_parametrized_*` variants**, many of which additionally *fail* after ~300 s with an Inductor autotuning timeout (one shard-2/2 run logged **21×**):\n```\nE ... triton_heuristics.py:1258] Triton compilation failed: Placeholder.DESCRIPTIVE_NAME\nFAILED [300.59s] ...GPUTests::test_conv2d_backward_parametrized_..._cuda\n  - torch._inductor.exc.InductorError: TimeoutError: 1 (of 14) futures unfinished\n```\ngfx1100 is a consumer RDNA3 part where Triton/inductor compilation (esp. these conv2d-backward templates) is slow, so the suite no longer fits the budget.\n\n### How long it's been failing\n\n`rocm-navi31` workflow last **GREEN** run: **2026-05-19**. Continuously red (failure/cancelled) since **2026-05-20** — **388 consecutive red runs over ~6 weeks** as of 2026-06-30, with **zero successes** in that window. Clean cliff on ~May 20 (healthy before: e.g. 178 successes in April).\n\nThe specific **`test (default, 2, 2, gfx1100)`** shard has been tracked down as **reliably failing since at least 2026-06-05 ~09:50**, consistent with the workflow-level cliff.\n\n*Caveat:* the 6-week duration is measured at the **workflow level** (easily queryable). The 270-min Test timeout is confirmed for the current runs but not individually proven as the culprit for all 388 red runs.\n\n### This is NOT covered by the existing issue\n\n**#165040** \"DISABLED rocm / linux-jammy-rocm-py3_10-gfx1100 / test (default)\" (OPEN; `module: rocm`, `module: ci`) is **adjacent but distinct**: it's the **`rocm`** workflow (not `rocm-navi31`), and its root cause is the **build not compiling for the gfx1100 target → \"device not found\"**. Here the build is fine, the GPU is found, tests **run and pass**, and the job is killed purely by the **270-min wall-clock**. (Other gfx1100 issues #152595 / #165141 / #169857 / #177834 are unrelated.)\n\n### Suggested fix\n\n1. **Unblock now (CI-side):** increase shard count for this job (it's `num_shards=2` today) so each Test step fits in 270 min; and/or raise the Test-step timeout for navi31; and/or skip/trim the heaviest inductor parametrizations (notably `test_conv2d_backward_parametrized`) on navi31.\n2. **Real fix:** the slow/hanging Triton `convolution2d_bwd_weight` template compilation on RDNA3 (`1 (of 14) futures unfinished` = specific configs never compile within the deadline).\n\n### Versions\n\nROCm navi31 (gfx1100), PyTorch trunk `main`. Red since 2026-05-20 (last green 2026-05-19).\n\ncc @ezyang @gchanan @kadeng @msaroufim @jeffdaily @sunway513 @jithunnair-amd @pruthvistony @ROCmSupport @jataylo @hongxiayang @naromero77amd @pragupta @jerrymannil @xinyazhang @malfet @pytorch/pytorch-dev-infra @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @muchulee8 @amjames @aakhundov @coconutruben @oulgen @jamesjwu @aorenste @anijain2305 @laithsakka @masnesral @aditvenk\n",
+      "comments": [
+        {
+          "author": "frgossen",
+          "created_at": "2026-06-30T17:29:41Z",
+          "updated_at": "2026-06-30T17:29:41Z",
+          "body": "Root cause is almost certainly #178945 (05-13): it enables Triton conv-backward autotuning on ROCm by default —\n\n```python\n_conv_default_backends = \"ATEN,TRITON\" if torch.version.hip else \"ATEN\"\n```\n\nCUDA stays ATEN-only (hence only gfx1100/gfx942 hit). Same PR adds `test_conv2d_backward_parametrized` (69 variants, forced TRITON), and each takes ~300s to autotune then times out on gfx1100:\n\n```\nInductorError: TimeoutError: 1 (of 14) futures unfinished\n```\n\n69 × ~5min blows past the 270min budget on its own.\n\nFix is the slow Triton conv-bwd compile on RDNA3; short term, reconsider the ROCm default for gfx1100 or bump shard count.\n\n(landed 05-13, cliff ~05-20, so mechanism not exact-bisect)\n\ncc @chien-an-chen @jeffdaily\n",
+          "url": "https://github.com/pytorch/pytorch/issues/188564#issuecomment-4846223861"
+        }
+      ]
+    },
+    {
+      "number": 188545,
+      "title": "[PT2] Output mismatch between eager and torch.compile for torch.special.bessel_y0 with +inf input on CUDA",
+      "url": "https://github.com/pytorch/pytorch/issues/188545",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/188545",
+      "state": "open",
+      "author": "xyt66665000",
+      "created_at": "2026-06-30T12:05:14Z",
+      "updated_at": "2026-07-06T17:12:08Z",
+      "closed_at": null,
+      "labels": [
+        "high priority",
+        "module: cuda",
+        "triaged",
+        "module: NaNs and Infs",
+        "module: correctness (silent)",
+        "module: special",
+        "module: edge cases",
+        "oncall: pt2",
+        "bot-triaged"
+      ],
+      "comments_count": 0,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "### 🐛 Describe the bug\n\ntorch.compile(backend=\"inductor\") returns a different result from eager mode for torch.special.bessel_y0 on CUDA when the input contains positive infinity.\nFor input [nan, inf, -inf], eager mode returns [nan, nan, nan], but Inductor returns [nan, 0., nan].\nThis changes the isnan result for the +inf element.\nThis appears related to #187332 , but it affects torch.special.bessel_y0.\n### Repro\n```python\nimport torch\n\ndef test_bessel_y0_mismatch():\n    x = torch.tensor([float('nan'), float('inf'), float('-inf')], dtype=torch.float64, device='cuda')\n    \n    print(\"Input:\", x)\n    \n    eager_out = torch.special.bessel_y0(x)\n    print(\"Eager output:   \", eager_out)\n    \n    @torch.compile(backend=\"inductor\")\n    def compiled_bessel_y0(x):\n        return torch.special.bessel_y0(x)\n        \n    inductor_out = compiled_bessel_y0(x)\n    print(\"Inductor output:\", inductor_out)\n    \n\nif __name__ == \"__main__\":\n    test_bessel_y0_mismatch()\n```\n\n### Log\n```text\nInput: tensor([nan, inf, -inf], device='cuda:0', dtype=torch.float64)\nEager output:    tensor([nan, nan, nan], device='cuda:0', dtype=torch.float64)\nInductor output: tensor([nan, 0., nan], device='cuda:0', dtype=torch.float64)\n```\n\n### Versions\n\nPyTorch: 2.14.0.dev20260624+cu130\nCUDA used to build PyTorch: 13.0\nOS: Ubuntu 24.04.4 LTS (x86_64)\nIs CUDA available: True\nCUDA runtime version: 12.0.140\n\ncc @ezyang @gchanan @kadeng @msaroufim @ptrblck @eqy @tinglvv @nWEIdia @mruberry @kshitij12345 @chauhang @penguinwu",
+      "comments": []
+    },
+    {
+      "number": 188541,
+      "title": "[Inductor][CUDA] F.logsigmoid flushes negative float32 subnormal outputs to +0.0, changing sign-sensitive behavior",
+      "url": "https://github.com/pytorch/pytorch/issues/188541",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/188541",
+      "state": "open",
+      "author": "xyt66665000",
+      "created_at": "2026-06-30T10:06:43Z",
+      "updated_at": "2026-07-06T17:09:07Z",
+      "closed_at": null,
+      "labels": [
+        "high priority",
+        "module: nn",
+        "module: cuda",
+        "triaged",
+        "module: correctness (silent)",
+        "module: edge cases",
+        "oncall: pt2",
+        "module: inductor",
+        "bot-triaged"
+      ],
+      "comments_count": 0,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "### 🐛 Describe the bug\n\nWhen compiling torch.nn.functional.logsigmoid with the Inductor backend on CUDA, large positive float32 inputs produce different results from eager mode.\n\nFor inputs where eager mode returns negative nonzero subnormal values, the compiled function returns +0.0. This also changes downstream observable behavior such as torch.signbit, equality-to-zero checks, and torch.copysign.\n### Reproduce script\n```python\nimport torch\nimport torch.nn.functional as F\n\ndef fn(x):\n    y = F.logsigmoid(x)\n    return y, torch.signbit(y), y == 0, torch.copysign(torch.ones_like(y), y)\n\ncfn = torch.compile(fn, backend=\"inductor\", fullgraph=True)\n\nxs = torch.tensor([80.0, 85.0, 87.0, 88.0, 90.0, 100.0],\n                  device=\"cuda\", dtype=torch.float32)\n\neager = fn(xs)\ncompiled = cfn(xs)\n\nprint(\"x:\", xs)\nprint(\"eager y:\", eager[0])\nprint(\"compiled y:\", compiled[0])\nprint(\"eager signbit:\", eager[1])\nprint(\"compiled signbit:\", compiled[1])\nprint(\"eager y == 0:\", eager[2])\nprint(\"compiled y == 0:\", compiled[2])\nprint(\"eager copysign:\", eager[3])\nprint(\"compiled copysign:\", compiled[3])\n```\n\n### Output\n```text\nx: tensor([ 80.,  85.,  87.,  88.,  90., 100.], device='cuda:0')\neager y: tensor([-1.8049e-35, -1.2161e-37, -1.6458e-38, -6.0546e-39, -8.1940e-40,\n        -3.7835e-44], device='cuda:0')\ncompiled y: tensor([-1.8049e-35, -1.2161e-37, -1.6458e-38,  0.0000e+00,  0.0000e+00,\n         0.0000e+00], device='cuda:0')\neager signbit: tensor([True, True, True, True, True, True], device='cuda:0')\ncompiled signbit: tensor([ True,  True,  True, False, False, False], device='cuda:0')\neager y == 0: tensor([False, False, False, False, False, False], device='cuda:0')\ncompiled y == 0: tensor([False, False, False,  True,  True,  True], device='cuda:0')\neager copysign: tensor([-1., -1., -1., -1., -1., -1.], device='cuda:0')\ncompiled copysign: tensor([-1., -1., -1.,  1.,  1.,  1.], device='cuda:0')\n```\n\n### Versions\n\nPyTorch: 2.14.0.dev20260624+cu130\nCUDA used to build PyTorch: 13.0\nOS: Ubuntu 24.04.4 LTS (x86_64)\nIs CUDA available: True\nCUDA runtime version: 12.0.140\n\ncc @ezyang @gchanan @kadeng @msaroufim @albanD @mruberry @jbschlosser @walterddr @mikaylagawarecki @ptrblck @eqy @tinglvv @nWEIdia @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @muchulee8 @amjames @aakhundov @coconutruben @jataylo",
+      "comments": []
+    },
+    {
+      "number": 188547,
+      "title": "[dynamo] Infinite recursion when returning a Pybind11 enum from a compiled function",
+      "url": "https://github.com/pytorch/pytorch/issues/188547",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/188547",
+      "state": "open",
+      "author": "kshitij12345",
+      "created_at": "2026-06-30T13:12:48Z",
+      "updated_at": "2026-07-06T17:02:39Z",
+      "closed_at": null,
+      "labels": [
+        "module: crash",
+        "triaged",
+        "module: pybind",
+        "oncall: pt2",
+        "module: dynamo",
+        "bot-triaged"
+      ],
+      "comments_count": 1,
+      "matched_keywords": [
+        "compile",
+        "dynamo"
+      ],
+      "body": "### 🐛 Describe the bug\n\nRepro:\n```python\n\"\"\"\nMinimal reproduction: torch._dynamo infinite recursion in nb_int_impl when\ncalling int() on a pybind11 enum passed as a function argument.\n\nRun:\n  python repro_dynamo_nb_int_recursion.py\n\nExpected output:\n  BUG: InternalTorchDynamoError\n  Dynamo's nb_int_impl infinitely recurses on pybind11 instancemethod __int__\n\n\"\"\"\n\nimport tempfile\nimport os\nimport sysconfig\nimport subprocess\nimport importlib.util\n\nimport torch\nimport torch._dynamo\n\n\n# --- Build a minimal pybind11 extension inline ---\n_EXT_SRC = r\"\"\"\n#include <pybind11/pybind11.h>\nnamespace py = pybind11;\n\nenum class MyBackend { BackendA = 0, BackendB = 1, BackendC = 2 };\n\nPYBIND11_MODULE(my_enum_ext, m) {\n    py::enum_<MyBackend>(m, \"MyBackend\")\n        .value(\"BackendA\", MyBackend::BackendA)\n        .value(\"BackendB\", MyBackend::BackendB)\n        .value(\"BackendC\", MyBackend::BackendC);\n}\n\"\"\"\n\n\ndef _build_extension():\n    build_dir = tempfile.mkdtemp(prefix=\"pybind11_enum_repro_\")\n    src_path = os.path.join(build_dir, \"my_enum_ext.cpp\")\n    with open(src_path, \"w\") as f:\n        f.write(_EXT_SRC)\n\n    ext_suffix = sysconfig.get_config_var(\"EXT_SUFFIX\")\n    out_path = os.path.join(build_dir, f\"my_enum_ext{ext_suffix}\")\n    pybind11_includes = subprocess.check_output(\n        [\"python\", \"-m\", \"pybind11\", \"--includes\"], text=True\n    ).strip()\n\n    cmd = (\n        f\"g++ -O2 -shared -fPIC -std=c++17 {pybind11_includes} \"\n        f\"{src_path} -o {out_path}\"\n    )\n    subprocess.check_call(cmd, shell=True)\n\n    spec = importlib.util.spec_from_file_location(\"my_enum_ext\", out_path)\n    mod = importlib.util.module_from_spec(spec)\n    spec.loader.exec_module(mod)\n    return mod\n\n\nmy_enum_ext = _build_extension()\n\n# --- Reproduce the bug ---\n\n# my_enum_ext.MyBackend is a pybind11 enum with __int__ as 'instancemethod'.\n# It is not registered in torch._dynamo.utils.common_constant_types.\nbackend = my_enum_ext.MyBackend(0)\n\ndef fn(backend):\n    return int(backend)\n\n\ntorch._dynamo.reset()\ncompiled_fn = torch.compile(fn, backend=\"eager\")\n\nresult = compiled_fn(backend)\nprint(f\"No error: result={result}\")\n\n```\n\nError\n```\n  File \"/opt/pytorch/pytorch/torch/_dynamo/variables/user_defined.py\", line 1993, in nb_int_impl\n    result = method_var.call_function(tx, [], {})\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/opt/pytorch/pytorch/torch/_dynamo/variables/misc.py\", line 1546, in call_function\n    return self.obj.call_method(tx, self.name, args, kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/opt/pytorch/pytorch/torch/_dynamo/variables/user_defined.py\", line 2851, in call_method\n    return super().call_method(tx, name, args, kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/opt/pytorch/pytorch/torch/_dynamo/variables/base.py\", line 885, in call_method\n    return self.nb_int_impl(tx)\n           ^^^^^^^^^^^^^^^^^^^^\n  File \"/opt/pytorch/pytorch/torch/_dynamo/variables/user_defined.py\", line 1993, in nb_int_impl\n    result = method_var.call_function(tx, [], {})\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/opt/pytorch/pytorch/torch/_dynamo/variables/misc.py\", line 1546, in call_function\n    return self.obj.call_method(tx, self.name, args, kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/opt/pytorch/pytorch/torch/_dynamo/variables/user_defined.py\", line 2851, in call_method\n    return super().call_method(tx, name, args, kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/opt/pytorch/pytorch/torch/_dynamo/variables/base.py\", line 885, in call_method\n    return self.nb_int_impl(tx)\n           ^^^^^^^^^^^^^^^^^^^^\n  File \"/opt/pytorch/pytorch/torch/_dynamo/variables/user_defined.py\", line 1992, in nb_int_impl\n    method_var = self.resolve_type_attr(tx, \"__int__\", type_attr, source)\n                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/opt/pytorch/pytorch/torch/_dynamo/variables/user_defined.py\", line 3684, in resolve_type_attr\n    get_fn = inspect.getattr_static(type(type_attr), \"__get__\", None)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.12/inspect.py\", line 1839, in getattr_static\n    klass_result = _check_class(klass, attr)\n                   ^^^^^^^^^^^^^^^^^^^^^^^^^\ntorch._dynamo.exc.InternalTorchDynamoError: RecursionError: maximum recursion depth exceeded\n\nfrom user code:\n   File \"/opt/pytorch/pytorch/agent_space/repro.py\", line 73, in fn\n    return int(backend)\n           ^^^^^^^^^^^^\n\nSet TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS=\"+dynamo\"\n```\n\n\n### Versions\n\nmain aab577b236447c87bb4970bb78c9c01b99b7ba62\n\ncc @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @kadeng @amjames @jataylo @azahed98",
+      "comments": [
+        {
+          "author": "dsashidh",
+          "created_at": "2026-06-30T20:16:14Z",
+          "updated_at": "2026-06-30T20:16:14Z",
+          "body": "Working on this",
+          "url": "https://github.com/pytorch/pytorch/issues/188547#issuecomment-4847563890"
+        }
+      ]
+    },
+    {
+      "number": 188680,
+      "title": "[test] OpInfo gap: allclose-based compile-vs-eager checks are blind to signed-zero and signed-infinity divergences",
+      "url": "https://github.com/pytorch/pytorch/issues/188680",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/188680",
+      "state": "open",
+      "author": "raravind007",
+      "created_at": "2026-07-01T15:40:43Z",
+      "updated_at": "2026-07-06T16:41:39Z",
+      "closed_at": null,
+      "labels": [
+        "module: tests",
+        "triaged",
+        "enhancement",
+        "oncall: pt2",
+        "bot-triaged"
+      ],
+      "comments_count": 4,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "# [test] OpInfo gap: allclose-based compile-vs-eager checks are blind to signed-zero and signed-infinity divergences\n\n## Summary\n\nThe existing compile-vs-eager correctness check in `TestCommon` uses `torch.allclose`\n(or `torch.testing.assert_close`) for output comparison.  IEEE 754 defines\n`+0.0 == -0.0`, so `allclose` treats them as identical — meaning a compiler\npass that silently normalises `−0.0 → +0.0` (or flips the sign of an infinity)\nwill pass every existing correctness test even though it produced the wrong result.\n\nThis issue proposes adding a lightweight, opt-in parity check for\n`signbit` / `isinf` / `isnan` to the OpInfo test framework so those\ndivergences can be caught automatically.\n\n---\n\n## Concrete example of the blind spot\n\n```python\nimport torch\n\n# IEEE 754: +0.0 and -0.0 compare equal\na = torch.tensor(-0.0)\nb = torch.tensor(+0.0)\n\ntorch.allclose(a, b)           # True  — the sign disappears silently\ntorch.equal(a, b)              # True  — same\ntorch.signbit(a).item()        # True  (negative zero)\ntorch.signbit(b).item()        # False (positive zero)\n\n# The sign of a zero input propagates to the sign of the resulting infinity.\n# A pass that normalises -0 → +0 before reciprocal will silently flip the output:\ntorch.reciprocal(a)            # tensor(-inf)   ← correct\ntorch.reciprocal(b)            # tensor(inf)    ← wrong, but looks \"close\"\n\n# For copysign the sign IS the result:\ntorch.copysign(torch.tensor(0.0), torch.tensor(-1.0))  # tensor(-0.)   eager\n# If compiled returned tensor(0.) instead:\ntorch.allclose(\n    torch.tensor(-0.0),\n    torch.tensor(+0.0),\n)  # True — bug is invisible to the current test\n```\n\nIf `torch.compile` produced `+0.0` where eager produces `−0.0` for\n`torch.copysign`, every existing test would pass. The sign difference would\nonly be caught by a `signbit`-aware assertion.\n\n---\n\n## Why this matters\n\nOps whose output sign is semantically load-bearing include (non-exhaustively):\n\n| Op | Sign-sensitive case |\n|---|---|\n| `torch.copysign` | The sign bit is the entire output |\n| `torch.atan2` | IEEE 754 §9.2.1 specifies 4 distinct signed-zero corner cases for boundary inputs |\n| `torch.reciprocal` | `1/−0.0 = −inf`, `1/+0.0 = +inf` — sign of zero propagates to sign of inf |\n| `torch.neg` | `neg(−0.0) = +0.0` |\n| `torch.sign` | `sign(−0.0)` is implementation-defined |\n| `torch.pow`, `torch.div` | Various IEEE 754 signed-zero propagation rules |\n\nA compiler optimisation that canonicalises `−0.0 → +0.0` in any of these\nwill produce silently wrong results that `allclose` cannot detect.\n\n### Related issues\n\n- #53963 — `torch.signbit` itself is currently incorrect for negative zero\n  in eager, which means *both* sides of the comparison may be wrong. The\n  proposed test infrastructure would surface those cases too.\n- #172529 — `torch.isin` eager/compile divergence (shape mismatch), found\n  without automated special-value coverage. Demonstrates that compile-vs-eager\n  divergences in output structure are already slipping through.\n- #164186 — Fuzzer-discovered eager/compile divergence (compile raises,\n  eager succeeds). The exception-parity variant of this problem.\n\n---\n\n## Proposed change\n\nAdd a single opt-in boolean field to `OpInfo`:\n\n```python\n# torch/testing/_internal/opinfo/core.py\ncheck_sign_sensitive_special_values: bool = False\n```\n\nAnd a companion test in `TestCommon` in `test/test_ops.py`:\n\n```python\n@ops(op_db, allowed_dtypes=floating_and_complex_types())\ndef test_sign_sensitive_special_values(self, device, dtype, op):\n    \"\"\"\n    Checks that signbit / isinf / isnan are identical between\n    eager and torch.compile on the op's reference_inputs.\n    \"\"\"\n```\n\nThe test:\n1. Skips unless `check_sign_sensitive_special_values=True` on the OpInfo\n2. Prefers `reference_inputs` (which already generates ±inf, ±0.0 extremal\n   combinations) over `sample_inputs`\n3. Checks three properties in order:\n   - **isnan parity**: NaN positions match\n   - **isinf parity**: inf positions match\n   - **signbit parity**: sign of every ±inf and every ±0.0 matches\n4. Fails with a clear message showing position, eager value, and compiled value\n\nThe initial PR will enable the flag on three seed ops (`copysign`, `atan2`,\n`reciprocal`) to prove the mechanism works end-to-end. Additional ops can be\nopted in via follow-up PRs.\n\n---\n\n## What this does NOT include (intentional scope limit)\n\n- Exception parity testing (eager raises, compiled succeeds silently) — separate issue/PR\n- NaN payload comparison — out of scope, PyTorch does not guarantee NaN payload propagation\n- Non-floating-point types — signed zeros and signed infinities are a floating-point concept\n\n---\n\n## cc\n\n`@pytorch/pt2` for the compile-vs-eager aspect\n\ncc @mruberry @chauhang @penguinwu",
+      "comments": [
+        {
+          "author": "raravind007",
+          "created_at": "2026-07-01T18:23:42Z",
+          "updated_at": "2026-07-01T18:23:42Z",
+          "body": "Could a maintainer mark this issue as actionable if the proposed direction looks reasonable? I’ll wait for that before opening a PR.",
+          "url": "https://github.com/pytorch/pytorch/issues/188680#issuecomment-4858887315"
+        },
+        {
+          "author": "morrison-turnansky",
+          "created_at": "2026-07-06T14:33:06Z",
+          "updated_at": "2026-07-06T14:33:34Z",
+          "body": "Generally, we express correctness within a tolerance value of eager. However, we have some issues/prs enforcing this specific exact correctness case. \n\nDo we have a subset of operations that we want to enforce this on? I think enforcing exact correctness in general is not good goal and will not be maintainable in the long run. \n\n",
+          "url": "https://github.com/pytorch/pytorch/issues/188680#issuecomment-4893998783"
+        },
+        {
+          "author": "raravind007",
+          "created_at": "2026-07-06T16:05:34Z",
+          "updated_at": "2026-07-06T16:05:34Z",
+          "body": "Thanks you Morrison, that makes sense. I agree that enforcing exact correctness generally would not be maintainable, and that is not what I'm proposing.\n\nThe narrower scope I had in mind is an opt-in check for operations where special-value semantics are directly observable and tolerance-based comparison can miss a real behavioral difference.\n\nFor example, not exact elementwise equality in general, but targeted checks like:\n\n- NaN mask matches\n- Inf mask matches\n- signbit matches only where the output is zero, and only for ops where signed zero is part of the observable behavior\n\nA reasonable initial subset could be very small, for example ops where signed zero directly affects downstream results:\n- torch.copysign\n- torch.atan2\n- possibly torch.reciprocal / division-style ops where +0.0 vs -0.0 can become +inf vs -inf\n\nI'm happy to keep the first PR limited to adding the helper/opt-in mechanism and enabling it only for 2-3 seed ops, rather than applying it broadly across OpInfo. The goal would be to create a targeted guardrail for semantic special-value behavior, not to make exact correctness the default expectation.",
+          "url": "https://github.com/pytorch/pytorch/issues/188680#issuecomment-4894952160"
+        },
+        {
+          "author": "morrison-turnansky",
+          "created_at": "2026-07-06T16:41:11Z",
+          "updated_at": "2026-07-06T16:41:39Z",
+          "body": "yes just wanted to clarify scope and give context to what \"correct\" means here. can you post a draft pr?",
+          "url": "https://github.com/pytorch/pytorch/issues/188680#issuecomment-4895312785"
+        }
+      ]
+    },
+    {
+      "number": 188890,
+      "title": "Non-deterministic gradients when using torch.compile and PyTorch >= 2.12",
+      "url": "https://github.com/pytorch/pytorch/issues/188890",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/188890",
+      "state": "open",
+      "author": "embe-pw",
+      "created_at": "2026-07-03T10:59:38Z",
+      "updated_at": "2026-07-06T15:19:14Z",
+      "closed_at": null,
+      "labels": [
+        "triaged",
+        "module: regression",
+        "module: determinism",
+        "module: correctness (silent)",
+        "oncall: pt2",
+        "bot-triaged"
+      ],
+      "comments_count": 2,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "### 🐛 Describe the bug\n\nThe attached code seems to produce non-deterministic and wildly different gradients when run with `torch.compile` on PyTorch >= 2.12. Code run without `torch.compile`, as well as code run on older PyTorch versions produces identical gradients all the time.\n\nThe reproduction script has been reduced with the use of LLM.\n\n```python\n#!/usr/bin/env python3\nimport os\n\nos.environ.setdefault(\"CUBLAS_WORKSPACE_CONFIG\", \":4096:8\")\n\nimport torch\nimport torch.nn.functional as F\n\n\ndef forward_fn(inputs, score_weight):\n    length, dim = inputs.shape\n    scores = torch.einsum(\"td,gd->gt\", inputs, score_weight)\n    score_delta = scores[:, None, :] - scores[:, :, None]\n\n    pair_scores = torch.einsum(\"tn,Tn->tT\", inputs, inputs)\n    pair_weights = pair_scores[None] * torch.exp(score_delta)\n    context = torch.einsum(\"gtT,Td->gtd\", pair_weights, inputs)\n    context = F.layer_norm(context, (dim,))\n\n    return context.repeat_interleave(4, dim=-1)[:1, :, :1].view(length, 1)\n\n\ndef main():\n    torch.use_deterministic_algorithms(True)\n    torch.backends.cuda.matmul.allow_tf32 = True\n\n    print(\n        f\"torch={torch.__version__} cuda_build={torch.version.cuda} \"\n        f\"gpu={torch.cuda.get_device_name()} runs=2 failure_threshold=1.0\"\n    )\n\n    torch.manual_seed(1337)\n    score_weight = torch.empty(4, 224, device=\"cuda\").normal_(std=0.02).requires_grad_()\n    compiled_fn = torch.compile(forward_fn)\n    inputs = torch.empty(296, 224, device=\"cuda\").normal_(std=0.02)\n\n    score_weight.grad = None\n    with torch.autocast(device_type=\"cuda\", dtype=torch.bfloat16):\n        outputs = compiled_fn(inputs, score_weight)\n        loss = outputs.sum()\n    loss.backward()\n    grads_a = score_weight.grad.detach().float().reshape(-1).cpu()\n    grads_a_finite = torch.isfinite(grads_a).all().item()\n    grad_left_norm = float(torch.linalg.vector_norm(grads_a))\n\n    score_weight.grad = None\n    with torch.autocast(device_type=\"cuda\", dtype=torch.bfloat16):\n        outputs = compiled_fn(inputs, score_weight)\n        loss = outputs.sum()\n    loss.backward()\n    grads_b = score_weight.grad.detach().float().reshape(-1).cpu()\n    grads_b_finite = torch.isfinite(grads_b).all().item()\n    grad_right_norm = float(torch.linalg.vector_norm(grads_b))\n\n    grad_rel = float(torch.linalg.vector_norm(grads_b - grads_a)) / max(\n        grad_left_norm, 1e-30\n    )\n    all_grads_finite = grads_a_finite and grads_b_finite\n    failed = not all_grads_finite or grad_rel >= 1.0\n\n    print(\n        f\"failed={failed} all_grads_finite={all_grads_finite} \"\n        f\"max_seen_grad_rel={grad_rel:.8e} \"\n        f\"grad0_norm={grad_left_norm:.8e} \"\n        f\"grad1_norm={grad_right_norm:.8e}\"\n    )\n    raise SystemExit(int(failed))\n\n\nif __name__ == \"__main__\":\n    main()\n```\n\n### Error logs\n\n```\ntorch=2.12.1+cu132 cuda_build=13.2 gpu=NVIDIA H200 runs=2 failure_threshold=1.0\nfailed=True all_grads_finite=True max_seen_grad_rel=4.07311368e+00 grad0_norm=2.91221905e+00 grad1_norm=1.24026461e+01\n```\n\n### Versions\n\n```\nCollecting environment information...\nPyTorch version: 2.12.1+cu132\nIs debug build: False\nCUDA used to build PyTorch: 13.2\nROCM used to build PyTorch: N/A\n\nOS: Ubuntu 22.04.5 LTS (x86_64)\nGCC version: (conda-forge gcc 14.3.0-16) 14.3.0\nClang version: Could not collect\nCMake version: version 3.22.1\nLibc version: glibc-2.35\n\nPython version: 3.13.11 | packaged by conda-forge | (main, Dec  6 2025, 11:24:03) [GCC 14.3.0] (64-bit runtime)\nPython platform: Linux-6.8.0-1053-aws-x86_64-with-glibc2.35\nIs CUDA available: True\nCUDA runtime version: 12.9.86\nCUDA_MODULE_LOADING set to:\nGPU models and configuration: GPU 0: NVIDIA H200\nNvidia driver version: 580.126.09\ncuDNN version: Could not collect\nIs XPU available: False\nHIP runtime version: N/A\nMIOpen runtime version: N/A\nIs XNNPACK available: True\nCaching allocator config: N/A\n\nCPU:\nArchitecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           46 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  96\nOn-line CPU(s) list:                     0-95\nVendor ID:                               GenuineIntel\nModel name:                              Intel(R) Xeon(R) Platinum 8488C\nCPU family:                              6\nModel:                                   143\nThread(s) per core:                      1\nCore(s) per socket:                      48\nSocket(s):                               2\nStepping:                                8\nBogoMIPS:                                4800.00\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc arch_perfmon rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq monitor ssse3 fma cx16 pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch ssbd ibrs ibpb stibp ibrs_enhanced fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 wbnoinvd ida arat avx512vbmi umip pku ospke waitpkg avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg tme avx512_vpopcntdq rdpid cldemote movdiri movdir64b md_clear serialize amx_bf16 avx512_fp16 amx_tile amx_int8 flush_l1d arch_capabilities\nHypervisor vendor:                       KVM\nVirtualization type:                     full\nL1d cache:                               4.5 MiB (96 instances)\nL1i cache:                               3 MiB (96 instances)\nL2 cache:                                192 MiB (96 instances)\nL3 cache:                                210 MiB (2 instances)\nNUMA node(s):                            2\nNUMA node0 CPU(s):                       0-47\nNUMA node1 CPU(s):                       48-95\nVulnerability Gather data sampling:      Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI BHI_DIS_S\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected\n\nVersions of relevant libraries:\n[pip3] Could not collect\n[conda] Could not collect\n```\n\ncc @mruberry @kurtamohler @chauhang @penguinwu",
+      "comments": [
+        {
+          "author": "IvanKobzarev",
+          "created_at": "2026-07-06T12:13:51Z",
+          "updated_at": "2026-07-06T12:13:51Z",
+          "body": "@embe-pw \n\nI could not repro it on 2.13 and 2.14 on H100, the numerics is < 3e3 which is ok for bf16. Could you still reproduce on the latest nightly?",
+          "url": "https://github.com/pytorch/pytorch/issues/188890#issuecomment-4892642669"
+        },
+        {
+          "author": "embe-pw",
+          "created_at": "2026-07-06T15:19:14Z",
+          "updated_at": "2026-07-06T15:19:14Z",
+          "body": "I get the following output on nightly:\n```\ntorch=2.14.0.dev20260705+cu132 cuda_build=13.2 gpu=NVIDIA H200 runs=2 failure_threshold=1.0\nfailed=True all_grads_finite=True max_seen_grad_rel=3.19396160e+00 grad0_norm=2.73707581e+00 grad1_norm=9.28059959e+00\n```\nso the gradients are still wildly different between runs.\n\nNot sure if I understand the `< 3e3` bit (seems large, is this a typo?), but I'd expect perfectly matching gradients in deterministic mode nevertheless.",
+          "url": "https://github.com/pytorch/pytorch/issues/188890#issuecomment-4894480203"
+        }
+      ]
+    },
+    {
+      "number": 188422,
+      "title": "Some test_sdpa_can_compile_dynamic in transformers fail (with torch.compile(dynamic=True)) with torch 2.13 RC but pass with torch 2.12",
+      "url": "https://github.com/pytorch/pytorch/issues/188422",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/188422",
+      "state": "open",
+      "author": "ydshieh",
+      "created_at": "2026-06-29T14:36:24Z",
+      "updated_at": "2026-07-06T12:40:03Z",
+      "closed_at": null,
+      "labels": [
+        "triaged",
+        "oncall: pt2",
+        "module: dynamic shapes"
+      ],
+      "comments_count": 0,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "### 🐛 Describe the bug\r\n\r\nRunner: AWS G5 (A10G single GPU)\r\n\r\n### Install transformers\r\n\r\n```bash\r\ngit clone https://github.com/huggingface/transformers.git && cd transformers && git fetch origin && git checkout effde20942e3 && pip install -e .[torch,testing]\r\n```\r\n\r\n### Install\r\n\r\n```bash\r\npython3 -m pip uninstall -y torch torchvision torchaudio torchcodec\r\npython3 -m pip install --no-cache-dir \"torchcodec\" --index-url https://download.pytorch.org/whl/test/cpu\r\npython3 -m pip install --no-cache-dir \"torch\" \"torchvision\" \"torchaudio\" --index-url https://download.pytorch.org/whl/test/cu126\r\n```\r\n\r\n### What we get\r\n\r\n```\r\ntorch==2.13.0+cu126\r\ntorchaudio==2.11.0+cu126\r\ntorchcodec==0.14.0+cpu\r\ntorchvision==0.28.0+cu126\r\n```\r\n\r\n### Run tests\r\n\r\nAll 2 of the following tests fail with the same error:\r\n\r\n```bash\r\nRUN_SLOW=1 python3 -m pytest -v tests/models/segformer/test_modeling_segformer.py::SegformerModelTest::test_sdpa_can_compile_dynamic\r\nRUN_SLOW=1 python3 -m pytest -v tests/models/efficientloftr/test_modeling_efficientloftr.py::EfficientLoFTRModelTest::test_sdpa_can_compile_dynamic\r\n```\r\n\r\n### Error (shown for `tests/models/segformer/test_modeling_segformer.py::SegformerModelTest::test_sdpa_can_compile_dynamic`; all 2 tests produce the same error at the same location)\r\n\r\n```\r\n___________________________________________________________________________________________________________________________ SegformerModelTest.test_sdpa_can_compile_dynamic ____________________________________________________________________________________________________________________________\r\n\r\nself = <tests.models.segformer.test_modeling_segformer.SegformerModelTest testMethod=test_sdpa_can_compile_dynamic>\r\n\r\n    @require_torch_accelerator\r\n    @pytest.mark.torch_compile_test\r\n    @slow\r\n    def test_sdpa_can_compile_dynamic(self):\r\n        if not self.has_attentions:\r\n            self.skipTest(reason=\"Model architecture does not support attentions\")\r\n\r\n        device_type, major, minor = get_device_properties()\r\n        if device_type == \"cuda\" and major < 8:\r\n            self.skipTest(reason=\"This test requires an NVIDIA GPU with compute capability >= 8.0\")\r\n        elif device_type == \"rocm\" and major < 9:\r\n            self.skipTest(reason=\"This test requires an AMD GPU with compute capability >= 9.0\")\r\n        elif device_type not in [\"cuda\", \"rocm\", \"xpu\"]:\r\n            self.skipTest(reason=\"This test requires a Nvidia or AMD GPU, or an Intel XPU\")\r\n\r\n        torch.compiler.reset()\r\n\r\n        for model_class in self.all_model_classes:\r\n            if not model_class._supports_sdpa:\r\n                self.skipTest(f\"{model_class.__name__} does not support SDPA\")\r\n\r\n            config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()\r\n            inputs_dict = self._prepare_for_class(inputs_dict, model_class)\r\n            if config.model_type == \"dbrx\":\r\n                self.skipTest(\r\n                    \"DBRX (transformers==4.40) requires a modification to support dynamic shapes with compile.\"\r\n                )\r\n            if getattr(config, \"cache_implementation\", None) == \"hybrid\":\r\n                self.skipTest(\r\n                    \"Cannot compile forward without an existing cache with Hybrid, as `torch._dynamo.mark_static_address` \"\r\n                    \"is a forbidden call.\"\r\n                )\r\n\r\n            model = model_class(config)\r\n\r\n            sub_models_supporting_sdpa = [\r\n                module._supports_sdpa\r\n                for name, module in model.named_modules()\r\n                if isinstance(module, PreTrainedModel) and name != \"\"\r\n            ]\r\n            supports_sdpa_all_modules = (\r\n                all(sub_models_supporting_sdpa) if len(sub_models_supporting_sdpa) > 0 else model._supports_sdpa\r\n            )\r\n            if not supports_sdpa_all_modules:\r\n                self.skipTest(reason=\"This models' submodels does not support sdpa\")\r\n\r\n            with tempfile.TemporaryDirectory() as tmpdirname:\r\n                model.save_pretrained(tmpdirname)\r\n                model = model_class.from_pretrained(tmpdirname, dtype=torch.bfloat16, attn_implementation=\"sdpa\")\r\n                model.to(torch_device)\r\n\r\n                # For PyTorch 2.1 - 2.3.0 set `dynamic=True`. In the future setting `dynamic=None` and using `torch._dynamo.mark_dynamic()`\r\n                # on input tensors will be required. `mark_dynamic` currently raises inconsistent shape errors.\r\n                model = torch.compile(model, dynamic=True)\r\n\r\n                inputs_dict.pop(\"attention_mask\", None)\r\n                inputs_dict.pop(\"decoder_attention_mask\", None)\r\n                for name, inp in inputs_dict.items():\r\n                    if isinstance(inp, torch.Tensor) and inp.dtype in [torch.float32, torch.float16]:\r\n                        inputs_dict[name] = inp.to(torch.bfloat16)\r\n\r\n                # use no_grad to save some memory\r\n                with torch.no_grad():\r\n>                   _ = model(**inputs_dict)\r\n\r\ntests/test_modeling_common.py:3813:\r\n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\r\n/usr/local/lib/python3.10/dist-packages/torch/_dynamo/eval_frame.py:511: in __call__\r\n    return super().__call__(*args, **kwargs)\r\n/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py:1778: in _wrapped_call_impl\r\n    return self._call_impl(*args, **kwargs)\r\n/usr/local/lib/python3.10/dist-packages/torch/nn/modules/module.py:1789: in _call_impl\r\n    return forward_call(*args, **kwargs)\r\n/usr/local/lib/python3.10/dist-packages/torch/_dynamo/eval_frame.py:1183: in compile_wrapper\r\n    raise e.remove_dynamo_frames() from None  # see TORCHDYNAMO_VERBOSE=1\r\n/usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_fx.py:1079: in _compile_fx_inner\r\n    raise InductorError(e, currentframe()).with_traceback(\r\n/usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_fx.py:1059: in _compile_fx_inner\r\n    mb_compiled_graph = fx_codegen_and_compile(\r\n/usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_fx.py:1847: in fx_codegen_and_compile\r\n    return scheme.codegen_and_compile(gm, example_inputs, inputs_to_check, graph_kwargs)\r\n/usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_fx.py:1523: in codegen_and_compile\r\n    graph.run(*example_inputs)\r\n/usr/local/lib/python3.10/dist-packages/torch/_inductor/graph.py:1092: in run\r\n    return super().run(*args)\r\n/usr/local/lib/python3.10/dist-packages/torch/fx/interpreter.py:197: in run\r\n    self.env[node] = self.run_node(node)\r\n/usr/local/lib/python3.10/dist-packages/torch/_inductor/graph.py:1940: in run_node\r\n    result = super().run_node(n)\r\n/usr/local/lib/python3.10/dist-packages/torch/fx/interpreter.py:294: in run_node\r\n    return getattr(self, n.op)(n.target, args, kwargs)\r\n/usr/local/lib/python3.10/dist-packages/torch/_inductor/graph.py:1518: in call_function\r\n    raise LoweringException(\r\n/usr/local/lib/python3.10/dist-packages/torch/_inductor/graph.py:1469: in call_function\r\n    args, kwargs = layout_constraints(n, *args, **kwargs)\r\n/usr/local/lib/python3.10/dist-packages/torch/_inductor/kernel/conv.py:748: in constrain_conv_to_fx_strides\r\n    return constrain_to_fx_strides(fx_node, *args, **kwargs)\r\n/usr/local/lib/python3.10/dist-packages/torch/_inductor/lowering.py:3345: in constrain_to_fx_strides\r\n    args = tuple(\r\n/usr/local/lib/python3.10/dist-packages/torch/_inductor/lowering.py:3346: in <genexpr>\r\n    apply_constraint(arg, fx_arg) for arg, fx_arg in zip(args, fx_node.args)\r\n/usr/local/lib/python3.10/dist-packages/torch/_inductor/lowering.py:3332: in apply_constraint\r\n    return ir.ExternKernel.require_stride_order(arg, stride_order)\r\n/usr/local/lib/python3.10/dist-packages/torch/_inductor/ir.py:7346: in require_stride_order\r\n    return cls.require_strides(x, order=order, allow_padding=allow_padding)\r\n/usr/local/lib/python3.10/dist-packages/torch/_inductor/ir.py:7210: in require_strides\r\n    (order and x.get_layout().is_stride_ordered(order))\r\n/usr/local/lib/python3.10/dist-packages/torch/_inductor/ir.py:4413: in is_stride_ordered\r\n    if self._stride_expr_ge_or_false(left, right):\r\n/usr/local/lib/python3.10/dist-packages/torch/_inductor/ir.py:4381: in _stride_expr_ge_or_false\r\n    ) or sizevars.guard_or_false(sympy.Eq(left % right, 0))\r\n/usr/local/lib/python3.10/dist-packages/torch/_inductor/sizevars.py:866: in guard_or_false\r\n    return self.evaluate_expr(left, fallback_value=False)\r\n/usr/local/lib/python3.10/dist-packages/torch/_inductor/sizevars.py:893: in evaluate_expr\r\n    return self.shape_env.evaluate_expr(\r\n/usr/local/lib/python3.10/dist-packages/torch/fx/experimental/symbolic_shapes.py:8203: in evaluate_expr\r\n    return self._inner_evaluate_expr(\r\n/usr/local/lib/python3.10/dist-packages/torch/fx/experimental/recording.py:297: in wrapper\r\n    return retlog(fn(*args, **kwargs))\r\n/usr/local/lib/python3.10/dist-packages/torch/fx/experimental/symbolic_shapes.py:8226: in _inner_evaluate_expr\r\n    return self._evaluate_expr(\r\n/usr/local/lib/python3.10/dist-packages/torch/fx/experimental/symbolic_shapes.py:8392: in _evaluate_expr\r\n    static_expr = self._maybe_evaluate_static(\r\n/usr/local/lib/python3.10/dist-packages/torch/fx/experimental/symbolic_shapes.py:2767: in wrapper\r\n    return fn_cache(self, *args, **kwargs)\r\n/usr/local/lib/python3.10/dist-packages/torch/fx/experimental/symbolic_shapes.py:7189: in _maybe_evaluate_static\r\n    r = _maybe_evaluate_static_worker(\r\n/usr/local/lib/python3.10/dist-packages/torch/fx/experimental/symbolic_shapes.py:2611: in _maybe_evaluate_static_worker\r\n    out = bound_sympy(new_expr, new_range_env)\r\n/usr/local/lib/python3.10/dist-packages/torch/utils/_sympy/value_ranges.py:1142: in bound_sympy\r\n    return sympy_interp(\r\n/usr/local/lib/python3.10/dist-packages/torch/utils/_sympy/interp.py:216: in sympy_interp\r\n    [\r\n/usr/local/lib/python3.10/dist-packages/torch/utils/_sympy/interp.py:217: in <listcomp>\r\n    sympy_interp(\r\n/usr/local/lib/python3.10/dist-packages/torch/utils/_sympy/interp.py:216: in sympy_interp\r\n    [\r\n/usr/local/lib/python3.10/dist-packages/torch/utils/_sympy/interp.py:217: in <listcomp>\r\n    sympy_interp(\r\n/usr/local/lib/python3.10/dist-packages/torch/utils/_sympy/interp.py:216: in sympy_interp\r\n    [\r\n/usr/local/lib/python3.10/dist-packages/torch/utils/_sympy/interp.py:217: in <listcomp>\r\n    sympy_interp(\r\n/usr/local/lib/python3.10/dist-packages/torch/utils/_sympy/interp.py:216: in sympy_interp\r\n    [\r\n/usr/local/lib/python3.10/dist-packages/torch/utils/_sympy/interp.py:217: in <listcomp>\r\n    sympy_interp(\r\n/usr/local/lib/python3.10/dist-packages/torch/utils/_sympy/interp.py:216: in sympy_interp\r\n    [\r\n/usr/local/lib/python3.10/dist-packages/torch/utils/_sympy/interp.py:217: in <listcomp>\r\n    sympy_interp(\r\n/usr/local/lib/python3.10/dist-packages/torch/utils/_sympy/interp.py:214: in sympy_interp\r\n    return _run_sympy_handler(\r\n/usr/local/lib/python3.10/dist-packages/torch/utils/_sympy/interp.py:173: in _run_sympy_handler\r\n    r = handler(*args)\r\n/usr/local/lib/python3.10/dist-packages/torch/utils/_sympy/value_ranges.py:813: in pow_by_natural\r\n    a, b & ValueRanges(0, int_oo), PowByNatural\r\n/usr/local/lib/python3.10/dist-packages/torch/utils/_sympy/value_ranges.py:268: in __and__\r\n    return ValueRanges(\r\n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\r\n\r\nself = <[AttributeError(\"'ValueRanges' object has no attribute 'lower'\") raised in repr()] ValueRanges object at 0x7fbb3e7f5900>, lower = 0, upper = -1\r\n\r\n    def __init__(self, lower: AllIn, upper: AllIn) -> None:\r\n        lower = simple_sympify(lower)\r\n        upper = simple_sympify(upper)\r\n        # TODO: when the bounds have free variables, this may be\r\n        # nontrivial to actually verify\r\n        try:\r\n            if not sympy_generic_le(lower, upper):\r\n>               raise ValueRangeError(f\"Invalid ranges [{lower}:{upper}]\")\r\nE               torch._inductor.exc.InductorError: LoweringException: ValueRangeError: Invalid ranges [0:-1]\r\nE                 target: aten.convolution.default\r\nE                 args[0]: TensorBox(\r\nE                   ReinterpretView(\r\nE                     StorageBox(\r\nE                       ComputedBuffer(name='buf8', layout=FixedLayout('cuda:0', torch.bfloat16, size=[s40, (((s58 - 1)//4))**2 + 2*(((s58 - 1)//4)) + 1, 8], stride=[8*(((s58 - 1)//4))**2 + 16*(((s58 - 1)//4)) + 8, 8, 1]), data=Pointwise(\r\nE                         'cuda',\r\nE                         torch.bfloat16,\r\nE                         def inner_fn(index):\r\nE                             i0, i1, i2 = index\r\nE                             tmp0 = ops.load(buf4, i2 + 8 * i1 + i0 * (8 + 8 * (((s58 - 1)//4))**2 + 16 * FloorDiv(-1 + s58, 4)))\r\nE                             tmp1 = ops.to_dtype(tmp0, torch.float32, src_dtype=torch.bfloat16, use_compute_types=True)\r\nE                             tmp2 = ops.load(buf6, i1 + i0 * (1 + (((s58 - 1)//4))**2 + 2 * FloorDiv(-1 + s58, 4)))\r\nE                             tmp3 = tmp1 - tmp2\r\nE                             tmp4 = ops.load(buf7, i1 + i0 * (1 + (((s58 - 1)//4))**2 + 2 * FloorDiv(-1 + s58, 4)))\r\nE                             tmp5 = ops.index_expr(8, torch.float32)\r\nE                             tmp6 = tmp4 / tmp5\r\nE                             tmp7 = ops.constant(1e-05, torch.float32)\r\nE                             tmp8 = tmp6 + tmp7\r\nE                             tmp9 = ops.rsqrt(tmp8)\r\nE                             tmp10 = tmp3 * tmp9\r\nE                             tmp11 = ops.load(arg7_1, i2)\r\nE                             tmp12 = ops.to_dtype(tmp11, torch.float32, src_dtype=torch.bfloat16, use_compute_types=True)\r\nE                             tmp13 = tmp10 * tmp12\r\nE                             tmp14 = ops.load(arg8_1, i2)\r\nE                             tmp15 = ops.to_dtype(tmp14, torch.float32, src_dtype=torch.bfloat16, use_compute_types=True)\r\nE                             tmp16 = tmp13 + tmp15\r\nE                             tmp17 = ops.to_dtype(tmp16, torch.bfloat16, src_dtype=torch.float32, use_compute_types=True)\r\nE                             return tmp17\r\nE                         ,\r\nE                         ranges=[s40, (((s58 - 1)//4))**2 + 2*(((s58 - 1)//4)) + 1, 8],\r\nE                         origin_node=convert_element_type_3,\r\nE                         origins=OrderedSet([convert_element_type_3, add_28, mul_34, m...,\r\nE                         stack_traces = {,\r\nE                           File \"/transformers/src/transformers/utils/generic.py\", line 1036, in wrapper,\r\nE                             output = func(self, *args, **kwargs),\r\nE                           File \"/transformers/src/transformers/utils/output_capturing.py\", line 252, in wrapper,\r\nE                             outputs = func(self, *args, **kwargs),\r\nE                           File \"/transformers/src/transformers/models/segformer/modeling_segformer.py\", line 400, in forward,\r\nE                             hidden_states = stage(hidden_states, **kwargs),\r\nE                           File \"/transformers/src/transformers/models/segformer/modeling_segformer.py\", line 345, in forward,\r\nE                             hidden_states = block(hidden_states, height, width, **kwargs),\r\nE                           File \"/transformers/src/transformers/modeling_layers.py\", line 93, in __call__,\r\nE                             return super().__call__(*args, **kwargs),\r\nE                           File \"/transformers/src/transformers/models/segformer/modeling_segformer.py\", line 296, in forward,\r\nE                             hidden_states = self.layernorm_before(hidden_states),\r\nE                         ,\r\nE                         }\r\nE                       ), _split_size=None, _original_inner_fn=None, _original_ranges=None, _original_reduction_ranges=None)\r\nE                     ),\r\nE                     FixedLayout('cuda:0', torch.bfloat16, size=[s40, 8, (((s58 - 1)//4)) + 1, (((s58 - 1)//4)) + 1], stride=[8*(((s58 - 1)//4))**2 + 16*(((s58 - 1)//4)) + 8, 1, 8*(((s58 - 1)//4)) + 8, 8]),\r\nE                     origins=OrderedSet([view_4, permute_3]),\r\nE                     stack_traces = {,\r\nE                       File \"/transformers/src/transformers/utils/generic.py\", line 1036, in wrapper,\r\nE                         output = func(self, *args, **kwargs),\r\nE                       File \"/transformers/src/transformers/utils/output_capturing.py\", line 252, in wrapper,\r\nE                         outputs = func(self, *args, **kwargs),\r\nE                       File \"/transformers/src/transformers/models/segformer/modeling_segformer.py\", line 400, in forward,\r\nE                         hidden_states = stage(hidden_states, **kwargs),\r\nE                       File \"/transformers/src/transformers/models/segformer/modeling_segformer.py\", line 345, in forward,\r\nE                         hidden_states = block(hidden_states, height, width, **kwargs),\r\nE                       File \"/transformers/src/transformers/modeling_layers.py\", line 93, in __call__,\r\nE                         return super().__call__(*args, **kwargs),\r\nE                       File \"/transformers/src/transformers/models/segformer/modeling_segformer.py\", line 297, in forward,\r\nE                         hidden_states, _ = self.attention(hidden_states, height, width, **kwargs),\r\nE                       File \"/transformers/src/transformers/models/segformer/modeling_segformer.py\", line 179, in forward,\r\nE                         kv_hidden_states = self.sequence_reduction(hidden_states, height, width),\r\nE                       File \"/transformers/src/transformers/models/segformer/modeling_segformer.py\", line 104, in forward,\r\nE                         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, num_channels, height, width),\r\nE                     ,\r\nE                     }\r\nE                   )\r\nE                 )\r\nE                 args[1]: TensorBox(StorageBox(\r\nE                   InputBuffer(name='arg11_1', layout=FixedLayout('cuda:0', torch.bfloat16, size=[8, 8, 8, 8], stride=[512, 64, 8, 1]))\r\nE                 ))\r\nE                 args[2]: TensorBox(StorageBox(\r\nE                   InputBuffer(name='arg12_1', layout=FixedLayout('cuda:0', torch.bfloat16, size=[8], stride=[1]))\r\nE                 ))\r\nE                 args[3]: [8, 8]\r\nE                 args[4]: [0, 0]\r\nE                 args[5]: [1, 1]\r\nE                 args[6]: False\r\nE                 args[7]: [0, 0]\r\nE                 args[8]: 1ValueRangeError: Invalid ranges [0:-1]\r\nE                 target: aten.convolution.default\r\nE                 args[0]: TensorBox(\r\nE                   ReinterpretView(\r\nE                     StorageBox(\r\nE                       ComputedBuffer(name='buf8', layout=FixedLayout('cuda:0', torch.bfloat16, size=[s40, (((s58 - 1)//4))**2 + 2*(((s58 - 1)//4)) + 1, 8], stride=[8*(((s58 - 1)//4))**2 + 16*(((s58 - 1)//4)) + 8, 8, 1]), data=Pointwise(\r\nE                         'cuda',\r\nE                         torch.bfloat16,\r\nE                         def inner_fn(index):\r\nE                             i0, i1, i2 = index\r\nE                             tmp0 = ops.load(buf4, i2 + 8 * i1 + i0 * (8 + 8 * (((s58 - 1)//4))**2 + 16 * FloorDiv(-1 + s58, 4)))\r\nE                             tmp1 = ops.to_dtype(tmp0, torch.float32, src_dtype=torch.bfloat16, use_compute_types=True)\r\nE                             tmp2 = ops.load(buf6, i1 + i0 * (1 + (((s58 - 1)//4))**2 + 2 * FloorDiv(-1 + s58, 4)))\r\nE                             tmp3 = tmp1 - tmp2\r\nE                             tmp4 = ops.load(buf7, i1 + i0 * (1 + (((s58 - 1)//4))**2 + 2 * FloorDiv(-1 + s58, 4)))\r\nE                             tmp5 = ops.index_expr(8, torch.float32)\r\nE                             tmp6 = tmp4 / tmp5\r\nE                             tmp7 = ops.constant(1e-05, torch.float32)\r\nE                             tmp8 = tmp6 + tmp7\r\nE                             tmp9 = ops.rsqrt(tmp8)\r\nE                             tmp10 = tmp3 * tmp9\r\nE                             tmp11 = ops.load(arg7_1, i2)\r\nE                             tmp12 = ops.to_dtype(tmp11, torch.float32, src_dtype=torch.bfloat16, use_compute_types=True)\r\nE                             tmp13 = tmp10 * tmp12\r\nE                             tmp14 = ops.load(arg8_1, i2)\r\nE                             tmp15 = ops.to_dtype(tmp14, torch.float32, src_dtype=torch.bfloat16, use_compute_types=True)\r\nE                             tmp16 = tmp13 + tmp15\r\nE                             tmp17 = ops.to_dtype(tmp16, torch.bfloat16, src_dtype=torch.float32, use_compute_types=True)\r\nE                             return tmp17\r\nE                         ,\r\nE                         ranges=[s40, (((s58 - 1)//4))**2 + 2*(((s58 - 1)//4)) + 1, 8],\r\nE                         origin_node=convert_element_type_3,\r\nE                         origins=OrderedSet([convert_element_type_3, add_28, mul_34, m...,\r\nE                         stack_traces = {,\r\nE                           File \"/transformers/src/transformers/utils/generic.py\", line 1036, in wrapper,\r\nE                             output = func(self, *args, **kwargs),\r\nE                           File \"/transformers/src/transformers/utils/output_capturing.py\", line 252, in wrapper,\r\nE                             outputs = func(self, *args, **kwargs),\r\nE                           File \"/transformers/src/transformers/models/segformer/modeling_segformer.py\", line 400, in forward,\r\nE                             hidden_states = stage(hidden_states, **kwargs),\r\nE                           File \"/transformers/src/transformers/models/segformer/modeling_segformer.py\", line 345, in forward,\r\nE                             hidden_states = block(hidden_states, height, width, **kwargs),\r\nE                           File \"/transformers/src/transformers/modeling_layers.py\", line 93, in __call__,\r\nE                             return super().__call__(*args, **kwargs),\r\nE                           File \"/transformers/src/transformers/models/segformer/modeling_segformer.py\", line 296, in forward,\r\nE                             hidden_states = self.layernorm_before(hidden_states),\r\nE                         ,\r\nE                         }\r\nE                       ), _split_size=None, _original_inner_fn=None, _original_reduction_ranges=None)\r\nE                     ),\r\nE                     FixedLayout('cuda:0', torch.bfloat16, size=[s40, 8, (((s58 - 1)//4)) + 1, (((s58 - 1)//4)) + 1], stride=[8*(((s58 - 1)//4))**2 + 16*(((s58 - 1)//4)) + 8, 1, 8*(((s58 - 1)//4)) + 8, 8]),\r\nE                     origins=OrderedSet([view_4, permute_3]),\r\nE                     stack_traces = {,\r\nE                       File \"/transformers/src/transformers/utils/generic.py\", line 1036, in wrapper,\r\nE                         output = func(self, *args, **kwargs),\r\nE                       File \"/transformers/src/transformers/utils/output_capturing.py\", line 252, in wrapper,\r\nE                         outputs = func(self, *args, **kwargs),\r\nE                       File \"/transformers/src/transformers/models/segformer/modeling_segformer.py\", line 400, in forward,\r\nE                         hidden_states = stage(hidden_states, **kwargs),\r\nE                       File \"/transformers/src/transformers/models/segformer/modeling_segformer.py\", line 345, in forward,\r\nE                         hidden_states = block(hidden_states, height, width, **kwargs),\r\nE                       File \"/transformers/src/transformers/modeling_layers.py\", line 93, in __call__,\r\nE                         return super().__call__(*args, **kwargs),\r\nE                       File \"/transformers/src/transformers/models/segformer/modeling_segformer.py\", line 297, in forward,\r\nE                         hidden_states, _ = self.attention(hidden_states, height, width, **kwargs),\r\nE                       File \"/transformers/src/transformers/models/segformer/modeling_segformer.py\", line 179, in forward,\r\nE                         kv_hidden_states = self.sequence_reduction(hidden_states, height, width),\r\nE                       File \"/transformers/src/transformers/models/segformer/modeling_segformer.py\", line 104, in forward,\r\nE                         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, num_channels, height, width),\r\nE                     ,\r\nE                     }\r\nE                   )\r\nE                 )\r\nE                 args[1]: TensorBox(StorageBox(\r\nE                   InputBuffer(name='arg11_1', layout=FixedLayout('cuda:0', torch.bfloat16, size=[8, 8, 8, 8], stride=[512, 64, 8, 1]))\r\nE                 ))\r\nE                 args[2]: TensorBox(StorageBox(\r\nE                   InputBuffer(name='arg12_1', layout=FixedLayout('cuda:0', torch.bfloat16, size=[8], stride=[1]))\r\nE                 ))\r\nE                 args[3]: [8, 8]\r\nE                 args[4]: [0, 0]\r\nE                 args[5]: [1, 1]\r\nE                 args[6]: False\r\nE                 args[7]: [0, 0]\r\nE                 args[8]: 1\r\nE               Found from :\r\nE                  File \"/transformers/src/transformers/utils/generic.py\", line 1036, in wrapper\r\nE                   output = func(self, *args, **kwargs)\r\nE                 File \"/transformers/src/transformers/utils/output_capturing.py\", line 252, in wrapper\r\nE                   outputs = func(self, *args, **kwargs)\r\nE                 File \"/transformers/src/transformers/models/segformer/modeling_segformer.py\", line 400, in forward\r\nE                   hidden_states = stage(hidden_states, **kwargs)\r\nE                 File \"/transformers/src/transformers/models/segformer/modeling_segformer.py\", line 345, in forward\r\nE                   hidden_states = block(hidden_states, height, width, **kwargs)\r\nE                 File \"/transformers/src/transformers/modeling_layers.py\", line 93, in __call__\r\nE                   return super().__call__(*args, **kwargs)\r\nE                 File \"/transformers/src/transformers/models/segformer/modeling_segformer.py\", line 297, in forward\r\nE                   hidden_states, _ = self.attention(hidden_states, height, width, **kwargs)\r\nE                 File \"/transformers/src/transformers/models/segformer/modeling_segformer.py\", line 179, in forward\r\nE                   kv_hidden_states = self.sequence_reduction(hidden_states, height, width)\r\nE                 File \"/transformers/src/transformers/models/segformer/modeling_segformer.py\", line 105, in forward\r\nE                   hidden_states = self.sequence_reduction(hidden_states)\r\nE\r\n\r\nE               Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS=\"+dynamo\"\r\n\r\n/usr/local/lib/python3.10/dist-packages/torch/utils/_sympy/value_ranges.py:164: InductorError\r\n----------------------------------------------------------------------------------------------------------------------------------------- Captured stderr call ------------------------------------------------------------------------------------------------------------------------------------------\r\nWriting model shards: 100%|██████████| 1/1 [00:00<00:00, 293.72it/s]\r\nLoading weights: 100%|██████████| 108/108 [00:00<00:00, 3305.81it/s]\r\nW0629 13:39:00.041000 1938 torch/utils/_sympy/interp.py:179] [0/0_1] failed while executing pow_by_natural([VR[16, int_oo], VR[-1, -1]])\r\nW0629 13:39:00.041000 1938 torch/fx/experimental/symbolic_shapes.py:8238] [0/0_1] failed during evaluate_expr(Eq((8*(((s58 - 1)//4)) + 8)*(Mod(1, ((((s58 - 1)//4))**2 + 2*(((s58 - 1)//4)) + 1)/((((s58 - 1)//4)) + 1))), 0), hint=None, size_oblivious=False, forcing_spec=False\r\n=========================================================================================================================================== warnings summary ============================================================================================================================================\r\n../usr/local/lib/python3.10/dist-packages/torch/jit/_script.py:365: 14 warnings\r\n  /usr/local/lib/python3.10/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.\r\n    warnings.warn(\r\n\r\n../usr/local/lib/python3.10/dist-packages/torch/jit/_script.py:1488: 34 warnings\r\n  /usr/local/lib/python3.10/dist-packages/torch/jit/_script.py:1488: DeprecationWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.\r\n    warnings.warn(\r\n\r\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\r\n======================================================================================================================================== short test summary info ========================================================================================================================================\r\nFAILED tests/models/segformer/test_modeling_segformer.py::SegformerModelTest::test_sdpa_can_compile_dynamic - torch._inductor.exc.InductorError: LoweringException: ValueRangeError: Invalid ranges [0:-1]\r\n==================================================================================================================================== 1 failed, 48 warnings in 26.84s ====================================================================================================================================\r\nroot@aws-g5-4xlarge-cache-ssh-use1-public-80-spqj2-runner-j-workflow:/transformers#\r\n```\r\n\n\ncc @chauhang @penguinwu @ezyang @bobrenjc93 @aditvenk @laithsakka",
+      "comments": []
+    },
+    {
+      "number": 188955,
+      "title": "rms_norm autocast fp32 policy (2.12) materializes standalone cast kernels under torch.compile when dtypes already match. Peak-memory and throughput regression for bf16 models",
+      "url": "https://github.com/pytorch/pytorch/issues/188955",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/188955",
+      "state": "open",
+      "author": "abhishek-patnia-nu",
+      "created_at": "2026-07-04T19:31:19Z",
+      "updated_at": "2026-07-06T10:13:27Z",
+      "closed_at": null,
+      "labels": [
+        "module: performance",
+        "module: memory usage",
+        "triaged",
+        "module: regression",
+        "module: amp (automated mixed precision)",
+        "oncall: pt2",
+        "module: inductor",
+        "bot-triaged"
+      ],
+      "comments_count": 2,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "### 🐛 Describe the bug\n\ntorch 2.12 registered `rms_norm` under autocast's `fp32` cast policy ([#174824](https://github.com/pytorch/pytorch/pull/174824)). The policy applies unconditionally, including when input and weight are already both bf16. On torch 2.11 the op had no autocast registration, so in this configuration it ran bf16-in/bf16-out and autocast played no role.\n\n```python\n# torch 2.12.1, bf16 input AND bf16 weight:\nwith torch.autocast('cuda', dtype=torch.bfloat16):\n    y = norm(x_bf16)     # y.dtype == torch.float32  <- promoted regardless\nwith torch.autocast('cuda', enabled=False):\n    y = norm(x_bf16)     # y.dtype == torch.bfloat16\n```\n\nThe promotion inserts an fp32 upcast of the activation before every norm and leaves an fp32 output\nthat is downcast by the next `lower_precision_fp` op. Under `torch.compile`, these casts are graph\nnodes with multiple consumers (the promoted input feeds both the statistic reduction and the\nelementwise normalize). Some fuse into the generated norm kernels, but a large fraction are emitted\nas standalone `triton_poi_fused__to_copy*` kernels, each writing a full-size buffer — a full fp32\ncopy of the activation per cast.\n\nThe promotion also provides no numerical benefit in this configuration: `rms_norm` upcasts\ninternally regardless (`rms_norm_composite`: `input.to(opmath_t)`; generated kernels accumulate the\nstatistic in fp32 registers), and upcasting a bf16-stored weight recovers no information.\n\nAt scale this is a significant delta. \n\n### Minimal reproduction\n\nA single `Linear(4096, 4096)` followed by `RMSNorm(4096)`, model cast\nto bf16, compiled, forward+backward under bf16 autocast, input (8, 4096, 4096). The only\ndifference between the two modes is whether the norm call is wrapped in\n`torch.autocast(enabled=False)`:\n\n<details>\n<summary>repro.py</summary>\n\n```python\n# ruff: noqa\n\"\"\"Repro: rms_norm autocast fp32 policy materializes cast kernels under\ntorch.compile when input and weight are already bf16 (torch 2.12 vs 2.11).\n\nMinimal setup: Linear -> RMSNorm, model cast to bf16, compiled,\nforward+backward under bf16 autocast.\n\ntorch 2.11: rms_norm has no autocast registration; with matched bf16 dtypes\nthe compiled step emits no standalone copy kernels.\ntorch 2.12: rms_norm is registered under autocast's fp32 cast policy\n(pytorch#174824), which promotes unconditionally; the promotion casts\nmaterialize as standalone `triton_poi_fused__to_copy*` kernels and raise\npeak memory.\n\nRun (single GPU):\n    python repro.py            # autocast-wrapped norm (regression path)\n    python repro.py exempt     # norm under autocast(enabled=False) (workaround)\n\"\"\"\n\nimport sys\nimport time\n\nimport torch\nimport torch.nn as nn\n\nD, BATCH, SEQ, ITERS = 4096, 8, 4096, 20\nEXEMPT = len(sys.argv) > 1 and sys.argv[1] == \"exempt\"\n\n\nclass Net(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.linear = nn.Linear(D, D, bias=False)\n        self.norm = nn.RMSNorm(D, eps=1e-6)\n\n    def forward(self, x):\n        h = self.linear(x)\n        if EXEMPT:\n            with torch.autocast(x.device.type, enabled=False):\n                return self.norm(h)\n        return self.norm(h)\n\n\nmodel = Net().to(\"cuda\", torch.bfloat16)\nmodel = torch.compile(model)\n\n\ndef step():\n    x = torch.randn(BATCH, SEQ, D, device=\"cuda\", dtype=torch.bfloat16, requires_grad=True)\n    with torch.autocast(\"cuda\", dtype=torch.bfloat16):\n        out = model(x)\n    out.float().sum().backward()\n\n\nfor _ in range(3):  # warmup + compile\n    step()\ntorch.cuda.synchronize()\ntorch.cuda.reset_peak_memory_stats()\n\nt0 = time.perf_counter()\nfor _ in range(ITERS):\n    step()\ntorch.cuda.synchronize()\nstep_ms = (time.perf_counter() - t0) / ITERS * 1000\npeak_gib = torch.cuda.max_memory_allocated() / 2**30\n\nfrom torch.profiler import ProfilerActivity, profile\n\nwith profile(activities=[ProfilerActivity.CUDA]) as prof:\n    step()\n    torch.cuda.synchronize()\n\nkernels = copies = 0\nfor ev in prof.key_averages():\n    if getattr(ev, \"device_time_total\", 0) <= 0 or ev.key.startswith((\"aten::\", \"Prof\", \"cuda\")):\n        continue\n    kernels += ev.count\n    if \"to_copy\" in ev.key or \"convert_element_type\" in ev.key:\n        copies += ev.count\n\nprint(\n    f\"torch={torch.__version__} mode={'exempt' if EXEMPT else 'autocast'} \"\n    f\"peak_gib={peak_gib:.2f} step_ms={step_ms:.2f} kernels/step={kernels} cast_kernels/step={copies}\"\n)\n```\n\n</details>\n\n```bash\npython repro.py            # autocast-wrapped norm (regression path)\npython repro.py exempt     # norm under autocast(enabled=False) (workaround path)\n```\n\nOutput on torch 2.12.1+cu130, single B200 (the LayerNorm line is the same script with\n`nn.LayerNorm` substituted):\n\n```\ntorch=2.12.1+cu130 RMSNorm   mode=autocast peak_gib=1.97 step_ms=7.01 kernels/step=15 cast_kernels/step=3\ntorch=2.12.1+cu130 RMSNorm   mode=exempt   peak_gib=1.47 step_ms=7.43 kernels/step=16 cast_kernels/step=0\ntorch=2.12.1+cu130 LayerNorm mode=autocast peak_gib=2.00 step_ms=7.67 kernels/step=19 cast_kernels/step=4\n```\n\nOne norm costs +0.5 GiB peak (+34%): exactly one materialized fp32 copy of the (8, 4096, 4096)\nbf16 activation (512 MiB), plus standalone cast kernels. The cost scales linearly with the number\nof norm sites (see the at-scale numbers above). LayerNorm pays the same under autocast, confirming\nthe general Inductor behavior; for `rms_norm` this is new in 2.12 (no autocast registration on\n2.11, where the two modes behave identically).\n\n### Expected behavior\nThe `fp32` cast policy for `rms_norm` skips promotion when input and weight dtypes already\n   match (the fused path dispatches fine and accumulates in fp32 internally)\n\n### Workaround\n\nRun the norm outside autocast; internal fp32 accumulation provides the same protection the policy\nwas adding externally:\n\n```python\nclass AutocastExemptRMSNorm(nn.RMSNorm):\n    def forward(self, x):\n        with torch.autocast(x.device.type, enabled=False):\n            return super().forward(x)\n```\n\nMeasured at scale, this is faster and leaner than both the 2.12 default and the 2.11 baseline,\nsince the norm runs at bf16 I/O width on top of the improved 2.12 codegen.\n\n### Versions\n\n<details>\n<summary>collect_env (regression env)</summary>\n\n```\nCollecting environment information...\nPyTorch version: 2.12.1+cu130\nIs debug build: False\nCUDA used to build PyTorch: 13.0\nROCM used to build PyTorch: N/A\n\nOS: Ubuntu 24.04.3 LTS (x86_64)\nGCC version: (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0\nClang version: Could not collect\nCMake version: version 3.31.6\nLibc version: glibc-2.39\n\nPython version: 3.11.15 (main, Jun 23 2026, 15:19:43) [Clang 22.1.3 ] (64-bit runtime)\nPython platform: Linux-6.12.68+-x86_64-with-glibc2.39\nIs CUDA available: True\nCUDA runtime version: 13.0.88\nCUDA_MODULE_LOADING set to: LAZY\nGPU models and configuration: \nGPU 0: NVIDIA B200\nGPU 1: NVIDIA B200\nGPU 2: NVIDIA B200\nGPU 3: NVIDIA B200\nGPU 4: NVIDIA B200\nGPU 5: NVIDIA B200\nGPU 6: NVIDIA B200\nGPU 7: NVIDIA B200\n\nNvidia driver version: 580.126.09\ncuDNN version: Probably one of the following:\n/usr/lib/x86_64-linux-gnu/libcudnn.so.9.15.0\n/usr/lib/x86_64-linux-gnu/libcudnn_adv.so.9.15.0\n/usr/lib/x86_64-linux-gnu/libcudnn_cnn.so.9.15.0\n/usr/lib/x86_64-linux-gnu/libcudnn_engines_precompiled.so.9.15.0\n/usr/lib/x86_64-linux-gnu/libcudnn_engines_runtime_compiled.so.9.15.0\n/usr/lib/x86_64-linux-gnu/libcudnn_graph.so.9.15.0\n/usr/lib/x86_64-linux-gnu/libcudnn_heuristic.so.9.15.0\n/usr/lib/x86_64-linux-gnu/libcudnn_ops.so.9.15.0\nIs XPU available: False\nHIP runtime version: N/A\nMIOpen runtime version: N/A\nIs XNNPACK available: True\nCaching allocator config: N/A\n\nCPU:\nArchitecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           52 bits physical, 57 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  224\nOn-line CPU(s) list:                     0-223\nVendor ID:                               GenuineIntel\nModel name:                              INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.10GHz\nCPU family:                              6\nModel:                                   207\nThread(s) per core:                      2\nCore(s) per socket:                      56\nSocket(s):                               2\nStepping:                                2\nBogoMIPS:                                4200.00\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid tsc_known_freq pni pclmulqdq monitor ssse3 fma cx16 pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch ssbd ibrs ibpb stibp ibrs_enhanced fsgsbase tsc_adjust bmi1 hle avx2 smep bmi2 erms invpcid rtm avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 wbnoinvd arat avx512vbmi umip avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid cldemote movdiri movdir64b fsrm md_clear serialize tsxldtrk amx_bf16 avx512_fp16 amx_tile amx_int8 arch_capabilities\nHypervisor vendor:                       KVM\nVirtualization type:                     full\nL1d cache:                               5.3 MiB (112 instances)\nL1i cache:                               3.5 MiB (112 instances)\nL2 cache:                                224 MiB (112 instances)\nL3 cache:                                520 MiB (2 instances)\nNUMA node(s):                            2\nNUMA node0 CPU(s):                       0-55,112-167\nNUMA node1 CPU(s):                       56-111,168-223\nVulnerability Gather data sampling:      Not affected\nVulnerability Indirect target selection: Mitigation; Aligned branch/return thunks\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI SW loop, KVM SW loop\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected\n\nVersions of relevant libraries:\n[pip3] numpy==2.2.6\n[pip3] nvidia-cublas==13.4.1.1\n[pip3] nvidia-cuda-cupti==13.0.85\n[pip3] nvidia-cuda-nvrtc==13.0.88\n[pip3] nvidia-cuda-runtime==13.0.96\n[pip3] nvidia-cudnn-cu13==9.20.0.48\n[pip3] nvidia-cufft==12.0.0.61\n[pip3] nvidia-curand==10.4.0.35\n[pip3] nvidia-cusolver==12.0.4.66\n[pip3] nvidia-cusparse==12.6.3.3\n[pip3] nvidia-cusparselt-cu13==0.8.1\n[pip3] nvidia-nccl-cu13==2.29.7\n[pip3] nvidia-nvjitlink==13.0.88\n[pip3] nvidia-nvtx==13.0.85\n[pip3] onnx==1.22.0\n[pip3] onnx-ir==0.2.1\n[pip3] onnxscript==0.7.0\n[pip3] pytorch-lightning==2.6.5\n[pip3] torch==2.12.1+cu130\n[pip3] torch_c_dlpack_ext==0.1.5\n[pip3] torchmetrics==1.9.0\n[pip3] torchvision==0.27.1+cu130\n[pip3] transformer_engine_torch==2.16.1\n[pip3] triton==3.7.1\n[conda] No relevant packages\n```\n\n</details>\n\nBaseline env: torch 2.11.0+cu130, triton 3.6.0, CUDA 13.0, same machine.\n\n\ncc @mcarilli @ptrblck @leslie-fang-intel @jgong5 @chauhang @penguinwu @voznesenskym @EikanWang @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @aakhundov @coconutruben @jataylo",
+      "comments": [
+        {
+          "author": "abhishek-patnia-nu",
+          "created_at": "2026-07-04T22:31:37Z",
+          "updated_at": "2026-07-04T22:31:37Z",
+          "body": "Does it make sense to move _(rms_norm) from AT_FORALL_FP32 (aten/src/ATen/autocast_mode.h L878 on main) to AT_FORALL_PROMOTE (L948). Matched dtypes should be safe to pass through, since the fused kernel already accumulates in fp32 internally and mixed dtypes are still promoted, so the #167308 fix should keep working. If yes, I can open a PR in the coming week. ",
+          "url": "https://github.com/pytorch/pytorch/issues/188955#issuecomment-4884007778"
+        },
+        {
+          "author": "Sahil170595",
+          "created_at": "2026-07-06T05:09:06Z",
+          "updated_at": "2026-07-06T05:09:06Z",
+          "body": "Confirmed the core regression locally on a different GPU/setup:\n\n- Windows 11\n- NVIDIA RTX 4080 Laptop GPU, SM 8.9\n- torch 2.14.0.dev20260705+cu132\n- triton-windows 3.7.1\n\nUsing the reported bf16 `Linear(4096,4096) -> RMSNorm(4096)` compiled forward+backward shape `(8, 4096, 4096)`:\n\n- default autocast: `peak_gib=2.62`, `kernels/step=15`, `cast_kernels/step=3`\n- RMSNorm under `autocast(enabled=False)`: `peak_gib=1.34`, `kernels/step=16`, `cast_kernels/step=0`\n\nAlso confirmed the eager autocast policy behavior directly: bf16 input + bf16 RMSNorm weight returns fp32 under autocast, but bf16 when autocast is disabled around the norm.",
+          "url": "https://github.com/pytorch/pytorch/issues/188955#issuecomment-4889297712"
+        }
+      ]
+    },
+    {
+      "number": 188718,
+      "title": "torch.compile (Inductor) fails with KeyError: 'complex64' on view_as_complex of a valid non-contiguous CUDA tensor",
+      "url": "https://github.com/pytorch/pytorch/issues/188718",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/188718",
+      "state": "open",
+      "author": "Sunt-ing",
+      "created_at": "2026-07-01T19:09:07Z",
+      "updated_at": "2026-07-06T05:07:14Z",
+      "closed_at": null,
+      "labels": [
+        "module: cuda",
+        "triaged",
+        "module: complex",
+        "has workaround",
+        "oncall: pt2",
+        "module: inductor",
+        "bot-triaged"
+      ],
+      "comments_count": 2,
+      "matched_keywords": [
+        "compile",
+        "inductor"
+      ],
+      "body": "### 🐛 Describe the bug\n\n\n`torch.view_as_complex` on a valid non-contiguous CUDA tensor works in eager mode (and on CPU), but the same call under `torch.compile` fails during Inductor code generation with `InductorError: KeyError: 'complex64'`.\n\nThe input is a legal `view_as_complex` argument: its last dimension has size 2 and stride 1, and the remaining strides are even, so eager accepts it and returns a complex view. Only the compiled CUDA path fails. A `contiguous` input compiles fine; the failure is tied to the non-contiguous (here transposed) layout. A `float64` input fails the same way with `KeyError: 'complex128'`.\n\nMinimal repro:\n\n```python\nimport torch\n\ndef fn(x):\n    return torch.view_as_complex(x)\n\ndef make(device):\n    base = torch.arange(8, device=device, dtype=torch.float32).reshape(2, 2, 2)\n    return base.transpose(0, 1)  # non-contiguous (strides (2, 4, 1)), valid view_as_complex input\n\nprint(\"CPU  eager   :\", fn(make(\"cpu\")).reshape(-1).tolist())\nprint(\"CUDA eager   :\", fn(make(\"cuda\")).cpu().reshape(-1).tolist())\n\ncfn = torch.compile(fn, fullgraph=True)\nprint(\"CUDA compiled:\", cfn(make(\"cuda\")))   # InductorError: KeyError: 'complex64'\n```\n\nOutput:\n\n```\nCPU  eager   : [1j, (4+5j), (2+3j), (6+7j)]\nCUDA eager   : [1j, (4+5j), (2+3j), (6+7j)]\nInductorError: KeyError: 'complex64'\n```\n\nEager on both CPU and CUDA returns the same complex view; only `torch.compile` on CUDA raises.\n\n<details>\n<summary>Internal stack trace (TORCHDYNAMO_VERBOSE=1)</summary>\n\n```\nFile \"torch/_inductor/codegen/triton.py\", line 6566, in codegen_kernel\n    triton_meta_signature = signature_to_meta(\nFile \"torch/_inductor/codegen/triton_utils.py\", line 203, in signature_to_meta\n    argdefs[i].name: signature_of(arg, size_dtype=_decide_tl_dtype(arg))\nFile \"torch/_inductor/codegen/triton_utils.py\", line 63, in signature_of\n    typ = _type_of(arg.dtype)\nFile \"torch/_inductor/utils.py\", line 597, in _type_of\n    return key if isinstance(key, str) else f\"*{tys[dtype_str]}\"\ntorch._inductor.exc.InductorError: KeyError: 'complex64'\n```\n\n</details>\n\nI've root-caused this and have a fix with a regression test ready; could a maintainer mark this actionable so I can send the PR?\n\n### Versions\n\n\n```\nPyTorch version: 2.14.0.dev20260622+cu132\nIs debug build: False\nCUDA used to build PyTorch: 13.2\nROCM used to build PyTorch: N/A\n\nOS: Ubuntu 22.04.5 LTS (x86_64)\nGCC version: (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0\nLibc version: glibc-2.35\nPython version: 3.12.3 (64-bit runtime)\nIs CUDA available: True\nGPU models and configuration: GPU 0: NVIDIA GeForce RTX 4090\nNvidia driver version: 580.105.08\n```\n\n\ncc @ptrblck @msaroufim @eqy @tinglvv @nWEIdia @ezyang @anjali411 @dylanbespalko @mruberry @nikitaved @amjames @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @aakhundov @coconutruben @jataylo",
+      "comments": [
+        {
+          "author": "Sahil170595",
+          "created_at": "2026-07-06T04:58:45Z",
+          "updated_at": "2026-07-06T04:58:45Z",
+          "body": "Confirmed locally on a separate setup:\n\n- Windows 11\n- NVIDIA RTX 4080 Laptop GPU, SM 8.9\n- torch 2.14.0.dev20260705+cu132\n- triton-windows 3.7.1\n\n`view_as_complex` on the non-contiguous CUDA input reproduces the reported Inductor failure:\n\n- float32 input -> `InductorError: KeyError: 'complex64'`\n- float64 input -> `InductorError: KeyError: 'complex128'`\n\nThe same tensor works in eager CPU/CUDA, and making the transposed input contiguous makes the compiled path succeed. Since you mentioned you already have a fix ready, happy to validate the PR against this environment.",
+          "url": "https://github.com/pytorch/pytorch/issues/188718#issuecomment-4889236544"
+        },
+        {
+          "author": "Sunt-ing",
+          "created_at": "2026-07-06T05:07:14Z",
+          "updated_at": "2026-07-06T05:07:14Z",
+          "body": "Thanks @Sahil170595. The PR is https://github.com/pytorch/pytorch/pull/188719",
+          "url": "https://github.com/pytorch/pytorch/issues/188718#issuecomment-4889287120"
+        }
+      ]
+    }
+  ]
+}
