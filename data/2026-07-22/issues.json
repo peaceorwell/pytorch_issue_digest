@@ -1,0 +1,723 @@
+{
+  "metadata": {
+    "repo": "pytorch/pytorch",
+    "keywords": [
+      "compile",
+      "inductor",
+      "dynamo"
+    ],
+    "generated_at": "2026-07-22T04:00:02.175512+00:00",
+    "since": "2026-07-21T04:00:02.175512+00:00",
+    "lookback_hours": 24.0,
+    "timezone": "Asia/Shanghai",
+    "report_date": "2026-07-22",
+    "issue_count": 17
+  },
+  "issues": [
+    {
+      "number": 190757,
+      "title": "`TORCHINDUCTOR_FREEZING=1` makes CPU inductor generate a fused kernel ~15x slower than eager (shifted-window attention)",
+      "url": "https://github.com/pytorch/pytorch/issues/190757",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/190757",
+      "state": "open",
+      "author": "jiqing-feng",
+      "created_at": "2026-07-22T03:23:02Z",
+      "updated_at": "2026-07-22T03:27:01Z",
+      "closed_at": null,
+      "labels": [
+        "module: performance",
+        "module: cpu",
+        "triaged",
+        "oncall: pt2",
+        "module: inductor",
+        "oncall: cpu inductor",
+        "bot-triaged"
+      ],
+      "comments_count": 0,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "### 🐛 Describe the bug\n\n## Summary\n\nOn CPU with `torch.compile(backend=\"inductor\")`, enabling `TORCHINDUCTOR_FREEZING=1`\nproduces a fused kernel that is dramatically **slower** than both eager and non-frozen\ncompile. Without freezing, compile is faster than eager as expected; turning freezing\non regresses the same graph by more than an order of magnitude.\n\nAll numbers below are **relative to eager** (median wall time of the forward pass),\nmeasured on an **Intel Xeon 6** CPU. I'm not quoting absolute latencies, only ratios.\n\n| mode | time vs eager |\n|------|---------------|\n| eager | 1.0x (baseline) |\n| `compile` (no freezing) | ~0.5x (faster, expected) |\n| `compile` + `TORCHINDUCTOR_FREEZING=1` | **~15x (much slower)** |\n\nThis is **not dtype-specific** — it reproduces with the same magnitude in fp16,\nbf16 and fp32 (freezing lands at roughly the same absolute time in all three,\ni.e. ~12-18x eager depending on dtype).\n\nA profiler run shows ~97% of the time is spent inside a single generated fused\nC++ kernel (`## Call CompiledFxGraph ##`); no individual `aten` op is slow. This\nlooks like a codegen/layout pathology introduced by the freezing pass, not a\nslow operator. Outputs are numerically identical with and without freezing, so\nit's purely a performance issue.\n\n## Where it was found\n\nOriginally observed on the Hugging Face `transformers` model\n[`laion/clap-htsat-fused`](https://huggingface.co/laion/clap-htsat-fused) — its\nHTSAT audio tower (a Swin-style hierarchical transformer). On that real model the\naudio tower under freezing is **~1.7x slower than eager**, while non-frozen\ncompile is ~0.6x. I then reduced it to a self-contained, dependency-free script\n(below) where the effect is much larger (~15x), presumably because the reduced\ngraph is dominated by the offending pattern.\n\n## Minimal reproduction (pure PyTorch, no dependencies)\n\nBy ablation, the regression needs the **interaction of three ingredients**;\nremoving any single one makes freezing as fast as (or faster than) plain compile:\n\n1. a bicubic `F.interpolate` to a **tall / asymmetric** shape (`1024x64`) that is\n   then reshaped to a square feature map — a square `256x256` interpolate does\n   **not** trigger it;\n2. a conv patch-embed followed by a **sigmoid residual gate** `g * sigmoid(conv(g))`;\n3. **one shifted-window masked attention** layer — `torch.roll` plus a\n   `masked_fill` attention bias added through a 5-D `view`.\n\nRandom weights are enough; this is not numerics-dependent.\n\n```python\nimport math, os, sys, time\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\ntorch.manual_seed(0)\nC, WS, SHIFT, NH = 96, 8, 4, 4\n\n\nclass Net(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.proj = nn.Conv2d(1, C, 4, 4)\n        self.gate = nn.Conv2d(C, C, 1)\n        self.ln = nn.LayerNorm(C)\n        self.qkv = nn.Linear(C, 3 * C)\n        self.out = nn.Linear(C, C)\n\n    def forward(self, x):\n        x = F.interpolate(x, (1024, 64), mode=\"bicubic\", align_corners=True).reshape(1, 1, 256, 256)\n        g = self.proj(x)\n        x = g * torch.sigmoid(self.gate(g))\n        b, c, h, w = x.shape\n        x = self.ln(x.flatten(2).transpose(1, 2)).view(b, h, w, c)\n        x = torch.roll(x, (-SHIFT, -SHIFT), (1, 2))\n        win = x.view(b, h // WS, WS, w // WS, WS, c).permute(0, 1, 3, 2, 4, 5).reshape(-1, WS * WS, c)\n        n = win.shape[0]\n        r = (torch.arange(h) >= h - WS).long() + (torch.arange(h) >= h - SHIFT).long()\n        reg = (r[:, None] * 3 + r[None, :]).view(h // WS, WS, w // WS, WS).permute(0, 2, 1, 3).reshape(-1, WS * WS)\n        mask = (reg.unsqueeze(1) - reg.unsqueeze(2)).half().masked_fill_(reg.unsqueeze(1) != reg.unsqueeze(2), -100.0)\n        q, k, v = self.qkv(win).view(n, WS * WS, 3, NH, c // NH).permute(2, 0, 3, 1, 4)\n        s = q @ k.transpose(-1, -2) / math.sqrt(c // NH)\n        s = (s.view(1, n, NH, WS * WS, WS * WS) + mask.unsqueeze(1).unsqueeze(0)).view(-1, NH, WS * WS, WS * WS)\n        o = (s.softmax(-1) @ v).transpose(1, 2).reshape(n, WS * WS, c)\n        return self.out(o)\n\n\ndef bench(m, x, n=30):\n    with torch.inference_mode():\n        for _ in range(10):\n            m(x)\n        ts = []\n        for _ in range(n):\n            s = time.time()\n            m(x)\n            ts.append((time.time() - s) * 1000)\n    return sorted(ts)[n // 2]\n\n\nx = torch.randn(1, 1, 1001, 64, dtype=torch.float16)\nm = Net().eval().to(torch.float16)\nmode = sys.argv[1] if len(sys.argv) > 1 else \"eager\"\nif mode == \"compile\":\n    m.forward = torch.compile(m.forward, backend=\"inductor\")\ntag = \"eager\" if mode != \"compile\" else (\"compile+freeze\" if os.environ.get(\"TORCHINDUCTOR_FREEZING\") == \"1\" else \"compile\")\nprint(f\"{tag:16s} median={bench(m, x):.2f}ms\")\n```\n\nRun (bind to one NUMA node for stable numbers):\n\n```bash\nnumactl -N 0 -m 0 python repro.py                                # eager\nnumactl -N 0 -m 0 python repro.py compile                        # compile\nTORCHINDUCTOR_FREEZING=1 numactl -N 0 -m 0 python repro.py compile   # compile + freezing\n```\n\nThe third run is ~15x slower than the first; the second is faster than the first.\n\n## Original model reproduction (via `transformers`)\n\nFor completeness, the same regression on the real model. This needs\n`transformers`; the tower is loaded directly with random-free pretrained weights\n(only the forward-pass shape/branch matters — `is_longer=True` selects the\n4-channel fusion path that the feature extractor emits for this model):\n\n```python\nimport os, sys, time, torch\nfrom transformers import ClapModel\n\ntorch.manual_seed(0)\naudio = ClapModel.from_pretrained(\"laion/clap-htsat-fused\", dtype=torch.float16).eval().audio_model\ninputs = dict(\n    input_features=torch.randn(1, 4, 1001, 64, dtype=torch.float16),\n    is_longer=torch.ones(1, 1, dtype=torch.bool),\n)\n\nif len(sys.argv) > 1 and sys.argv[1] == \"compile\":\n    audio.forward = torch.compile(audio.forward, backend=\"inductor\")\n\nwith torch.inference_mode():\n    for _ in range(10):\n        audio(**inputs)\n    ts = []\n    for _ in range(30):\n        s = time.time()\n        audio(**inputs)\n        ts.append((time.time() - s) * 1000)\n\ntag = \"eager\" if len(sys.argv) < 2 else (\"compile+freeze\" if os.environ.get(\"TORCHINDUCTOR_FREEZING\") == \"1\" else \"compile\")\nprint(f\"{tag:16s} median={sorted(ts)[15]:.2f}ms\")\n```\n\nHere `compile` is ~0.6x eager, but `compile + TORCHINDUCTOR_FREEZING=1` is ~1.7x eager.\n\n## Expected behavior\n\n`TORCHINDUCTOR_FREEZING=1` should not make the compiled graph slower than eager\n(and certainly not by an order of magnitude). At worst it should match non-frozen\ncompile.\n\n## Environment\n\n- CPU: Intel Xeon 6\n- `torch.compile` backend: `inductor`, CPU\n- dtype: reproduces in fp16, bf16 and fp32\n- OS: Linux\n- allocator: measured with `tcmalloc` preloaded; results are essentially the same without it\n\n### Versions\n\ntorch 2.14.0.dev20260719+cpu\n\ncc @jgong5 @mingfeima @XiaobingSuper @sanchitintel @ashokei @jingxu10 @aditew01 @voznesenskym @penguinwu @EikanWang @Guobing-Chen @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @chauhang @aakhundov @coconutruben @jataylo",
+      "comments": []
+    },
+    {
+      "number": 190755,
+      "title": "Some Dynamo descriptors (`tp_descr_get_impl`) are missing a `descr_check` equivalent",
+      "url": "https://github.com/pytorch/pytorch/issues/190755",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/190755",
+      "state": "open",
+      "author": "guilhermeleobas",
+      "created_at": "2026-07-22T03:00:23Z",
+      "updated_at": "2026-07-22T03:03:16Z",
+      "closed_at": null,
+      "labels": [
+        "triage review",
+        "module: correctness (silent)",
+        "oncall: pt2",
+        "module: dynamo",
+        "bot-triaged"
+      ],
+      "comments_count": 0,
+      "matched_keywords": [
+        "dynamo"
+      ],
+      "body": "### 🐛 Describe the bug\n\n### Description\n\nCPython implements a [`descr_check`](https://github.com/python/cpython/blob/e76aa128fea8691525b482a211bef6b1c514019d/Objects/descrobject.c#L79) whose job is to check if the descriptor applies to the given object. It is currently used in 4 different descriptors:\n* [`PyMemberDescr::member_get`](https://github.com/python/cpython/blob/e76aa128fea8691525b482a211bef6b1c514019d/Objects/descrobject.c#L168)\n* [`PyMethodDescr::method_get`](https://github.com/python/cpython/blob/e76aa128fea8691525b482a211bef6b1c514019d/Objects/descrobject.c#L143)\n* [`PyGetSetDescr::getset_get`](https://github.com/python/cpython/blob/e76aa128fea8691525b482a211bef6b1c514019d/Objects/descrobject.c#L189)\n* [`PyWrapperDescr::wrapperdescr_get`](https://github.com/python/cpython/blob/e76aa128fea8691525b482a211bef6b1c514019d/Objects/descrobject.c#L209)\n\nDynamo already implements those descriptors in [`functions.py`](https://github.com/pytorch/pytorch/blob/main/torch/_dynamo/variables/functions.py) but only the [`MethodDescriptorVariable`](https://github.com/pytorch/pytorch/blob/801c3e6b41427fde03004f2afa4691919d4ee005/torch/_dynamo/variables/functions.py#L4194-L4201) implements some sort of check. The goal is to replicate the same to the other descriptors and see if we are missing any other gap (an LLM can help checking this).\n\n### Reproducer:\n\n```python\nimport torch\n\nclass Borrower:\n    append = list.append   # C method_descriptor; its __objclass__ is `list`\n\ndef fn(x, obj):\n    try:\n        m = obj.append     # eager: descr_check raises TypeError HERE (at the bind)\n        return x + 1       # dynamo: binds silently -> takes this branch\n    except TypeError:\n        return x + 2       # eager: takes this branch\n\nx = torch.randn(4)\nb = Borrower()\n\nprint(fn(x, b).sum())                                              # eager:   x + 2\nprint(torch.compile(fn, backend=\"eager\", fullgraph=True)(x, b).sum())  # dynamo:  x + 1  (WRONG)\n```\n\n### Versions\n\npytorch main\n\ncc @voznesenskym @penguinwu @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @kadeng @chauhang @amjames @jataylo @azahed98",
+      "comments": []
+    },
+    {
+      "number": 190735,
+      "title": "Fix dynamo compile time regression caused by #185057",
+      "url": "https://github.com/pytorch/pytorch/issues/190735",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/190735",
+      "state": "open",
+      "author": "jansel",
+      "created_at": "2026-07-21T23:03:21Z",
+      "updated_at": "2026-07-21T23:10:48Z",
+      "closed_at": null,
+      "labels": [
+        "module: performance",
+        "triaged",
+        "module: regression",
+        "oncall: pt2",
+        "module: dynamo",
+        "bot-triaged"
+      ],
+      "comments_count": 0,
+      "matched_keywords": [
+        "compile",
+        "dynamo"
+      ],
+      "body": "#185057 caused a minor compile time regression:\r\n\r\n```\r\n\r\n Benchmark                                                   Immediate    Sustained    Confidence\r\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━  ━━━━━━━━━━━  ━━━━━━━━━━━━\r\n aotdispatcher_partitioner_cpu2                                 +0.69%       +0.67%    High\r\n──────────────────────────────────────────────────────────  ───────────  ───────────  ────────────\r\n aotdispatcher_partitioner_cpu                                  +0.64%       +0.56%    High\r\n──────────────────────────────────────────────────────────  ───────────  ───────────  ────────────\r\n basic_modules_ListOfLinears_inductor_gpu                       +0.34%       +0.42%    High\r\n──────────────────────────────────────────────────────────  ───────────  ───────────  ────────────\r\n basic_modules_ListOfLinears_inductor                           +0.29%       +0.39%    High\r\n──────────────────────────────────────────────────────────  ───────────  ───────────  ────────────\r\n basic_modules_ListOfLinears_inductor_gpu_force_shape_pad       +0.27%       +0.37%    High\r\n──────────────────────────────────────────────────────────  ───────────  ───────────  ────────────\r\n aotdispatcher_training_nosubclass_cpu                          +0.33%       +0.33%    High\r\n──────────────────────────────────────────────────────────  ───────────  ───────────  ────────────\r\n mm_loop_inductor_gpu                                           +0.36%       +0.33%    High\r\n──────────────────────────────────────────────────────────  ───────────  ───────────  ────────────\r\n aotdispatcher_training_subclass_cpu                            +0.27%       +0.29%    Moderate\r\n──────────────────────────────────────────────────────────  ───────────  ───────────  ────────────\r\n add_loop_inductor_gpu                                          +0.27%       +0.24%    Moderate\r\n──────────────────────────────────────────────────────────  ───────────  ───────────  ────────────\r\n add_loop_inductor                                              +0.22%       +0.23%    Moderate\r\n──────────────────────────────────────────────────────────  ───────────  ───────────  ────────────\r\n add_loop_inductor_dynamic_gpu                                  +0.17%       +0.19%    Moderate\r\n──────────────────────────────────────────────────────────  ───────────  ───────────  ────────────\r\n mm_loop_inductor_dynamic_gpu                                   +0.11%       +0.18%    Moderate\r\n\r\n```\r\nthese are the instruction count benchmarks (https://github.com/pytorch/pytorch/blob/ea0d2733abe91c41b88c75ba88b6fd10698eb000/benchmarks/dynamo/pr_time_benchmarks/expected_results.csv#L65). They're small overhead benchmarks.\r\n\r\n_Originally posted by @zou3519 in https://github.com/pytorch/pytorch/issues/185057#issuecomment-5038577837_\r\n            \r\n\r\nA possible fix is described here: https://github.com/pytorch/pytorch/pull/185057#issuecomment-5039638411\r\n\n\ncc @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @kadeng @amjames @jataylo @azahed98",
+      "comments": []
+    },
+    {
+      "number": 189138,
+      "title": "[RFC] DeviceInterface: Registry Support for PrivateUse1 Backends in torch.compile",
+      "url": "https://github.com/pytorch/pytorch/issues/189138",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/189138",
+      "state": "open",
+      "author": "1479518308",
+      "created_at": "2026-07-07T08:17:16Z",
+      "updated_at": "2026-07-21T23:05:14Z",
+      "closed_at": null,
+      "labels": [
+        "feature",
+        "triaged",
+        "large",
+        "module: backend",
+        "oncall: pt2",
+        "module: inductor",
+        "module: dynamo",
+        "module: PrivateUse1",
+        "bot-triaged"
+      ],
+      "comments_count": 11,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "## TL;DR\n\nThis RFC document aims to propose and discuss making PrivateUse1 (out-of-tree) backends first-class citizens in `torch.compile`. Our focus is on eliminating the hardcoded `cuda`/`xpu`/`mps` device lists and if-branches that permeate the Dynamo and Inductor codebase, replacing them with a unified registry-based contract that the eager path already respects. This initiative is split into three independent, reviewable sub-RFCs along the `torch.compile` pipeline — device identity/capability, Dynamo tracing, and Inductor codegen — each addressing a distinct slice of the problem. By aligning with the existing `DeviceInterface` / `DeviceOpOverrides` / entry-point mechanisms, we aim to enable any PrivateUse1 backend that registers via `register_interface_for_device_PrivateUse1` to be automatically recognized by the entire `torch.compile` stack, with zero monkeypatching of upstream module-level lists or dicts.\n\n## Motivation\n\nPyTorch's eager path already has a device extension contract for PrivateUse1 backends: register a device module, dispatch ops, expose runtime APIs + `DeviceInterface`, and the backend becomes a first-class device. This has enabled out-of-tree backends like `torch_npu`, `torch_mlu`, and others to integrate with PyTorch's eager mode. However, `torch.compile` (Dynamo + Inductor) **ignores this contract** and instead checks hardcoded `cuda`/`xpu`/`mps` device lists and if-branches at every layer.\n\nThis creates a **structural contradiction**: a backend already recognized in eager mode (e.g., a hypothetical accelerator `acc`) is invisible at compile time — treated as \"not GPU\", \"can't run Triton\", \"untraceable\", \"device nyi\". The only workaround today is monkeypatching upstream module-level lists/dicts/private functions, which is fragile, untested by upstream CI, drifts on every refactor, and contradicts the first-class citizen goal. As more PrivateUse1 backends emerge, this problem scales worse — each backend independently patches the same upstream symbols, creating maintenance burden and breakage risk.\n\nTherefore, we upstream the registry-based device contract into `torch.compile` itself, so that any PrivateUse1 backend that registers via `register_interface_for_device_PrivateUse1` is automatically recognized by the entire compile stack. This will facilitate the out-of-box experience for PrivateUse1 backend users and benefit the PyTorch community by making `torch.compile` truly device-agnostic.\n\n## Approach\n\nEventually, we will fully support PrivateUse1 backends in `torch.compile` for both inference and training, in both `torch.compile` mode and eager mode. From an execution perspective, we split the problem into three independent slices along the `torch.compile` pipeline, each landable and reviewable on its own:\n\n1. **Device identity/capability** (RFC 1): Before dispatching to any backend, Inductor must determine the device's identity (is it a GPU?) and capabilities (can it run Triton? how many compute units? does it need guards?). Today these checks query hardcoded lists; we change them to query `get_interface_for_device(device).is_gpu()` and similar contract methods.\n\n2. **Dynamo tracing** (RFC 2): When Dynamo symbolically executes Python into an FX graph, it must recognize device-related types (tensor classes, `Stream`, `Event`) and runtime functions (`current_stream`, `synchronize`, `get_device_properties`). Today six lookup tables hardcode CUDA/XPU; we splice them from the registry.\n\n3. **Inductor codegen** (RFC 3): When Inductor codegens an optimized FX graph into device-specific compilable code, it must discover the backend, accept per-device configuration, compile C++ wrappers with the right include/lib/definitions, and contribute device info to cache keys and autotune env. Today all of these hardcode CUDA; we provide registration interfaces via `DeviceOpOverrides` and `DeviceInterface` extensions.\n\nIn addition, we have added a shared registration primitive — `register_interface_for_device_PrivateUse1` + `get_interface_for_device` — to `torch/_dynamo/device_interface.py` that all three sub-RFCs build upon. Built-in devices (`cuda`, `xpu`, `cpu`, `mps`, `mtia`, `meta`) are locked down by `_BUILTIN_DEVICE_INIT_LIST`; out-of-tree extensions must target a PrivateUse1 device type.\n\nIn summary, the scope of this umbrella RFC is as follows:\n\n- Three sub-RFCs, each independently reviewable and landable\n- Shared registration primitive: `register_interface_for_device_PrivateUse1` + `get_interface_for_device`\n- New capability bits on `DeviceInterface`: `is_gpu()`, `exposes_streams()`, `get_multi_processor_count()`, `visible_devices_env()`, `get_cache_system_info()`, `dynamo_tensor_classes`, `dynamo_constant_fold_fns[_need_guards]`\n- Extensions to `DeviceOpOverrides`: `get_cpp_torch_device_options`, `aten_device_type`, `cpp_stream_type`\n- New entry-point group `torch_inductor_backends` for backend auto-discovery\n- All new methods have safe defaults (`False`, `None`, empty tuple/list) — a backend that registers with minimal slots doesn't break anything\n- in-tree backends declare capability bits, precisely reproducing current behavior (zero behavior change)\n- **Out of scope**: AOTInductor C-shim ABI (`aoti_torch_<device>_<op>`) — needs a separate proposal\n\n## Components\n\nSince we are taking a pipeline-sliced approach, we have identified three crucial components, each corresponding to one sub-RFC:\n\n- **Device Identity/Capability Contract** – This component is the cornerstone to support all downstream compile-stack decisions. It provides the registration entry (`register_interface_for_device_PrivateUse1`), the extended query function (`get_interface_for_device`), and capability bits on `DeviceInterface` (`is_gpu`, `is_triton_capable`, `exposes_streams`, `get_multi_processor_count`). Without this, no other component can make device-aware decisions.\n\n- **Dynamo Registry Splicing** – Although Dynamo has some registry-aware code paths (e.g., `builder.py` already iterates `get_registered_device_interfaces()`), six critical lookup tables still hardcode CUDA/XPU. This component splices all six tables from the registry, introduces `get_interface_for_device__PrivateUse1()` for iterating only PrivateUse1 devices, and adds the `register_device_trace_rules()` public entry for backend runtime function trace rules.\n\n- **Inductor Codegen Registration Interfaces** – Inductor's codegen path has no end-to-end backend discovery, rejects third-party config keys, and hardcodes branches in cpp-builder/AOTI/wrapper/autotune/cache-key. This component provides four registration interfaces: entry-point discovery, per-device config routing, `DeviceOpOverrides` contract extensions, and `DeviceInterface` runtime methods.\n\nBesides the three components above, we rely on the existing `DeviceInterface` and `DeviceOpOverrides` contracts that PyTorch already defines for eager mode. No parallel mechanism is created.\n\n## Design\n\nIn this section, we present a high-level design for each component. Regarding the detailed design, please refer to the dedicated sub-RFC for each component for more information.\n\n### Device Identity/Capability Contract\n\nPyTorch's `torch.compile` stack determines device identity and capabilities through hardcoded lists: `GPU_TYPES = [\"cuda\", \"mps\", \"xpu\", \"mtia\"]` for `is_gpu`, a `triton_supported_devices` dict for `has_triton`, and `if device_type == \"xpu\"/\"mtia\"` fallbacks for `multi_processor_count`. In terms of PrivateUse1 backends, we will replace all these with `get_interface_for_device(device).is_gpu()` and similar contract method calls. We add an `is_gpu()` capability bit to `DeviceInterface` (default `False`, parallel to the existing `is_triton_capable()`). The `GPU_TYPES` list is retained as a late-binding compatibility shim backed by a private `_gpu_types()` that iterates the registry — no new public function is added. The `assert len(avail_gpus) <= 1` in `get_gpu_type()` is replaced by a disambiguation rule (reuse `torch.accelerator.current_accelerator()` priority, PrivateUse1 first). The `!= \"mps\"` literal in `device_need_guard` is replaced by `_exposes_streams(device)`, which checks whether `iface.Stream is not DeviceInterface.Stream`.\n\nPlease refer to the dedicated RFC #189135 for detailed design elaboration.\n\n### Dynamo Registry Splicing\n\nDynamo answers two questions for every value/call during symbolic execution: \"what is it\" (which `VariableTracker` wraps it) and \"how to handle it\" (inline / emit FX node / constant-fold / graph-break). Six lookup tables answer these questions, and all hardcode CUDA/XPU. We will splice all six from the registry: `_in_graph_classes` splices `dynamo_tensor_classes` / `Stream` / `Event` from all registered interfaces; stream variable class uses generic `StreamVariable` + `native_handle` default path (out-of-tree: zero subclass, zero slot), with the `native_handle` fallback lifted from inside the `\"cuda_stream\"` branch to the generic base; `trace_rules` gets a new `register_device_trace_rules()` public entry; constant-fold groups use two optional tuple slots on `DeviceInterface`; `common_constant_types` derives properties class from `type(iface.get_device_properties(...))`. The only non-derivable information — dtype-specialized tensor types — is handled by one optional slot `dynamo_tensor_classes` (default empty, safe).\n\nPlease refer to the dedicated RFC #189136 for detailed design elaboration.\n\n### Inductor Codegen Registration Interfaces\n\nInductor's codegen path has four things that lack registration interfaces. We will address all four: (1) backend discovery via new entry-point group `torch_inductor_backends`, loaded in `init_backend_registration()` (failure is warning-only); (2) per-device config `apply_options` accepting registered keys by prefix (e.g., `\"acc_backend.flag\"`); (3) C++ compile options and AOTI device mapping via `DeviceOpOverrides` contract extensions (`get_cpp_torch_device_options`, `aten_device_type` default `at::kPrivateUse1`, `cpp_stream_type`); (4) runtime/host misc via `DeviceInterface` methods (`visible_devices_env` default `None`, `get_cache_system_info` default `None`). The four autotune sites that hardcode `CUDA_VISIBLE_DEVICES` are unified through `visible_devices_env()`. The two-pass compilation gate in `graph.py` uses `is_gpu(device)` (depends on RFC 1). We follow existing `DeviceOpOverrides` / `DeviceInterface` / entry-point mechanisms — no parallel mechanism is created.\n\n**Honest boundary**: AOTInductor has an additional C-shim ABI layer (`aoti_torch_<device>_<op>`) that this RFC **cannot** address. `get_c_shim_func_name` directly concatenates `aoti_torch_{device}_{op}` without going through `DEVICE_TO_ATEN` fallback. No-c-shim backends will still fail AOTI at link time. This needs a separate proposal.\n\nPlease refer to the dedicated RFC #189137 for detailed design elaboration.\n\nFor a more comprehensive and detailed understanding of each component's design, we highly encourage you to explore the respective sub-RFCs linked above. These documents provide in-depth insight and technical specifics that are crucial for a complete grasp of the proposed implementations and integrations.\n",
+      "comments": [
+        {
+          "author": "fffrog",
+          "created_at": "2026-07-16T13:08:32Z",
+          "updated_at": "2026-07-16T13:08:32Z",
+          "body": "Hi @jansel, so sorry to ping you again.\n\nCould you help to review this RFC? Thank you ahead of time. :D",
+          "url": "https://github.com/pytorch/pytorch/issues/189138#issuecomment-4992228530"
+        },
+        {
+          "author": "jansel",
+          "created_at": "2026-07-16T16:30:59Z",
+          "updated_at": "2026-07-16T16:30:59Z",
+          "body": "We already have support for out-of-tree backends, though perhaps there are some gaps relating to PrivateUse1.  Smaller patches that remove device hardcodings are welcome.  I think this is mostly all that would be needed to fix PrivateUse1 issues.\n\nIf you think bigger changes are needed, please provide more details -- expecially compared to the existing out-of-tree backend support.  I'd much rather extend what is already there than add some sort of parallel registration system.\n",
+          "url": "https://github.com/pytorch/pytorch/issues/189138#issuecomment-4994265657"
+        },
+        {
+          "author": "1479518308",
+          "created_at": "2026-07-17T08:44:49Z",
+          "updated_at": "2026-07-20T01:54:52Z",
+          "body": "Thanks a lot for your review feedback. My proposed solution consists of small incremental patches to eliminate hardcoded device type logic. The get_registered_device_interfaces registration mechanism this change relies on is already a pre-existing built-in API. This work primarily addresses hardcoded entries like the GPU_TYPES = [\"cuda\", \"mps\", \"xpu\", \"mtia\"] list to resolve compatibility issues for PrivateUse1 devices.\n",
+          "url": "https://github.com/pytorch/pytorch/issues/189138#issuecomment-5000890334"
+        },
+        {
+          "author": "myfykris",
+          "created_at": "2026-07-20T20:47:31Z",
+          "updated_at": "2026-07-20T20:51:05Z",
+          "body": "> We already have support for out-of-tree backends, though perhaps there are some gaps relating to PrivateUse1. Smaller patches that remove device hardcodings are welcome. I think this is mostly all that would be needed to fix PrivateUse1 issues.\n>\n> If you think bigger changes are needed, please provide more details -- especially compared to the existing out-of-tree backend support. I'd much rather extend what is already there than add some sort of parallel registration system.\n\nI completely agree that extending the existing backend interfaces is preferable to introducing a parallel registration mechanism. I don't think another registration system is needed.\n\nWhere I think we may be aiming a little too narrowly is in the scope.\n\nTo me, this isn't fundamentally a `torch.compile` problem. It's a PyTorch-wide backend capability problem.\n\n`torch.compile` is one consumer of backend capabilities, but so are eager execution, backend dispatch, optimization selection, and libraries built on top of PyTorch. If the capability abstraction only exists inside `torch.compile`, every other consumer will continue solving the same problem independently.\n\nThe reason I think this matters is that a surprising number of backend checks are not actually backend checks. They're capability checks expressed as backend checks because there isn't currently a first-class capability interface available.\n\nFor example, in Inductor there is:\n\n```python\ndef prepare_softmax_extra_check(match):\n    \"\"\"\n    We only have triton online softmax kernels currently.\n    \"\"\"\n    device_type = match.kwargs[\"x\"].meta[\"val\"].device.type\n    return (\n        config.online_softmax\n        and device_type in [\"cuda\", \"xpu\"]\n        and getattr(config, f\"{device_type}_backend\") == \"triton\"\n    )\n```\n\nThe capability being queried here is the availability of an online-softmax implementation.\n\nCUDA is not an online-softmax algorithm.\n\nXPU is not an online-softmax algorithm.\n\nTriton is not an online-softmax algorithm.\n\nThose are simply implementation choices that currently happen to provide an online-softmax implementation. Another backend could provide exactly the same capability through native kernels, another compiler, generated code, or a vendor library. The logical requirement is \"an online-softmax implementation is available,\" but the current mechanism infers that from backend identity and implementation details.\n\nThe same pattern already exists outside PyTorch.\n\nTransformers has accumulated a growing collection of backend, package, and feature discovery helpers such as `is_flash_attn_2_available()`, `is_flash_linear_attention_available()`, `is_causal_conv1d_available()`, `is_torch_bf16_available_on_device()`, and many others. Those functions are effectively an ad hoc capability and availability layer implemented outside of PyTorch because downstream libraries have no common capability interface they can query.\n\nEven more interesting is what happens inside model implementations themselves.\n\nRecent Qwen3.5 models determine whether their optimized gated-delta attention path is available by checking whether CUDA-oriented packages like `causal-conv1d` and `flash-linear-attention` can be imported, then binding function pointers from those packages into the model class.\n\nBut those models do not fundamentally require those packages.\n\nThey require implementations of causal convolution, incremental causal-convolution update, chunked gated-delta attention, and recurrent gated-delta attention.\n\nThose operations could be provided by any backend.\n\nToday, however, there is no PyTorch capability interface that allows a backend to advertise those capabilities or a model to discover them. Under the current design, a non-CUDA backend cannot provide equivalent optimized implementations through the existing backend interface. It has to modify Transformers, inject or replace the stored function pointers, or fall back to the generic implementation. That seems like a strong indication that the abstraction is missing at the framework level rather than simply requiring a few additional backend integrations.\n\nThis is why I don't think removing hardcoded backend checks one at a time completely solves the problem. Even if every remaining check inside `torch.compile` were replaced, downstream projects would continue writing backend-name checks, package checks, version checks, runtime probes, and library-specific capability systems because they have no common capability interface to use instead.\n\nI wonder if this RFC could become the foundation of a PyTorch-wide backend capability system, with `torch.compile` being one consumer rather than the owner of that abstraction.\n\nI also think the capability interface itself probably needs to be richer than simple booleans.\n\nMany capabilities are conditional. Support often depends on the exact operation and its inputs.\n\nConceptually, capability queries are closer to:\n\n```python\nsupports(\n    op=torch.ops.aten.scaled_dot_product_attention,\n    device=device,\n    dtype=torch.float16,\n    layout=torch.strided,\n    head_dim=128,\n    is_causal=True,\n    mask_type=\"none\",\n)\n```\n\nthan:\n\n```python\nsupports_sdpa = True\n```\n\nSimilarly, implementation selection should become capability negotiation rather than backend detection. Higher-level code should be able to request an implementation satisfying a set of requirements instead of enumerating backend names.\n\nI'm not proposing a second registration mechanism. I'd like to see the existing backend interfaces become the authoritative source for capability discovery so both PyTorch itself and the broader ecosystem have something better to query than backend identity or package availability.\n\nTo me, the remaining backend-specific checks throughout the ecosystem aren't the root problem. They're evidence that backend identity and package availability are currently being used as substitutes for capability because capability isn't yet a first-class concept in PyTorch.\n",
+          "url": "https://github.com/pytorch/pytorch/issues/189138#issuecomment-5027127116"
+        },
+        {
+          "author": "jansel",
+          "created_at": "2026-07-20T23:43:15Z",
+          "updated_at": "2026-07-20T23:43:15Z",
+          "body": "For that example, we already have:\nhttps://github.com/pytorch/pytorch/blob/5bcdfd46600b4ae673afe665544a7c574bd0dba2/torch/_inductor/codegen/common.py#L437-L447\nwith each backend defining:\nhttps://github.com/pytorch/pytorch/blob/5bcdfd46600b4ae673afe665544a7c574bd0dba2/torch/_inductor/codegen/triton.py#L7766-L7777\n\nSo I'd accept a PR that added `BackendFeature.ONLINE_SOFTMAX` and updated the check to use it.\n\nA new `supports()` registration system would need additional motivation and discussion.\n",
+          "url": "https://github.com/pytorch/pytorch/issues/189138#issuecomment-5028419548"
+        },
+        {
+          "author": "myfykris",
+          "created_at": "2026-07-21T04:22:05Z",
+          "updated_at": "2026-07-21T04:22:05Z",
+          "body": "> So I'd accept a PR that added `BackendFeature.ONLINE_SOFTMAX` and updated the check to use it.\n> \n> A new `supports()` registration system would need additional motivation and discussion.\n\nThat actually seems like the right abstraction. Do you think it makes sense to promote it from an Inductor-only abstraction into the framework-wide backend capability interface, with a supported public API so libraries like Transformers can consume it?",
+          "url": "https://github.com/pytorch/pytorch/issues/189138#issuecomment-5030124139"
+        },
+        {
+          "author": "onlyxItachi",
+          "created_at": "2026-07-21T13:16:08Z",
+          "updated_at": "2026-07-21T13:16:08Z",
+          "body": "I reviewed the two-file change and its physical/OpenReg evidence. I believe this is a narrow, independently actionable pre-lowering bug that does not require a new API or parallel registration path. I am making the branch available now so maintainers can guide the initial-trace semantics and preferred test placement.\n\nCodex assisted with the source audit, implementation, testing, and drafting. I reviewed the code and evidence and take responsibility for this submission. The contained technical summary below is AI-assisted:\n\n> A real OOT PrivateUse1 consumer on AMD XDNA2 reproduces a failure before backend lowering, including for an unrelated int32 graph.\n>\n> During static SDPA pattern initialization, Inductor uses `torch.tensor(2.0, device=device)` for a tensor-valued scale example. Although the initial trace only consumes its metadata, that value-producing constructor retains a floating scalar constant on the target device and reaches the backend's real Float allocation path.\n>\n> Replacing it with `torch.empty((), device=device)` preserves the zero-dimensional shape, requested dtype, explicit device, pattern count, and measured pattern/signature metadata, while avoiding the unused target value. A focused OpenReg regression checks this invariant. The pipeline then proceeds to the next backend-owned blocker rather than failing in SDPA initialization.\n>\n> The reviewed branch contains only the one-line production change and the OpenReg test:\n> https://github.com/onlyxItachi/pytorch/compare/main...agent/inductor-sdpa-metadata-only-scale\n>\n> This addresses one concrete gap only and does not attempt to close #189138.\n\nPyTorch's contribution guidance asks new contributors to associate PRs with an issue carrying the `actionable` label. Since #189138 does not currently have that label, I have not opened the draft PR yet. Would you prefer a dedicated narrow bug issue, or is #189138 the appropriate issue to make actionable for this draft?\n",
+          "url": "https://github.com/pytorch/pytorch/issues/189138#issuecomment-5034517165"
+        },
+        {
+          "author": "jansel",
+          "created_at": "2026-07-21T18:14:02Z",
+          "updated_at": "2026-07-21T18:14:02Z",
+          "body": "> That actually seems like the right abstraction. Do you think it makes sense to promote it from an Inductor-only abstraction into the framework-wide backend capability interface, with a supported public API so libraries like Transformers can consume it?\n\nI think for PrivateUse1 you will need to register a custom inductor backend anyway.  Most of those flags are specific to inductor behavior.",
+          "url": "https://github.com/pytorch/pytorch/issues/189138#issuecomment-5037483979"
+        },
+        {
+          "author": "myfykris",
+          "created_at": "2026-07-21T18:43:50Z",
+          "updated_at": "2026-07-21T18:43:50Z",
+          "body": "> I think for PrivateUse1 you will need to register a custom inductor backend anyway. Most of those flags are specific to inductor behavior.\n\nMaybe for some backends, but not for mine. My PrivateUse1 backend provides its own `torch.compile` backend rather than using Inductor, so Inductor-only abstractions aren't directly usable for advertising backend capabilities to the rest of the framework or downstream libraries.\n\nThat's why I was wondering whether promoting `BackendFeature` into a framework-wide capability interface, rather than keeping it Inductor-specific, might be the right long-term direction.\n",
+          "url": "https://github.com/pytorch/pytorch/issues/189138#issuecomment-5037763814"
+        },
+        {
+          "author": "jansel",
+          "created_at": "2026-07-21T20:05:36Z",
+          "updated_at": "2026-07-21T20:06:24Z",
+          "body": "The softmax example above was inductor-specific.  So if you aren't using inductor you don't need to change it at all.\n\nMaybe it would help to come up wth some non-inductor examples that need updating to motivate such a feature.",
+          "url": "https://github.com/pytorch/pytorch/issues/189138#issuecomment-5038521586"
+        },
+        {
+          "author": "myfykris",
+          "created_at": "2026-07-21T23:05:14Z",
+          "updated_at": "2026-07-21T23:05:14Z",
+          "body": "> The softmax example above was inductor-specific. So if you aren't using inductor you don't need to change it at all.\n> \n> Maybe it would help to come up wth some non-inductor examples that need updating to motivate such a feature.\n\nMy very first post noted other examples.  The easiest way to see the need is to look at the fact that transformers and qwen/other models do hacky incorrect capability checks by using cuda as a proxy.",
+          "url": "https://github.com/pytorch/pytorch/issues/189138#issuecomment-5039967827"
+        }
+      ]
+    },
+    {
+      "number": 190718,
+      "title": "Inductor doesn't do a good job of fusing Domino CE",
+      "url": "https://github.com/pytorch/pytorch/issues/190718",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/190718",
+      "state": "open",
+      "author": "zou3519",
+      "created_at": "2026-07-21T20:48:29Z",
+      "updated_at": "2026-07-21T20:58:58Z",
+      "closed_at": null,
+      "labels": [
+        "module: performance",
+        "triaged",
+        "enhancement",
+        "oncall: pt2",
+        "module: inductor",
+        "bot-triaged"
+      ],
+      "comments_count": 0,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "This is the Domino CE code I've been playing around with: [link](https://github.com/sgl-project/SpecForge/blob/1bfa8ae992628624c22d3d3e43c70af671155765/specforge/algorithms/common/dflash_family_model.py#L556-L590).\n\nHere's a standalone repro: https://gist.github.com/zou3519/8f9004a5408e6ab2082dea2f1b7ac72c (generated by AI, note that the triton kernel example is slop).\n\nI asked codex to write the triton kernel to save memory via avoiding materializing big tensors and the resulting kernel appears to be much faster than the torch.compile fusion (3.795 ms torch.compiled / 2.166 ms Triton). I benchmarked on PyTorch 2.11 as well as a recent PyTorch nightly.\n\nWarning: I have not verified the triton kernel does anything correctly\n\ncc @voznesenskym @penguinwu @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @chauhang @aakhundov @coconutruben @jataylo",
+      "comments": []
+    },
+    {
+      "number": 190702,
+      "title": "Unify naming in torch/_dynamo/variables/object_protocol.py",
+      "url": "https://github.com/pytorch/pytorch/issues/190702",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/190702",
+      "state": "open",
+      "author": "guilhermeleobas",
+      "created_at": "2026-07-21T18:51:43Z",
+      "updated_at": "2026-07-21T19:16:04Z",
+      "closed_at": null,
+      "labels": [
+        "good first issue",
+        "triaged",
+        "enhancement",
+        "oncall: pt2",
+        "module: dynamo",
+        "bot-triaged"
+      ],
+      "comments_count": 1,
+      "matched_keywords": [
+        "dynamo"
+      ],
+      "body": "Currently `object_protocol.py` does not follow any naming convention. Some functions are\nprefixed with `generic_`, others with `vt_`. I'd like to change that, not just for readability\nbut also to make it easy to spot which function it represents in the CPython codebase.\n\n### Proposed Convention\nName each function after the CPython symbol it mirrors.\n\n* `PyObject_*` -> `generic_*`\n* `PySequence_*` -> `pysequence_*`\n* `PyMapping_*` -> `pymapping_*`\n* `PyNumber_*` -> `pynumber_*`\n* `PyIter_*` -> `pyiter_*`\n* `PyLong_*` -> `pylong_*`\n\n\n### Renames needed\n### Renames needed\n\n| Current | New | CPython symbol |\n|---|---|---|\n| `vt_getitem` | `generic_getitem` | `PyObject_GetItem` |\n| `generic_len` | `generic_size` | `PyObject_Size` |\n| `generic_bool` | `generic_is_true` | `PyObject_IsTrue` |\n| `vt_mapping_size` | `pymapping_size` | `PyMapping_Size` |\n| `vt_sequence_getitem` | `pysequence_getitem` | `PySequence_GetItem` |\n| `vt_sequence_setitem` | `pysequence_setitem` | `PySequence_SetItem` |\n| `sequence_delitem` | `pysequence_delitem` | `PySequence_DelItem` |\n| `sequence_repeat` | `pysequence_repeat` | `PySequence_Repeat` |\n| `sequence_inplace_repeat` | `pysequence_inplace_repeat` | `PySequence_InPlaceRepeat` |\n| `generic_contains` | `pysequence_contains` | `PySequence_Contains` |\n| `generic_int` | `pynumber_int` | `PyNumber_Long` |\n| `generic_float` | `pynumber_float` | `PyNumber_Float` |\n| `generic_add` | `pynumber_add` | `PyNumber_Add` |\n| `generic_inplace_add` | `pynumber_inplace_add` | `PyNumber_InPlaceAdd` |\n| `generic_multiply` | `pynumber_multiply` | `PyNumber_Multiply` |\n| `generic_inplace_multiply` | `pynumber_inplace_multiply` | `PyNumber_InPlaceMultiply` |\n| `generic_matmul` | `pynumber_matrix_multiply` | `PyNumber_MatrixMultiply` |\n| `generic_inplace_matmul` | `pynumber_inplace_matrix_multiply` | `PyNumber_InPlaceMatrixMultiply` |\n| `generic_neg` | `pynumber_negative` | `PyNumber_Negative` |\n| `generic_pos` | `pynumber_positive` | `PyNumber_Positive` |\n| `generic_abs` | `pynumber_absolute` | `PyNumber_Absolute` |\n| `generic_invert` | `pynumber_invert` | `PyNumber_Invert` |\n| `generic_iternext` | `pyiter_next` | `PyIter_Next` |\n\ncc @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @kadeng @amjames @jataylo @azahed98",
+      "comments": [
+        {
+          "author": "jensecrest",
+          "created_at": "2026-07-21T19:08:43Z",
+          "updated_at": "2026-07-21T19:08:43Z",
+          "body": "If there is consensus on the proposed renames, then I am willing to take on this issue! Please let me know.",
+          "url": "https://github.com/pytorch/pytorch/issues/190702#issuecomment-5038021297"
+        }
+      ]
+    },
+    {
+      "number": 145383,
+      "title": "Windows Pytorch compiler crash some version of cl.exe. Fix provided",
+      "url": "https://github.com/pytorch/pytorch/issues/145383",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/145383",
+      "state": "closed",
+      "author": "deepbeepmeep",
+      "created_at": "2025-01-22T17:32:13Z",
+      "updated_at": "2026-07-21T18:22:50Z",
+      "closed_at": "2026-07-21T18:22:50Z",
+      "labels": [
+        "module: windows",
+        "triaged",
+        "oncall: pt2"
+      ],
+      "comments_count": 2,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "### 🐛 Describe the bug\n\nHi.\nIn _cpp_builder.py / function 'check_compiler_exist_windows'_ you check for the existence of the cl C++ compiler by calling it with a '/help' option.\n\nHowever for some versions of cl.exe, the header of the help message contains some invisible invalid utf8 char (here a single xff):\n\n_Compilateur d\\'optimisation Microsoft (R) C/C++ version\\xff19.35.32216.1_\n\nThis causes the following crash:\n```torch._dynamo.exc.BackendCompilerFailed: backend='inductor' raised:\nUnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 54: invalid start byte'\n```\n\n\nThe solution would to be to remove the decode line since this is only an existence test you don't need to process the help message\n\n```\n@functools.lru_cache(None)\ndef check_compiler_exist_windows(compiler: str) -> None:\n    \"\"\"\n    Check if compiler is ready, in case end user not activate MSVC environment.\n    \"\"\"\n    try:        \n        output_msg = (\n            subprocess.check_output(  [compiler,   \"\\help\"  ]  , stderr=subprocess.STDOUT)\n            .strip()\n            #.decode(*SUBPROCESS_DECODE_ARGS)\n        )\n```\n\n### Versions\n\nnot needed\n\ncc @peterjc123 @mszhanyi @skyline75489 @nbcsm @iremyux @Blackhex @chauhang @penguinwu",
+      "comments": [
+        {
+          "author": "SystemPanic",
+          "created_at": "2025-04-04T18:10:42Z",
+          "updated_at": "2025-04-04T18:10:42Z",
+          "body": "I can confirm this problem with latest cl 19.43.34809",
+          "url": "https://github.com/pytorch/pytorch/issues/145383#issuecomment-2779445557"
+        },
+        {
+          "author": "woct0rdho",
+          "created_at": "2026-02-17T20:14:00Z",
+          "updated_at": "2026-02-18T01:34:13Z",
+          "body": "It's still not fully fixed after #157673 . Recently a user reported with stack trace: https://github.com/woct0rdho/triton-windows/issues/191\n\nUpdate: Nevermind. I guess it's because of 'Beta: Use Unicode UTF-8 for worldwide language support' in Windows.",
+          "url": "https://github.com/pytorch/pytorch/issues/145383#issuecomment-3916861251"
+        }
+      ]
+    },
+    {
+      "number": 185509,
+      "title": "[inductor] Silent incorrect gradients with interpolate, conv2d, max_pool2d and torch.where",
+      "url": "https://github.com/pytorch/pytorch/issues/185509",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/185509",
+      "state": "closed",
+      "author": "xyt66665000",
+      "created_at": "2026-05-28T12:23:18Z",
+      "updated_at": "2026-07-21T18:19:00Z",
+      "closed_at": "2026-07-21T18:19:00Z",
+      "labels": [
+        "triaged",
+        "module: correctness (silent)",
+        "oncall: pt2",
+        "module: inductor",
+        "bot-triaged"
+      ],
+      "comments_count": 0,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "### 🐛 Describe the bug\n\nWhen compiling a function containing `F.interpolate`, `F.conv2d`, `F.max_pool2d`, and `torch.where` using `torch.compile(backend=\"inductor\")`, the forward pass matches eager mode perfectly, but the gradients in the backward pass are completely incorrect (showing massive max diffs).\n\nThis is a silent correctness issue during training, as the forward output does not throw any errors and matches eager mode (max diff `~1.9e-06`), but the calculated gradients for input, weight, and bias differ by values up to `77.0`.\n\n### Reproducer\n\n```python\nimport torch\nimport torch.nn.functional as F\n\n\ndef inner(x, weight, bias):\n    y = F.interpolate(\n        x,\n        scale_factor=(1.5, 1.25),\n        mode=\"bilinear\",\n        align_corners=False,\n    )\n    y = y[:, :, 1:7, 1:8]\n\n    conv = F.conv2d(y, weight, bias, padding=1)\n    pool = F.max_pool2d(conv, kernel_size=3, stride=1, padding=1)\n    threshold = pool.mean(dim=(2, 3), keepdim=True)\n    return conv, pool, threshold\n\n\ndef make_mask(x, weight, bias):\n    conv, _, threshold = inner(x, weight, bias)\n    return conv > threshold\n\n\ndef fn(x, weight, bias, mask):\n    conv, pool, _ = inner(x, weight, bias)\n\n    return torch.where(mask, conv, pool)\n\n\ndef clone_inputs(xs):\n    return [x.detach().clone().requires_grad_(True) for x in xs]\n\n\ndef run(f, xs, mask):\n    out = f(*xs, mask)\n    out.sum().backward()\n    return out.detach(), [x.grad.detach().clone() for x in xs]\n\n\ndef max_diff(a, b):\n    return (a - b).abs().max().item()\n\n\ndef main():\n    print(\"torch:\", torch.__version__)\n    print(\"cuda:\", torch.version.cuda)\n\n    torch.manual_seed(0)\n    device = \"cpu\"\n\n    inputs = [\n        torch.randn(2, 3, 6, 7, device=device, requires_grad=True),\n        torch.randn(4, 3, 3, 3, device=device, requires_grad=True),\n        torch.zeros(4, device=device, requires_grad=True),\n    ]\n\n    inputs_eager = clone_inputs(inputs)\n    inputs_comp = clone_inputs(inputs)\n\n    torch._dynamo.reset()\n    compiled_mask = torch.compile(make_mask, backend=\"inductor\")\n\n    mask_eager = make_mask(*inputs_eager).detach()\n    mask_comp = compiled_mask(*inputs_comp).detach()\n\n    print(\"mask mismatches:\", (mask_eager != mask_comp).sum().item(), \"/\", mask_eager.numel())\n\n    fixed_mask = mask_eager\n\n    inputs_eager = clone_inputs(inputs)\n    inputs_comp = clone_inputs(inputs)\n\n    out_eager, grads_eager = run(fn, inputs_eager, fixed_mask)\n\n    torch._dynamo.reset()\n    compiled_fn = torch.compile(fn, backend=\"inductor\")\n    out_comp, grads_comp = run(compiled_fn, inputs_comp, fixed_mask)\n\n    print(\"forward max diff:\", max_diff(out_eager, out_comp))\n\n    for i, (ge, gc) in enumerate(zip(grads_eager, grads_comp)):\n        diff = max_diff(ge, gc)\n        mismatches = ((ge - gc).abs() > 1e-3).sum().item()\n        print(f\"grad[{i}] max diff:\", diff)\n        print(f\"grad[{i}] mismatches > 1e-3:\", mismatches, \"/\", ge.numel())\n\n\nif __name__ == \"__main__\":\n    main()\n```\n\n### Actual Output\n\n```text\n(torch-nightly) xyt19@Oasis:/tmp$ python bug.py\ntorch: 2.13.0.dev20260521+cu130\ncuda: 13.0\nmask mismatches: 0 / 336\nforward max diff: 1.9073486328125e-06\ngrad[0] max diff: 54.59376907348633\ngrad[0] mismatches > 1e-3: 210 / 252\ngrad[1] max diff: 43.85358810424805\ngrad[1] mismatches > 1e-3: 108 / 108\ngrad[2] max diff: 77.0\ngrad[2] mismatches > 1e-3: 4 / 4\n```\n\n### Expected Behavior\nCompiled function should produce the same gradients as eager mode (max diffs should be within reasonable floating-point tolerances, e.g., `< 1e-4`).\n\n\n### Versions\n\nPyTorch version: 2.13.0.dev20260521+cu130\nIs debug build: False\nCUDA used to build PyTorch: 13.0\nROCM used to build PyTorch: N/A\n\nOS: Ubuntu 24.04.4 LTS (x86_64)\nGCC version: (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0\nClang version: 18.1.3 (1ubuntu1)\nCMake version: version 3.28.3\nLibc version: glibc-2.39\n\nPython version: 3.10.20 (main, Mar 11 2026, 17:46:40) [GCC 14.3.0] (64-bit runtime)\nPython platform: Linux-5.15.167.4-microsoft-standard-WSL2-x86_64-with-glibc2.39\nIs CUDA available: True\nCUDA runtime version: 12.0.140\nNvidia driver version: 596.49\ncuDNN version: Probably one of the following:\n/usr/lib/x86_64-linux-gnu/libcudnn.so.9.21.1\n/usr/lib/x86_64-linux-gnu/libcudnn_adv.so.9.21.1\n/usr/lib/x86_64-linux-gnu/libcudnn_cnn.so.9.21.1\n/usr/lib/x86_64-linux-gnu/libcudnn_engines_precompiled.so.9.21.1\n/usr/lib/x86_64-linux-gnu/libcudnn_engines_runtime_compiled.so.9.21.1\n/usr/lib/x86_64-linux-gnu/libcudnn_engines_tensor_ir.so.9.21.1\n/usr/lib/x86_64-linux-gnu/libcudnn_graph.so.9.21.1\n/usr/lib/x86_64-linux-gnu/libcudnn_heuristic.so.9.21.1\n/usr/lib/x86_64-linux-gnu/libcudnn_ops.so.9.21.1\nIs XPU available: False\nHIP runtime version: N/A\nMIOpen runtime version: N/A\nIs XNNPACK available: True\nCaching allocator config: N/A\nersions of relevant libraries:\n[pip3] numpy==2.2.6\n[pip3] nvidia-cublas==13.1.1.3\n[pip3] nvidia-cuda-cupti==13.0.85\n[pip3] nvidia-cuda-nvrtc==13.0.88\n[pip3] nvidia-cuda-runtime==13.0.96\n[pip3] nvidia-cudnn-cu13==9.20.0.48\n[pip3] nvidia-cufft==12.0.0.61\n[pip3] nvidia-curand==10.4.0.35\n[pip3] nvidia-cusolver==12.0.4.66\n[pip3] nvidia-cusparse==12.6.3.3\n[pip3] nvidia-cusparselt-cu13==0.8.1\n[pip3] nvidia-nccl-cu13==2.29.7\n[pip3] nvidia-nvjitlink==13.0.88\n[pip3] nvidia-nvtx==13.0.85\n[pip3] torch==2.13.0.dev20260521+cu130\n[pip3] torchaudio==2.11.0.dev20260525+cu130\n[pip3] torchvision==0.28.0.dev20260525+cu130\n[pip3] triton==3.7.0+git88b227e2\n[conda] numpy 2.2.6 pypi_0 pypi\n[conda] nvidia-cublas 13.1.1.3 pypi_0 pypi\n[conda] nvidia-cuda-cupti 13.0.85 pypi_0 pypi\n[conda] nvidia-cuda-nvrtc 13.0.88 pypi_0 pypi\n[conda] nvidia-cuda-runtime 13.0.96 pypi_0 pypi\n[conda] nvidia-cudnn-cu13 9.20.0.48 pypi_0 pypi\n[conda] nvidia-cufft 12.0.0.61 pypi_0 pypi\n[conda] nvidia-curand 10.4.0.35 pypi_0 pypi\n[conda] nvidia-cusolver 12.0.4.66 pypi_0 pypi\n[conda] nvidia-cusparse 12.6.3.3 pypi_0 pypi\n[conda] nvidia-cusparselt-cu13 0.8.1 pypi_0 pypi\n[conda] nvidia-nccl-cu13 2.29.7 pypi_0 pypi\n[conda] nvidia-nvjitlink 13.0.88 pypi_0 pypi\n[conda] nvidia-nvtx 13.0.85 pypi_0 pypi\n[conda] torch 2.13.0.dev20260521+cu130 pypi_0 pypi\n[conda] torchaudio 2.11.0.dev20260525+cu130 pypi_0 pypi\n[conda] torchvision 0.28.0.dev20260525+cu130 pypi_0 pypi\n[conda] triton 3.7.0+git88b227e2 pypi_0 pypi\n\ncc @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @aakhundov @coconutruben @jataylo",
+      "comments": []
+    },
+    {
+      "number": 169966,
+      "title": "UNSTABLE inductor-rocm-mi200 / linux-jammy-rocm-py3.10-mi200 / test",
+      "url": "https://github.com/pytorch/pytorch/issues/169966",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/169966",
+      "state": "closed",
+      "author": "jithunnair-amd",
+      "created_at": "2025-12-09T17:35:36Z",
+      "updated_at": "2026-07-21T17:07:11Z",
+      "closed_at": "2026-01-14T22:39:58Z",
+      "labels": [
+        "module: rocm",
+        "module: ci",
+        "module: tests",
+        "triaged",
+        "unstable"
+      ],
+      "comments_count": 2,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "Marking this workflow as unstable since we are observing some failures after [bringing the runners back online](https://github.com/pytorch/pytorch/issues/169851#issuecomment-3633383425): e.g. https://hud.pytorch.org/pytorch/pytorch/commit/8982850fb675087c0fbd3e19af959222febf9339#inductor-rocm-mi200\n\ncc @jeffdaily @sunway513 @pruthvistony @ROCmSupport @jataylo @hongxiayang @naromero77amd @pragupta @jerrymannil @xinyazhang @seemethere @malfet @pytorch/pytorch-dev-infra @mruberry",
+      "comments": [
+        {
+          "author": "pytorch-bot[bot]",
+          "created_at": "2025-12-09T17:35:40Z",
+          "updated_at": "2025-12-09T17:35:40Z",
+          "body": "<!-- validation-comment-start --><body>Hello there! From the UNSTABLE prefix in this issue title, it looks like you are attempting to unstable a job in PyTorch CI. The information I have parsed is below:\n\n* Job name: `inductor-rocm-mi200 / rocm-py3.10-inductor / test`\n* Credential: `jithunnair-amd`\n\nWithin ~15 minutes, `inductor-rocm-mi200 / rocm-py3.10-inductor / test` and all of its dependants will be unstable in PyTorch CI. Please verify that the job name looks correct. With great power comes great responsibility.\n\n</body><!-- validation-comment-end -->",
+          "url": "https://github.com/pytorch/pytorch/issues/169966#issuecomment-3633447084"
+        },
+        {
+          "author": "jithunnair-amd",
+          "created_at": "2026-01-14T22:39:58Z",
+          "updated_at": "2026-01-14T22:39:58Z",
+          "body": "Closing this issue as the workflow has been stable for a while now.",
+          "url": "https://github.com/pytorch/pytorch/issues/169966#issuecomment-3752023146"
+        }
+      ]
+    },
+    {
+      "number": 189804,
+      "title": "Inductor vectorized GELU kernel produces tiny negative value (~-1.65e-7) where eager produces -0.0, causing sign() mismatch",
+      "url": "https://github.com/pytorch/pytorch/issues/189804",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/189804",
+      "state": "closed",
+      "author": "XYZboom",
+      "created_at": "2026-07-14T01:09:14Z",
+      "updated_at": "2026-07-21T16:16:16Z",
+      "closed_at": "2026-07-21T16:16:16Z",
+      "labels": [
+        "triage review",
+        "module: cpu",
+        "module: vectorization",
+        "module: correctness (silent)",
+        "module: edge cases",
+        "oncall: pt2",
+        "module: inductor",
+        "oncall: cpu inductor",
+        "topic: fuzzer",
+        "bot-triaged"
+      ],
+      "comments_count": 2,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "### 🐛 Describe the bug\n\n`torch.compile` with the `inductor` backend produces a numerical discrepancy in `F.gelu(x)` for input values near `x ≈ -5.53`. In eager mode, `F.gelu(-5.53)` produces `-0.0` (negative zero, 0x80000000). In inductor, it produces a tiny negative value (`≈ -1.65e-7`). When followed by `torch.sign()`, this causes `sign(-0.0) = 0` in eager vs `sign(tiny_negative) = -1` in inductor — a difference of 1.0 in the output.\nIn the original fuzzer-generated model, the chain `log2(x) → log2(result) → div → gelu → sign → sigmoid` produces `max_diff=0.23` at output index 13 (shape [23, 64, 62]).\n\n```python\nimport torch\nimport torch.nn.functional as F\n\n# Values from the original computation chain where gelu produces -0.0\nx = torch.tensor([-5.533906936645508, -5.531643390655518], dtype=torch.float32)\n\nclass BugModel(torch.nn.Module):\n    def forward(self, x):\n        return torch.sign(F.gelu(x))\n\nmodel = BugModel()\n\nwith torch.no_grad():\n    ref = model(x)  # eager\n\nwith torch.no_grad():\n    aot_out = torch.compile(model, backend=\"aot_eager\")(x)\n\nwith torch.no_grad():\n    ind_out = torch.compile(model, mode=\"default\")(x)\n\nprint(f\"Input:  {x.tolist()}\")\nprint(f\"Eager:  {ref.tolist()}   (gelu produces -0.0, sign(-0.0)=0)\")\nprint(f\"aot:    {aot_out.tolist()}\")\nprint(f\"Induct: {ind_out.tolist()}   (gelu produces ~-1.65e-7, sign(tiny_neg)=-1)\")\nprint(f\"aot vs ref: same={torch._dynamo.utils.same(ref.double(), aot_out.double())}\")\nprint(f\"ind  vs ref: same={torch._dynamo.utils.same(ref.double(), ind_out.double())}\")\nprint(f\"max_diff (ind vs ref): {(ref.double() - ind_out.double()).abs().max().item():.6f}\")\n\n# Also the full chain from the original source\nprint(\"\\n=== Full chain from original source ===\")\ntorch.manual_seed(42)\nv6 = torch.randn(23, 64, 62, dtype=torch.float32, device=\"cpu\")\n\nclass FullChainModel(torch.nn.Module):\n    def forward(self, x):\n        a = torch.log2(x)\n        b = torch.log2(a)\n        c = torch.div(a, b)\n        d = F.gelu(c)\n        e = torch.sign(d)\n        return torch.sigmoid(e)\n\nfull_model = FullChainModel()\nwith torch.no_grad():\n    full_ref = full_model(v6)\nfull_ind = torch.compile(full_model, mode=\"default\")\nwith torch.no_grad():\n    full_ind_out = full_ind(v6)\n\nprint(f\"Full chain ind vs ref: same={torch._dynamo.utils.same(full_ref.double(), full_ind_out.double())}\")\nprint(f\"max_diff: {(full_ref.double() - full_ind_out.double()).abs().max().item():.6f}\")\n```\ntopic: fuzzer\n\n### Error logs\n\n## Expected behavior\n\n```\nEager:  [0.0, 0.0]   (sign(-0.0) = 0)\naot:    [0.0, 0.0]   (same as eager)\nInduct: [0.0, 0.0]   (should also be 0.0)\n```\n\n## Actual behavior\n\n```\nE0714 09:07:13.167000 640949 site-packages/torch/_dynamo/utils.py:3706] RMSE (res-fp64): 1.00000, (ref-fp64): 0.00000 and shape=torch.Size([2]). res.dtype: torch.float64, multiplier: 3.000000, tol: 0.000100, use_larger_multiplier_for_smaller_tensor: 0\nInput:  [-5.533906936645508, -5.531643390655518]\nEager:  [0.0, 0.0]   (gelu produces -0.0, sign(-0.0)=0)\naot:    [0.0, 0.0]\nInduct: [-1.0, -1.0]   (gelu produces ~-1.65e-7, sign(tiny_neg)=-1)\naot vs ref: same=True\nind  vs ref: same=False\nmax_diff (ind vs ref): 1.000000\n\n=== Full chain from original source ===\nE0714 09:07:13.188000 640949 site-packages/torch/_dynamo/utils.py:3706] RMSE (res-fp64): 0.00153, (ref-fp64): 0.00000 and shape=torch.Size([23, 64, 62]). res.dtype: torch.float64, multiplier: 2.000000, tol: 0.000100, use_larger_multiplier_for_smaller_tensor: 0\nFull chain ind vs ref: same=False\nmax_diff: 0.231059\n\n```\n\n### Versions\n\nCollecting environment information...\nPyTorch version: 2.13.0+cu130\nIs debug build: False\nCUDA used to build PyTorch: 13.0\nROCM used to build PyTorch: N/A\n\nOS: Ubuntu 24.04.4 LTS (x86_64)\nGCC version: (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0\nClang version: 15.0.7\nCMake version: version 3.28.3\nLibc version: glibc-2.39\n\nPython version: 3.11.15 (main, Jun 11 2026, 15:20:16) [GCC 14.3.0] (64-bit runtime)\nPython platform: Linux-6.17.0-35-generic-x86_64-with-glibc2.39\nIs CUDA available: False\nCUDA runtime version: No CUDA\nCUDA_MODULE_LOADING set to: N/A\nGPU models and configuration: No CUDA\nNvidia driver version: No CUDA\ncuDNN version: No CUDA\nIs XPU available: False\nHIP runtime version: N/A\nMIOpen runtime version: N/A\nIs XNNPACK available: False\nCaching allocator config: N/A\n\nCPU:\nArchitecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           48 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  32\nOn-line CPU(s) list:                     0-31\nVendor ID:                               AuthenticAMD\nModel name:                              AMD Ryzen 9 9950X 16-Core Processor\nCPU family:                              26\nModel:                                   68\nThread(s) per core:                      2\nCore(s) per socket:                      16\nSocket(s):                               1\nStepping:                                0\nFrequency boost:                         enabled\nCPU(s) scaling MHz:                      79%\nCPU max MHz:                             5756.4521\nCPU min MHz:                             624.1940\nBogoMIPS:                                8599.99\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good amd_lbr_v2 nopl xtopology nonstop_tsc cpuid extd_apicid aperfmperf rapl pni pclmulqdq monitor ssse3 fma cx16 sse4_1 sse4_2 movbe popcnt aes xsave avx f16c rdrand lahf_lm cmp_legacy svm extapic cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw ibs skinit wdt tce topoext perfctr_core perfctr_nb bpext perfctr_llc mwaitx cpuid_fault cpb cat_l3 cdp_l3 hw_pstate ssbd mba perfmon_v2 ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid cqm rdt_a avx512f avx512dq adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local user_shstk avx_vnni avx512_bf16 clzero irperf xsaveerptr rdpru wbnoinvd cppc arat npt lbrv svm_lock nrip_save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold avic v_vmsave_vmload vgif x2avic v_spec_ctrl vnmi avx512vbmi umip pku ospke avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid bus_lock_detect movdiri movdir64b overflow_recov succor smca fsrm avx512_vp2intersect flush_l1d amd_lbr_pmc_freeze\nVirtualization:                          AMD-V\nL1d cache:                               768 KiB (16 instances)\nL1i cache:                               512 KiB (16 instances)\nL2 cache:                                16 MiB (16 instances)\nL3 cache:                                64 MiB (2 instances)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-31\nVulnerability Gather data sampling:      Not affected\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Mitigation; IBPB on VMEXIT only\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; STIBP always-on; PBRSB-eIBRS Not affected; BHI Not affected\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Mitigation; IBPB on VMEXIT\n\nVersions of relevant libraries:\n[pip3] numpy==2.4.6\n[pip3] nvidia-cublas==13.1.1.3\n[pip3] nvidia-cuda-cupti==13.0.85\n[pip3] nvidia-cuda-nvrtc==13.0.88\n[pip3] nvidia-cuda-runtime==13.0.96\n[pip3] nvidia-cudnn-cu13==9.20.0.48\n[pip3] nvidia-cufft==12.0.0.61\n[pip3] nvidia-curand==10.4.0.35\n[pip3] nvidia-cusolver==12.0.4.66\n[pip3] nvidia-cusparse==12.6.3.3\n[pip3] nvidia-cusparselt-cu13==0.8.1\n[pip3] nvidia-nccl-cu13==2.29.7\n[pip3] nvidia-nvjitlink==13.3.33\n[pip3] nvidia-nvtx==13.0.85\n[pip3] torch==2.13.0\n[pip3] triton==3.7.1\n[conda] numpy                     2.4.6                    pypi_0    pypi\n[conda] nvidia-cublas             13.1.1.3                 pypi_0    pypi\n[conda] nvidia-cuda-cupti         13.0.85                  pypi_0    pypi\n[conda] nvidia-cuda-nvrtc         13.0.88                  pypi_0    pypi\n[conda] nvidia-cuda-runtime       13.0.96                  pypi_0    pypi\n[conda] nvidia-cudnn-cu13         9.20.0.48                pypi_0    pypi\n[conda] nvidia-cufft              12.0.0.61                pypi_0    pypi\n[conda] nvidia-curand             10.4.0.35                pypi_0    pypi\n[conda] nvidia-cusolver           12.0.4.66                pypi_0    pypi\n[conda] nvidia-cusparse           12.6.3.3                 pypi_0    pypi\n[conda] nvidia-cusparselt-cu13    0.8.1                    pypi_0    pypi\n[conda] nvidia-nccl-cu13          2.29.7                   pypi_0    pypi\n[conda] nvidia-nvjitlink          13.3.33                  pypi_0    pypi\n[conda] nvidia-nvtx               13.0.85                  pypi_0    pypi\n[conda] torch                     2.13.0                   pypi_0    pypi\n[conda] triton                    3.7.1                    pypi_0    pypi\n\ncc @jgong5 @mingfeima @XiaobingSuper @sanchitintel @ashokei @jingxu10 @aditew01 @chauhang @penguinwu @voznesenskym @EikanWang @Guobing-Chen @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @aakhundov @coconutruben @jataylo",
+      "comments": [
+        {
+          "author": "frost-intel",
+          "created_at": "2026-07-16T20:23:12Z",
+          "updated_at": "2026-07-16T20:23:12Z",
+          "body": "The root cause here is the vectorized  `erf()` which doesn't numerically match `std::erf`. This particular case is very ill-conditioned input (GELU followed by sign) but it doesn't really represent an accuracy problem. Any attempt to close the gap would likely involve a major slowdown for vectorized code which is a non-starter.  @XYZboom Do you feel differently?\n\n@malfet I think we can close this as not-planned?",
+          "url": "https://github.com/pytorch/pytorch/issues/189804#issuecomment-4996239807"
+        },
+        {
+          "author": "XYZboom",
+          "created_at": "2026-07-17T10:34:00Z",
+          "updated_at": "2026-07-17T10:34:00Z",
+          "body": "@frost-intel Thank you for your reply. I agree with that perspective.",
+          "url": "https://github.com/pytorch/pytorch/issues/189804#issuecomment-5002198979"
+        }
+      ]
+    },
+    {
+      "number": 189270,
+      "title": "[inductor] Emit per-kernel physical op structure (with rematerialization) in provenance",
+      "url": "https://github.com/pytorch/pytorch/issues/189270",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/189270",
+      "state": "open",
+      "author": "Verma-Rajat",
+      "created_at": "2026-07-08T15:13:24Z",
+      "updated_at": "2026-07-21T14:47:56Z",
+      "closed_at": null,
+      "labels": [
+        "triaged",
+        "enhancement",
+        "oncall: pt2",
+        "module: inductor",
+        "module: trace",
+        "bot-triaged"
+      ],
+      "comments_count": 3,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "## Summary\n\n`kernel_information.json` (#160540, extended in #183952) and the profiler-timeline provenance (#186230, #187328) map each generated kernel to a *set* of pre/post-grad node names, stack traces, and now extern I/O shapes. What is still missing is the **physical, per-kernel op structure**: the ordered list of ops that actually execute inside each Triton kernel, including ops that were **rematerialized** (recomputed rather than loaded), with each op's inputs/outputs and buffer roles (`in_ptr` / `out_ptr` / `in_out_ptr`).\n\nToday the only place that structure exists is the generated Triton source. So downstream tools reconstruct it by parsing `inductor_output_code_*.html` (the `# Graph fragment` comments plus the `call()` body) and re-deriving per-kernel op membership with backward-reachability heuristics, because the fragment comment is emitted at the *fusion-group* level and lists more ops than any single kernel runs. That parse is brittle: the comments are formatting aids with no contract, so routine codegen changes break it.\n\nWe would like Inductor to emit this structure directly, as a versioned, opt-in addition to the existing provenance artifact.\n\n## Motivation: three independent consumers, same missing data\n\n1. **Profiler kernel attribution** (the timeline provenance work, #186230 / #187328): to explain where a kernel's runtime went, you need the physical op list including recomputes. A set of post-grad node names does not say which ops actually ran, in what order, or which were recomputed.\n2. **Cross-hardware perf comparison** (#183952): matching kernels and generating repros across backends wants the intra-kernel op sequence and buffer roles, not just extern I/O shapes. #183952's own description notes triton entries already carry shapes via scheduler metadata; this is the next layer down.\n3. **Static perf estimators**: cost models need each kernel's actual op sequence, with rematerialized ops present per kernel, to estimate cycles per hardware unit.\n\nAll three currently either parse generated code or make do with name-level data. One artifact serves all three.\n\n## Feasibility (already prototyped)\n\nA ~40-line `Scheduler.__init__` hook reads, per fused kernel, the leaf `SchedulerNode`s, each node's `_body` `LoopBody` op graph, and its `read_writes`. This recovers the ordered inner ops, buffer roles, and rematerialization with **no parsing of generated code**. Extern ops fall out as `ExternKernelSchedulerNode`s. The op stream is the `V.ops` sequence Inductor already builds during codegen (the same one `OpCounterCSE` / `KernelFormatterHandler` / dtype-propagation consume), so nothing new needs to be computed; it only needs to be serialized.\n\n## Proposal\n\nRecord the `V.ops` / `OpsHandler` stream (equivalently, walk each `LoopBody`) during kernel codegen, and capture per kernel:\n\n- ordered inner ops (`target` + a `rematerialized: bool` flag),\n- per-op / per-kernel input/output buffers and their role (`in_ptr` / `out_ptr` / `in_out_ptr`),\n- buffer shapes / strides / dtypes (reuse the scheduler metadata #183952 surfaces),\n- extern call-sites (mm / bmm / sdpa / ...) as first-class nodes with their input bindings.\n\nEmit it as a new `kernels` block in `kernel_information.json`, bump the node-mapping version, and gate it behind the existing `provenance_tracking_level` (opt-in, off by default, or a dedicated flag in the style of `TORCH_COMPILE_DEBUG_FUSION`). Keep it backend-agnostic: no hardware cost model, no consumer schema. Downstream tools layer their own semantics on top.\n\n### Rough shape (from a real capture)\n\nCaptured from a small RMSNorm+RoPE module via the hook above (Triton codegen path). The fused rotary kernel `op4` (q and k rotary fused into one kernel), ops in execution order:\n\n```\nload load cos* mul check_bounds load load sin* mul add\nload load cos* mul check_bounds load load sin* mul add add store\n```\n\n`*` marks rematerialization: `cos` and `sin` are each recomputed once for q and once for k rather than stored and reloaded. Serialized (memory/index ops elided for brevity):\n\n```jsonc\n\"op4\": {\n  \"type\": \"SchedulerNode\",\n  \"in_ptr\": [\"arg4_1\", \"buf2\", \"buf3\"], \"out_ptr\": [\"buf4\"],\n  \"ops\": [\n    {\"order\": 2,  \"target\": \"cos\", \"rematerialized\": true},\n    {\"order\": 7,  \"target\": \"sin\", \"rematerialized\": true},\n    {\"order\": 12, \"target\": \"cos\", \"rematerialized\": true},\n    {\"order\": 17, \"target\": \"sin\", \"rematerialized\": true}\n  ]\n}\n```\n\nThe two projection matmuls appear as standalone `ExternKernelSchedulerNode`s (`op2`, `op3`), i.e. the barrier isolation a perf consumer needs comes for free.\n\n## Scope\n\n- **In:** physical op capture + serialization, versioning, tlparse awareness.\n- **Out:** hardware cost taxonomy, scheduling semantics, consumer-specific schemas. Those stay downstream.\n\n## Open questions\n\n- Best interception point for faithful remat capture: an `OpsHandler` recorder vs. walking `LoopBody` at scheduling, given inlining happens during SIMD/Triton loop codegen.\n- Op granularity: raw `ops.*` (load/store/mul) vs. mapped back to ATen-node names. Which is more useful to consumers?\n- Dynamic shapes: emit symbolic expressions as-is, or require specialization?\n- Overhead: acceptable under `provenance_tracking_level >= N`, or a separate opt-in flag?\n\ncc @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @aakhundov @coconutruben @jataylo @yushangdi @desertfire @jansel (Inductor provenance / codegen) · @PannenetsF (profiler timeline provenance) · @rahul342 @skarjala (kernel_information.json consumers)\n",
+      "comments": [
+        {
+          "author": "Verma-Rajat",
+          "created_at": "2026-07-09T06:05:41Z",
+          "updated_at": "2026-07-09T06:05:41Z",
+          "body": "Follow-up: I validated that the captured structure is backend-independent, since that matters for whether the artifact can be produced and tested without a specific accelerator.\n\nI ran the same RMSNorm+RoPE module two ways:\n- Real Intel Arc B580 GPU, torch 2.12.1+xpu (XPU/Triton codegen).\n- Open-source CPU path, torch 2.11.0+cpu, via `torch._inductor.config.cpu_backend = \"triton\"`.\n\nThe two captures came out byte-for-byte identical: same fusion boundaries (4 scheduler nodes), same ordered inner-op streams, same buffer roles (`in_ptr`/`out_ptr`), the two projection matmuls isolated as standalone `ExternKernelSchedulerNode`s, and the same `cos`/`sin` rematerialization flags on the fused rotary kernel. That held across the two different torch versions and the two backends.\n\nTakeaway: the physical op structure the proposal wants to emit reflects backend-agnostic Inductor scheduling decisions, so it can be captured and unit-tested on the CPU Triton path with no GPU in CI, and a GPU run reproduces the same structure. Happy to share the ~40-line `Scheduler.__init__` capture hook and both sample JSONs if useful.\n",
+          "url": "https://github.com/pytorch/pytorch/issues/189270#issuecomment-4922058317"
+        },
+        {
+          "author": "Verma-Rajat",
+          "created_at": "2026-07-20T10:51:32Z",
+          "updated_at": "2026-07-20T10:51:32Z",
+          "body": "Opened #190535 implementing this: emits a per-kernel Triton Kernel Trace (ordered inner ops + cross-kernel rematerialization + buffer roles) as a trace_structured artifact / AOTI file, plus a profiler timeline enrichment that attaches the inner-op summary to kernel events. Validated on real CUDA (RTX 2070) and Intel XPU (B580) with byte-identical captured structure across both.",
+          "url": "https://github.com/pytorch/pytorch/issues/189270#issuecomment-5021426773"
+        },
+        {
+          "author": "Verma-Rajat",
+          "created_at": "2026-07-21T14:47:56Z",
+          "updated_at": "2026-07-21T14:47:56Z",
+          "body": "cc @albanD ",
+          "url": "https://github.com/pytorch/pytorch/issues/189270#issuecomment-5035484476"
+        }
+      ]
+    },
+    {
+      "number": 164124,
+      "title": "torch.compile compiles multiple Triton autotune kernels, but uses the wrong ones",
+      "url": "https://github.com/pytorch/pytorch/issues/164124",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/164124",
+      "state": "open",
+      "author": "dxqb",
+      "created_at": "2025-09-29T10:19:35Z",
+      "updated_at": "2026-07-21T13:50:42Z",
+      "closed_at": null,
+      "labels": [
+        "triaged",
+        "oncall: pt2",
+        "module: dynamic shapes",
+        "module: user triton"
+      ],
+      "comments_count": 8,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "### 🐛 Describe the bug\n\nWhen torch.compile autotunes a Triton kernel multiple times for different shapes, it uses the wrong kernel afterwards. Interestingly, this only happens when no torchinductor-cache files exist. On next run of the same program, it uses the correct kernels!\n\nHere are the details:\n\nI have adapted your example under \"Advanced Usage\" here, which explains how to use autotune with torch.compile:\nhttps://docs.pytorch.org/tutorials/recipes/torch_compile_user_defined_triton_kernel_tutorial.html\n\nHere is the test case:\n\n[test.py](https://github.com/user-attachments/files/22595171/test.py)\n\nChanges:\n - I have added a time waster to the kernel, that clearly shows autotune which configuration is the inefficient one\n - made the shape of `x` a key for autotuning. The use case for this in reality is using large block sizes for large tensors\n - Call the kernel with different shapes and let it tune\n - Call it normally - it uses the wrong kernel\n\nIt appears that it *has* compiled 2 separate kernels for the 2 shapes, but it consistently uses the wrong one for *both* shapes, as if it intentionally tried to use the wrong one.\nBut only until you run the program a second time. When it reads the kernels from the torchinductor cache, it uses the correct kernels!\n\n\n### Error logs\n\n- Without torch.compile:\n\n```\nTRITON_PRINT_AUTOTUNING=1 TORCH_COMPILE_DISABLE=1 python test.py\n[...]\nbest config selected: BLOCK_SIZE: 2, num_warps: 4, num_ctas: 1, num_stages: 4, maxnreg: None;\n[...]\nbest config selected: BLOCK_SIZE: 4, num_warps: 8, num_ctas: 1, num_stages: 3, maxnreg: None;\n```\nBest config for both shapes is selected, no errors.\n\n\n\n- With torch.compile **the first time**: [make sure your torchinductor cache is deleted]\n\n```\nTORCH_COMPILE_DISABLE= python test.py\npid (2, 0, 0) idx () --- BADLY TUNED KERNEL ---: 2\n```\n\n- With torch.compile, ran **a second time**, with existing torchinductor cache:\n\n```\nTORCH_COMPILE_DISABLE= python test.py\n```\n\nNo errors. It uses the correct kernels.\n\n### Versions\n\n```\nPyTorch version: 2.8.0+cu128\nIs debug build: False\nCUDA used to build PyTorch: 12.8\nROCM used to build PyTorch: N/A\n\nOS: Ubuntu 24.04.3 LTS (x86_64)\nGCC version: (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0\nClang version: Could not collect\nCMake version: version 3.28.3\nLibc version: glibc-2.39\n\nPython version: 3.12.3 (main, Aug 14 2025, 17:47:21) [GCC 13.3.0] (64-bit runtime)\nPython platform: Linux-6.8.0-36-generic-x86_64-with-glibc2.39\nIs CUDA available: True\nCUDA runtime version: Could not collect\nCUDA_MODULE_LOADING set to: LAZY\nGPU models and configuration: GPU 0: NVIDIA GeForce RTX 4070 Ti SUPER\nNvidia driver version: 580.82.07\ncuDNN version: Could not collect\nIs XPU available: False\nHIP runtime version: N/A\nMIOpen runtime version: N/A\nIs XNNPACK available: True\n\nCPU:\nArchitecture:                         x86_64\nCPU op-mode(s):                       32-bit, 64-bit\nAddress sizes:                        39 bits physical, 48 bits virtual\nByte Order:                           Little Endian\nCPU(s):                               12\nOn-line CPU(s) list:                  0-11\nVendor ID:                            GenuineIntel\nModel name:                           12th Gen Intel(R) Core(TM) i5-12400F\nCPU family:                           6\nModel:                                151\nThread(s) per core:                   2\nCore(s) per socket:                   6\nSocket(s):                            1\nStepping:                             5\nCPU(s) scaling MHz:                   54%\nCPU max MHz:                          4400.0000\nCPU min MHz:                          800.0000\nBogoMIPS:                             4992.00\nFlags:                                fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx est tm2 ssse3 sdbg fma cx16 xtpr pdcm sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nVirtualization:                       VT-x\nL1d cache:                            288 KiB (6 instances)\nL1i cache:                            192 KiB (6 instances)\nL2 cache:                             7.5 MiB (6 instances)\nL3 cache:                             18 MiB (1 instance)\nNUMA node(s):                         1\nNUMA node0 CPU(s):                    0-11\nVulnerability Gather data sampling:   Not affected\nVulnerability Itlb multihit:          Not affected\nVulnerability L1tf:                   Not affected\nVulnerability Mds:                    Not affected\nVulnerability Meltdown:               Not affected\nVulnerability Mmio stale data:        Not affected\nVulnerability Reg file data sampling: Not affected\nVulnerability Retbleed:               Not affected\nVulnerability Spec rstack overflow:   Not affected\nVulnerability Spec store bypass:      Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:             Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:             Mitigation; Enhanced / Automatic IBRS; IBPB conditional; RSB filling; PBRSB-eIBRS SW sequence; BHI BHI_DIS_S\nVulnerability Srbds:                  Not affected\nVulnerability Tsx async abort:        Not affected\n\nVersions of relevant libraries:\n[pip3] lion-pytorch==0.2.3\n[pip3] numpy==2.2.6\n[pip3] nunchaku==1.0.0+torch2.8\n[pip3] nvidia-cublas-cu12==12.8.4.1\n[pip3] nvidia-cuda-cupti-cu12==12.8.90\n[pip3] nvidia-cuda-nvrtc-cu12==12.8.93\n[pip3] nvidia-cuda-runtime-cu12==12.8.90\n[pip3] nvidia-cudnn-cu12==9.10.2.21\n[pip3] nvidia-cufft-cu12==11.3.3.83\n[pip3] nvidia-curand-cu12==10.3.9.90\n[pip3] nvidia-cusolver-cu12==11.7.3.90\n[pip3] nvidia-cusparse-cu12==12.5.8.93\n[pip3] nvidia-cusparselt-cu12==0.7.1\n[pip3] nvidia-nccl-cu12==2.27.3\n[pip3] nvidia-nvjitlink-cu12==12.8.93\n[pip3] nvidia-nvtx-cu12==12.8.90\n[pip3] onnxruntime==1.22.1\n[pip3] onnxruntime-gpu==1.22.0\n[pip3] open_clip_torch==2.32.0\n[pip3] pytorch-lightning==2.5.1.post0\n[pip3] pytorch_optimizer==3.6.0\n[pip3] torch==2.8.0+cu128\n[pip3] torchao==0.13.0\n[pip3] torchaudio==2.7.1+cu128\n[pip3] torchmetrics==1.8.2\n[pip3] torchvision==0.23.0+cu128\n[pip3] triton==3.4.0\n[pip3] triton_dejavu==0.7.5\n[conda] Could not collect\n```\n\ncc @chauhang @penguinwu @ezyang @bobrenjc93 @oulgen @aakhundov @davidberard98 @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @chenyang78 @kadeng @muchulee8 @amjames @coconutruben",
+      "comments": [
+        {
+          "author": "dxqb",
+          "created_at": "2025-09-29T10:45:21Z",
+          "updated_at": "2025-09-29T10:48:13Z",
+          "body": "Note: the observation that everything works on second run, seems to be an artifact of this test case. In my real use case, this doesn't solve the issue.\n\nWithout and with torch.compile:\n\n<img width=\"300\" height=\"40\" alt=\"Image\" src=\"https://github.com/user-attachments/assets/da942417-525b-454c-bd22-30321b2fbbaf\" />",
+          "url": "https://github.com/pytorch/pytorch/issues/164124#issuecomment-3346267088"
+        },
+        {
+          "author": "ezyang",
+          "created_at": "2025-09-29T16:41:43Z",
+          "updated_at": "2025-09-29T16:41:43Z",
+          "body": "Sorry, so is your test case invalid? If you are willing to share the tlparse for the full case, that would be helpful (but this will leak model arch information). Another thing is that if you don't want the kernel to be compiled with dynamic shapes, you need to mark_static it.",
+          "url": "https://github.com/pytorch/pytorch/issues/164124#issuecomment-3348004768"
+        },
+        {
+          "author": "dxqb",
+          "created_at": "2025-09-29T16:50:17Z",
+          "updated_at": "2025-09-29T16:50:17Z",
+          "body": "The test case is not invalid. It still shows the issue. Only the part where the test case doesn't have the issue on 2nd run doesn't match my real case, but you can still use this test case to see the issue on 1st run without cache.\nThe model I am using is public that's not a problem, but I prepared this testcase to make it easier to find the problem.\n\nI do want the kernel to be compiled multiple times for different shapes - and it does. But it uses the wrong ones. Not the best one found during autotune.\n\n\n",
+          "url": "https://github.com/pytorch/pytorch/issues/164124#issuecomment-3348042142"
+        },
+        {
+          "author": "dxqb",
+          "created_at": "2026-07-11T16:50:21Z",
+          "updated_at": "2026-07-11T16:50:21Z",
+          "body": "better repro code https://github.com/user-attachments/files/29927799/repro_164124.py",
+          "url": "https://github.com/pytorch/pytorch/issues/164124#issuecomment-4947850555"
+        },
+        {
+          "author": "ezyang",
+          "created_at": "2026-07-14T03:39:18Z",
+          "updated_at": "2026-07-14T03:39:18Z",
+          "body": "doesn't load",
+          "url": "https://github.com/pytorch/pytorch/issues/164124#issuecomment-4965165527"
+        },
+        {
+          "author": "dxqb",
+          "created_at": "2026-07-15T18:03:00Z",
+          "updated_at": "2026-07-15T18:03:00Z",
+          "body": "> doesn't load\n\nthe repro code? just re-tested, works. must be your env",
+          "url": "https://github.com/pytorch/pytorch/issues/164124#issuecomment-4983784083"
+        },
+        {
+          "author": "dxqb",
+          "created_at": "2026-07-18T08:38:26Z",
+          "updated_at": "2026-07-18T08:38:26Z",
+          "body": "making the kernel function a custom op seems to be a simple workaround for this issue, because triton is autotuning the kernel then: https://github.com/Nerogar/OneTrainer/pull/1626\nI haven't found a downside to this yet: Makes it opaque to torch.compile, but compile doesn't fuse with triton kernels anyway.",
+          "url": "https://github.com/pytorch/pytorch/issues/164124#issuecomment-5010613405"
+        },
+        {
+          "author": "ezyang",
+          "created_at": "2026-07-21T13:50:42Z",
+          "updated_at": "2026-07-21T13:50:42Z",
+          "body": "the url doesn't have any contents, I don't see anything there",
+          "url": "https://github.com/pytorch/pytorch/issues/164124#issuecomment-5034869569"
+        }
+      ]
+    },
+    {
+      "number": 190659,
+      "title": "Order and arguments of `@staticmethod` and `torch.compile()` decorators produces different results",
+      "url": "https://github.com/pytorch/pytorch/issues/190659",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/190659",
+      "state": "open",
+      "author": "I-Absolutely-Am-Not-A-Robot",
+      "created_at": "2026-07-21T11:38:12Z",
+      "updated_at": "2026-07-21T13:14:36Z",
+      "closed_at": null,
+      "labels": [
+        "triaged",
+        "oncall: pt2",
+        "module: dynamo",
+        "bot-triaged"
+      ],
+      "comments_count": 1,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "### 🐛 Describe the bug\n\nUsing the following base code :\n\n```py3\nclass Foo(L.LightningModule):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, x):\n        foo = Foo.foo(x)\n        bar = Foo.bar(x)\n\n        foobar = foo + bar\n        return foobar\n\n    def bar(x):\n        return x\n \n    def foo(x):\n        return x\n    \nfoo = Foo()\nbar = foo(torch.Tensor([0]))\n\nprint(bar)\n```\n\nThe following changes to function `bar` work :\n```py3\n    # OK\n    @staticmethod\n    @torch.compile()\n    def bar(x):\n        return x\n\n    # OK\n    @torch.compile()\n    @staticmethod\n    def bar(x):\n        return x\n```\n```\nOutput: tensor([0.])\n```\nBut this one raises an error :\n```py3\n    # Not OK\n    @torch.compile(fullgraph=True, dynamic=False)\n    @staticmethod\n    def bar(x):\n        return x\n```\n```\nOutput: torch._dynamo.exc.Unsupported: Unsupported method call...\n```\n\n### Error logs\n\n[tl_out.zip](https://github.com/user-attachments/files/30225352/tl_out.zip)\n\n<details>\n<summary>Anonymized log output</summary>\n\n```\nTraceback (most recent call last):\n  File \"/home/.../main.py\", line 44, in <module>\n    bar = foo(torch.Tensor([0]))\n  File \"/home/.../.venv/lib/python3.14/site-packages/torch/nn/modules/module.py\", line 1779, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\n  File \"/home/.../.venv/lib/python3.14/site-packages/torch/nn/modules/module.py\", line 1790, in _call_impl\n    return forward_call(*args, **kwargs)\n  File \"/home/.../main.py\", line 11, in forward\n    bar = Foo.bar(x)\n  File \"/home/.../.venv/lib/python3.14/site-packages/torch/_dynamo/eval_frame.py\", line 1034, in compile_wrapper\n    raise e.with_traceback(None) from e.__cause__  # User compiler error\n    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\ntorch._dynamo.exc.Unsupported: Unsupported method call\n  Explanation: Dynamo does not know how to trace method `__call__` of class `staticmethod`\n  Hint: Avoid calling `staticmethod.__call__` in your code.\n  Hint: Please report an issue to PyTorch.\n\n  Developer debug context: call_method UserDefinedObjectVariable(staticmethod) __call__ [LazyVariableTracker(unrealized: <class 'torch.Tensor'>)] {}\n\n For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0156.html\n\nfrom user code:\n   File \"/home/   /.venv/lib/python3.14/site-packages/torch/_dynamo/external_utils.py\", line 69, in inner\n    return fn(*args, **kwargs)\n\nSet TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS=\"+dynamo\"\n```\n</details>\n\n### Versions\n\n```\nPyTorch version: 2.11.0+cu128\nIs debug build: False\nCUDA used to build PyTorch: 12.8\nROCM used to build PyTorch: N/A\n\nOS: Ubuntu 24.04.4 LTS (x86_64)\nGCC version: (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0\nClang version: Could not collect\nCMake version: version 3.28.3\nLibc version: glibc-2.39\n\nPython version: 3.14.3 (main, Mar 24 2026, 22:50:36) [Clang 22.1.1 ] (64-bit runtime)\nPython platform: Linux-6.17.0-40-generic-x86_64-with-glibc2.39\nIs CUDA available: True\nCUDA runtime version: 12.0.140\nCUDA_MODULE_LOADING set to:\nGPU models and configuration:\nGPU 0: NVIDIA GeForce RTX 3080 Ti\nGPU 1: NVIDIA T400 4GB\n\nNvidia driver version: 580.159.03\ncuDNN version: Could not collect\nIs XPU available: False\nHIP runtime version: N/A\nMIOpen runtime version: N/A\nIs XNNPACK available: True\nCaching allocator config: N/A\n\nCPU:\nArchitecture :                            x86_64\nMode(s) opératoire(s) des processeurs :   32-bit, 64-bit\nTailles des adresses:                     46 bits physical, 48 bits virtual\nBoutisme :                                Little Endian\nProcesseur(s) :                           20\nListe de processeur(s) en ligne :         0-19\nIdentifiant constructeur :                GenuineIntel\nNom de modèle :                           Intel(R) Xeon(R) W-2255 CPU @ 3.70GHz\nFamille de processeur :                   6\nModèle :                                  85\nThread(s) par cœur :                      2\nCœur(s) par socket :                      10\nSocket(s) :                               1\nRévision :                                7\nmultiplication des MHz du/des CPU(s) :    29%\nVitesse maximale du processeur en MHz :   4700,0000\nVitesse minimale du processeur en MHz :   1200,0000\nBogoMIPS :                                7399,70\nDrapeaux :                                fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid dca sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb cat_l3 cdp_l3 intel_ppin ssbd mba ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid cqm mpx rdt_a avx512f avx512dq rdseed adx smap clflushopt clwb intel_pt avx512cd avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local dtherm ida arat pln pts hwp hwp_act_window hwp_epp hwp_pkg_req vnmi avx512_vnni md_clear flush_l1d arch_capabilities\nVirtualisation :                          VT-x\nCache L1d :                               320 KiB (10 instances)\nCache L1i :                               320 KiB (10 instances)\nCache L2 :                                10 MiB (10 instances)\nCache L3 :                                19,3 MiB (1 instance)\nNœud(s) NUMA :                            1\nNœud NUMA 0 de processeur(s) :            0-19\nVulnérabilité Gather data sampling :      Vulnerable\nVulnérabilité Ghostwrite :                Not affected\nVulnérabilité Indirect target selection : Mitigation; Aligned branch/return thunks\nVulnérabilité Itlb multihit :             KVM: Mitigation: Split huge pages\nVulnérabilité L1tf :                      Not affected\nVulnérabilité Mds :                       Not affected\nVulnérabilité Meltdown :                  Not affected\nVulnérabilité Mmio stale data :           Mitigation; Clear CPU buffers; SMT vulnerable\nVulnérabilité Old microcode :             Not affected\nVulnérabilité Reg file data sampling :    Not affected\nVulnérabilité Retbleed :                  Mitigation; Enhanced IBRS\nVulnérabilité Spec rstack overflow :      Not affected\nVulnérabilité Spec store bypass :         Mitigation; Speculative Store Bypass disabled via prctl\nVulnérabilité Spectre v1 :                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnérabilité Spectre v2 :                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI SW loop, KVM SW loop\nVulnérabilité Srbds :                     Not affected\nVulnérabilité Tsa :                       Not affected\nVulnérabilité Tsx async abort :           Mitigation; TSX disabled\nVulnérabilité Vmscape :                   Mitigation; IBPB before exit to userspace\n\nVersions of relevant libraries:\n[pip3] Could not collect\n[conda] Could not collect\n```\n\ncc @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @kadeng @amjames @jataylo @azahed98",
+      "comments": [
+        {
+          "author": "HussainNizamani",
+          "created_at": "2026-07-21T13:14:36Z",
+          "updated_at": "2026-07-21T13:14:36Z",
+          "body": "I can reproduce this. I’d like to work on a fix, the problem looks like `_TorchDynamoContext.__call__` has no special case for static method objects, so `fullgraph=True` turns the silent graph break into a hard error. Working on a patch with tests.",
+          "url": "https://github.com/pytorch/pytorch/issues/190659#issuecomment-5034502343"
+        }
+      ]
+    },
+    {
+      "number": 190664,
+      "title": "DISABLED test_dynamic_shape_backend_inductor_device_cpu (__main__.TestPackage)",
+      "url": "https://github.com/pytorch/pytorch/issues/190664",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/190664",
+      "state": "open",
+      "author": "pytorch-bot[bot]",
+      "created_at": "2026-07-21T13:09:15Z",
+      "updated_at": "2026-07-21T13:09:19Z",
+      "closed_at": null,
+      "labels": [
+        "triaged",
+        "module: flaky-tests",
+        "skipped",
+        "oncall: pt2",
+        "module: dynamo"
+      ],
+      "comments_count": 1,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "Platforms: linux\n\n  This test was disabled because it is failing in CI. See [recent examples](https://hud.pytorch.org/flakytest?name=test_dynamic_shape_backend_inductor_device_cpu&suite=TestPackage&limit=100) and the most recent trunk [workflow logs](https://github.com/pytorch/pytorch/runs/88611435309).\n\n  Over the past 6 hours, it has been determined flaky in 4 workflow(s) with 4 failures and 4 successes.\n\n  **Debugging instructions (after clicking on the recent samples link):**\n  DO NOT ASSUME THINGS ARE OKAY IF THE CI IS GREEN. We now shield flaky tests from developers so CI will thus be green but it will be harder to parse the logs.\n  To find relevant log snippets:\n  1. Click on the workflow logs linked above\n  2. Click on the Test step of the job so that it is expanded. Otherwise, the grepping will not work.\n  3. Grep for `test_dynamic_shape_backend_inductor_device_cpu`\n  4. There should be several instances run (as flaky tests are rerun in CI) from which you can study the logs.\n  \n  \n\n<details><summary>Sample error message</summary>\n\n```\nTraceback (most recent call last):\n  File \"/__w/pytorch/pytorch/test/dynamo/test_package.py\", line 300, in test_dynamic_shape\n    self.assertEqual(expected1, compiled_fn(*args1))\n                                ~~~~~~~~~~~^^^^^^^^\n  File \"/opt/python-3.14-venv/lib/python3.14t/site-packages/torch/_dynamo/eval_frame.py\", line 1188, in compile_wrapper\n    result = fn(*args, **kwargs)\n  File \"/__w/pytorch/pytorch/test/dynamo/test_package.py\", line 268, in fn\n    def fn(x):\nNameError: name '__compiled_fn_44_37581e4d_bcd6_4356_a232_b97066e6a599' is not defined\n\nTo execute this test, run the following from the base repo dir:\n    python test/dynamo/test_package.py TestPackage.test_dynamic_shape_backend_inductor_device_cpu\n\nThis message can be suppressed by setting PYTORCH_PRINT_REPRO_ON_FAILURE=0\n```\n\n</details>\n\n\n  Test file path: `dynamo/test_package.py`\n\n  For all disabled tests (by GitHub issue), see https://hud.pytorch.org/disabled.\n\ncc @voznesenskym @penguinwu @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @kadeng @chauhang @amjames @jataylo @azahed98",
+      "comments": [
+        {
+          "author": "pytorch-bot[bot]",
+          "created_at": "2026-07-21T13:09:18Z",
+          "updated_at": "2026-07-21T13:09:18Z",
+          "body": "<!-- validation-comment-start --><body>Hello there! From the DISABLED prefix in this issue title, it looks like you are attempting to disable a test in PyTorch CI. The information I have parsed is below:\n\n* Test name: `test_dynamic_shape_backend_inductor_device_cpu (__main__.TestPackage)`\n* Platforms for which to skip the test: linux\n* Disabled by `pytorch-bot[bot]`\n\nWithin ~15 minutes, `test_dynamic_shape_backend_inductor_device_cpu (__main__.TestPackage)` will be disabled in PyTorch CI for these platforms: linux. Please verify that your test name looks correct, e.g., `test_cuda_assert_async (__main__.TestCuda)`.\n\nTo modify the platforms list, please include a line in the issue body, like below. The default action will disable the test for all platforms if no platforms list is specified. \n```\nPlatforms: case-insensitive, list, of, platforms\n```\nWe currently support the following platforms: asan, dynamo, inductor, linux, mac, macos, rocm, slow, win, windows, xpu.\n\n\n### How to re-enable a test\nTo re-enable the test globally, close the issue. To re-enable a test for only a subset of platforms, remove the platforms from the list in the issue body. This may take some time to propagate. To re-enable a test only for a PR, put `Fixes #190664` in the PR body and rerun the test jobs. Note that if a test is flaky, it maybe be difficult to tell if the test is still flaky on the PR.\n</body><!-- validation-comment-end -->",
+          "url": "https://github.com/pytorch/pytorch/issues/190664#issuecomment-5034449833"
+        }
+      ]
+    },
+    {
+      "number": 178883,
+      "title": "`torch.compile` produces different output for model with `amax`/`amin` + partial reuse reduction pattern",
+      "url": "https://github.com/pytorch/pytorch/issues/178883",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/178883",
+      "state": "open",
+      "author": "prorrice",
+      "created_at": "2026-03-31T15:12:34Z",
+      "updated_at": "2026-07-21T09:53:08Z",
+      "closed_at": null,
+      "labels": [
+        "module: cuda",
+        "triaged",
+        "module: correctness (silent)",
+        "module: decompositions",
+        "module: aotdispatch",
+        "module: pt2-dispatcher"
+      ],
+      "comments_count": 2,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "### 🐛 Describe the bug\n\n\n`torch.compile` with `inductor` backend produces significantly different results (max_diff ≈ 896.0) for a model that performs multiple reduction operations (`torch.amax`, `torch.amin`, `torch.min`) on the same feature tensor, then combines them via normalization and centering arithmetic. The pattern targets Inductor's `reuse_partial` optimization, which attempts to reuse partial reduction results.\n\nThe maximum absolute difference observed was **896.0**, indicating a critical numerical divergence — not mere floating-point precision drift.\n\n### Minimal reproducer\n\n```python\nimport os\nos.environ[\"TRITON_BACKENDS_IN_TREE\"] = \"1\"\n\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nclass MultiReductionModel(nn.Module):\n    def __init__(self, in_channels=3, hidden_dim=64):\n        super().__init__()\n        self.conv1 = nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1)\n        self.conv2 = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1)\n        self.bn1 = nn.BatchNorm2d(hidden_dim)\n        self.relu = nn.ReLU()\n        self.conv3 = nn.Conv2d(hidden_dim, hidden_dim // 2, kernel_size=1)\n        self.bn2 = nn.BatchNorm2d(hidden_dim // 2)\n\n    def forward(self, x):\n        x = self.conv1(x)\n        x = self.bn1(x)\n        x = self.relu(x)\n        x = self.conv2(x)\n        features = self.relu(x)\n\n        # Multiple reductions on the SAME tensor\n        dim_amax = torch.amax(features, dim=[2, 3], keepdim=True)\n        global_amax = torch.amax(features)\n        dim_amin = torch.amin(features, dim=[1], keepdim=True)\n        global_amin = torch.min(features)\n\n        # Combine\n        amax_normalized = features / (dim_amax + 1e-8)\n        amax_scaled = amax_normalized * global_amax\n        amin_centered = features - dim_amin\n        amin_scaled = amin_centered / (torch.abs(global_amin) + 1e-8)\n        combined = amax_scaled + amin_scaled\n\n        output = self.conv3(combined)\n        output = self.bn2(output)\n        output = self.relu(output)\n        return output\n\n\ndevice = \"cuda\"\ntorch.manual_seed(42)\nmodel = MultiReductionModel().to(device).eval()\nx = torch.randn(2, 3, 32, 32, device=device)\n\nwith torch.no_grad():\n    eager_out = model(x)\n\ntorch._dynamo.reset()\ncompiled = torch.compile(model, backend=\"inductor\")\nwith torch.no_grad():\n    comp_out = compiled(x)\n\ndiff = (eager_out.float() - comp_out.float()).abs().max().item()\nprint(f\"Max diff: {diff}\")\nprint(f\"Match: {torch.allclose(eager_out, comp_out, atol=1e-5, rtol=1e-4)}\")\n# Expected: max_diff ≈ 896.0 — very large mismatch\n```\n\n### Behavior summary\n\n| Mode | Output | Max Diff |\n|------|--------|----------|\n| Eager | Reference | — |\n| `torch.compile` | Differs | ≈ 896.0 |\n\n### Root cause hypothesis\n\nInductor's `reuse_partial` optimization attempts to combine multiple reduction operations (`amax` dim=[2,3] + `amax` global, `amin` dim=[1] + `min` global) on the same tensor into shared partial computations. The optimization incorrectly carries forward an intermediate reduction result, causing the arithmetic `features / (dim_amax + 1e-8) * global_amax` to produce wildly different values. The magnitude of the difference (896.0) indicates an algorithmic error — not floating-point precision issue.\n\n\n### Error logs\n\n\nNo error — outputs silently differ with max_diff ≈ 896.0.\n\n\n### Versions\n\n\n```\nPyTorch version: 2.12.0.dev20260327+cu126\nCUDA used to build PyTorch: 12.6\nOS: Ubuntu 22.04.5 LTS (x86_64) — WSL2\nPython version: 3.10.12\nGPU: NVIDIA GeForce RTX 3060 Laptop GPU\n```\n\ncc @ezyang @gchanan @kadeng @msaroufim @ptrblck @eqy @jerryzh168 @tinglvv @nWEIdia @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @muchulee8 @amjames @aakhundov @coconutruben @jataylo @bdhirsh @bobrenjc93 @aorenste",
+      "comments": [
+        {
+          "author": "prorrice",
+          "created_at": "2026-03-31T15:15:56Z",
+          "updated_at": "2026-03-31T15:15:56Z",
+          "body": "@pytorchbot label \"topic: fuzzer\"",
+          "url": "https://github.com/pytorch/pytorch/issues/178883#issuecomment-4163421307"
+        },
+        {
+          "author": "eellison",
+          "created_at": "2026-04-03T20:34:38Z",
+          "updated_at": "2026-04-03T20:34:38Z",
+          "body": "fails with aot_eager_decomp_partition.",
+          "url": "https://github.com/pytorch/pytorch/issues/178883#issuecomment-4185100292"
+        }
+      ]
+    },
+    {
+      "number": 188336,
+      "title": "AArch64 CPU - Inductor benchmark Regressions",
+      "url": "https://github.com/pytorch/pytorch/issues/188336",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/188336",
+      "state": "open",
+      "author": "aditew01",
+      "created_at": "2026-06-27T14:51:26Z",
+      "updated_at": "2026-07-21T09:19:58Z",
+      "closed_at": null,
+      "labels": [
+        "module: performance",
+        "module: ci",
+        "triaged",
+        "module: regression",
+        "module: arm",
+        "oncall: pt2",
+        "oncall: cpu inductor",
+        "arm priority"
+      ],
+      "comments_count": 5,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "Regression noticed on upstream Compiler Inductor benchmarks after migration to OSDC (ARC) arm64 runners in this PR: https://github.com/pytorch/pytorch/pull/187994  (specifially with the Abs Execution Time field)\nThe overall speedup from the benchmark suite is constant, it mighe be it sees similar slowdown in the Eager path. \nTested this behaviour on commit before and after this PR: \n\n<img width=\"1205\" height=\"316\" alt=\"Image\" src=\"https://github.com/user-attachments/assets/d7196e6c-c865-4cfe-8d36-56aa4a8fb87b\" />\n\nRef: [hud.pytorch.org/benchmark/v3/dashboard/ pre-vs-post-migration-stats](https://hud.pytorch.org/benchmark/v3/dashboard/compiler_inductor?renderGroupId=main&time.start=2026-06-20T00%3A00%3A00.000Z&time.end=2026-06-27T23%3A59%3A59.999Z&filters.repo=pytorch%2Fpytorch&filters.benchmarkName=compiler&filters.mode=inference&filters.dtype=bfloat16&filters.deviceName=cpu+%28aarch64%29&filters.device=cpu&filters.arch=aarch64&filters.suite=all&filters.compiler=default&lbranch=adi%2Ftest_pre_migration&rbranch=adi%2Ftest_migration&rcommit.commit=4f07c525fd9939c71f54d62949060bfac20655bc&rcommit.workflow_id=28288392200&rcommit.date=2026-06-27T12%3A00%3A00Z&rcommit.branch=adi%2Ftest_migration&lcommit.commit=a4a6c8b7bd792a90fcfaafccbdbbda711cf143e5&lcommit.workflow_id=28288399484&lcommit.date=2026-06-27T12%3A00%3A00Z&lcommit.branch=adi%2Ftest_pre_migration&maxSampling=110)\n\n@huydhn  is this expected? \n\ncc @malfet @pytorch/pytorch-dev-infra @snadampal @milpuz01 @nikhil-arm @fadara01 @robert-hardwick @nWEIdia @chauhang @penguinwu",
+      "comments": [
+        {
+          "author": "aditew01",
+          "created_at": "2026-06-29T13:11:40Z",
+          "updated_at": "2026-06-29T13:11:40Z",
+          "body": "@claude triage the issue ",
+          "url": "https://github.com/pytorch/pytorch/issues/188336#issuecomment-4832976559"
+        },
+        {
+          "author": "claude[bot]",
+          "created_at": "2026-06-29T13:12:08Z",
+          "updated_at": "2026-06-29T13:14:34Z",
+          "body": "**Claude finished @aditew01's task in 2m 9s** —— [View job](https://github.com/pytorch/pytorch/actions/runs/28374551307)\n\n---\n### Issue Triage\n\n- [x] Analyze the regression data and PR #187994 context\n- [x] Investigate the runner migration (OSDC/ARC arm64)\n- [x] Classify root cause & recommend labels/next steps\n\n---\n\n### Analysis\n\nThis is a **performance regression on AArch64 CPU** that appeared after migrating the Inductor benchmark jobs to the OSDC (ARC) arm64 runners in #187994. The comparison table shows large jumps in **Abs Execution Time** while accuracy stays `pass` and **Portable speedup stays roughly constant**, e.g.:\n\n| Model | Abs exec time (pre → post) | Approx factor |\n|---|---|---|\n| `mobilenetv2_100` | 52.68ms → 158.30ms | ~3.0x |\n| `deit_base_distilled_patch16_224` | 308.31ms → 514.01ms | ~1.7x |\n| `mobilenetv3_large_100` | 309.20ms → 481.61ms | ~1.6x |\n| `repvgg_a2` | 190.96ms → 292.04ms | ~1.5x |\n| `ghostnet_100` | 138.14ms → 152.06ms | ~1.1x |\n\n**Key signal:** the *speedup* (compiled vs. eager) is essentially unchanged, and you note eager regressed by a similar amount. That points away from a `torch.compile`/Inductor codegen regression and toward the **runner environment itself** — i.e. the new ARC arm64 hosts are measuring slower wall-clock than the previous runners. Common causes for this pattern after a runner migration:\n\n- Different/older Neoverse core generation or lower sustained clocks (no turbo / power policy)\n- Fewer vCPUs or different thread/affinity defaults (`OMP_NUM_THREADS`, core pinning, NUMA)\n- Noisy-neighbor / shared-host contention or thermal throttling on the new fleet\n- Different glibc / kernel / BLAS (e.g. OpenBLAS vs. Arm Compute Library) or `LD_PRELOAD` / allocator differences baked into the new image\n\nSince absolute timings are not normalized across heterogeneous hardware, a runner migration legitimately shifts the baseline. The actionable question for whoever owns the benchmark fleet is whether the new ARC arm64 runners are spec-equivalent (CPU model, core count, threading env) to the pre-migration ones, and whether a fresh baseline needs to be captured for the dashboard.\n\n### Suggested next diagnostics\n- Compare `lscpu` / `nproc` / governor and the `OMP_NUM_THREADS` + thread-affinity settings between the old and new runner images.\n- Confirm the same BLAS/ACL backend and version are present in both images.\n- If the new fleet is intentionally different hardware, the benchmark dashboard baseline likely needs to be re-seeded post-migration rather than treated as a code regression.\n\n### Recommended labels\nBased on the [triage rubric](.claude/skills/triaging-issues), this is a CI-infrastructure-driven performance regression on ARM (root cause is the runner migration, not PT2 codegen), so:\n\n- `module: arm`\n- `module: ci`\n- `module: performance`\n- `module: regression`\n\n> ⚠️ I was unable to apply these labels directly — the `mcp__github__issue_write` tooling isn't available in this session and the `gh` CLI requires an approval I don't have. A maintainer (cc @huydhn) can apply the labels above. If you'd like me to take any further action, please re-run with the appropriate `--allowedTools` granted.\n · branch `claude/issue-188336-20260629-1312`",
+          "url": "https://github.com/pytorch/pytorch/issues/188336#issuecomment-4832980745"
+        },
+        {
+          "author": "huydhn",
+          "created_at": "2026-07-01T05:46:20Z",
+          "updated_at": "2026-07-01T05:46:20Z",
+          "body": "I would not be surprise if this is related.  Although the code is unchanged, the new runner is now managed by Kubernetes instead of running directly on the EC2 instance.  A missing / wrong config here would likely cause performance sensitive job to misbehave.  I don't think I have an answer at the moment, but could take a closer look. ",
+          "url": "https://github.com/pytorch/pytorch/issues/188336#issuecomment-4850641232"
+        },
+        {
+          "author": "aditew01",
+          "created_at": "2026-07-01T08:42:19Z",
+          "updated_at": "2026-07-01T08:42:19Z",
+          "body": "thanks @huydhn ",
+          "url": "https://github.com/pytorch/pytorch/issues/188336#issuecomment-4852244436"
+        },
+        {
+          "author": "aditew01",
+          "created_at": "2026-07-15T12:37:51Z",
+          "updated_at": "2026-07-21T09:19:58Z",
+          "body": "@huydhn followup on this, is this just an issue with incorrect config mapping ?  ",
+          "url": "https://github.com/pytorch/pytorch/issues/188336#issuecomment-4980647906"
+        }
+      ]
+    },
+    {
+      "number": 190631,
+      "title": "[Feature Request / RFC] Add auto_bucket support to torch.compile for automatic shape bucketing and padding",
+      "url": "https://github.com/pytorch/pytorch/issues/190631",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/190631",
+      "state": "open",
+      "author": "powerofaisinstudy-debug",
+      "created_at": "2026-07-21T04:31:14Z",
+      "updated_at": "2026-07-21T04:33:58Z",
+      "closed_at": null,
+      "labels": [
+        "feature",
+        "triaged",
+        "needs design",
+        "oncall: pt2",
+        "module: dynamic shapes",
+        "module: dynamo",
+        "module: compile ux",
+        "release-feature-request",
+        "bot-triaged"
+      ],
+      "comments_count": 0,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "### New Feature for Release\n\nWhen deploying models with torch.compile(dynamic=True) in production environments, variable input sizes (such as changing batch sizes or sequence lengths) frequently lead to guard cache explosions and unexpected recompilations. Furthermore, for low-batch or low-latency workloads (e.g., batch sizes 1 to 16), the runtime overhead of evaluating TorchDynamo guards and dispatching compiled kernels often causes performance regressions compared to standard eager mode.\n\nWhile developers can manually implement input padding and shape bucketing wrappers, doing so requires boilerplate code and complicates integration with downstream loss functions and masks.\n\nProposed Solution: auto_bucket=True\nIntroduce a native compiler-level flag—tentatively named auto_bucket (or shape_bucketing)—directly inside torch.compile().\n\nWhen enabled, the compiler handles dynamic dimensions transparently:\n\nBucketing: Automatically snaps incoming tensor dimensions into predefined, optimized tiers (e.g., powers of two like 1, 2, 4, 8, 16, 32).\n\nPadding & Slicing: Dynamically pads input tensors up to the nearest bucket size, executes the compiled kernel at peak efficiency, and slices the output back to the original requested shape before returning it to the user.\n\nGuard Stabilization: Restricts the total number of unique compiled graph variants to a controlled set of tiers, preventing cache bloat and enabling stable CUDA graph capture for variable workloads.\n\nProposed API Usage\nPython\nimport torch\n\n# Compile the model with automatic bucketing for dynamic inputs\ncompiled_model = torch.compile(\n    my_model, \n    dynamic=True, \n    auto_bucket=True\n)\nKey Benefits\nEliminates Guard Cache Bloat: Keeps the compilation cache bounded by limiting unique graph shapes.\n\nLow-Batch Acceleration: Protects low-latency inference pipelines from the overhead penalty of dynamic shape dispatch.\n\nDeveloper Experience: Bridges the gap between general-purpose training flexibility and high-throughput production serving engines (like vLLM/TensorRT) without requiring manual wrapper code.\n\nLooking forward to feedback from the maintainers and community on the feasibility and design of this approach!\n\n### Point(s) of contact\n\n_No response_\n\n### Release Mode (pytorch/pytorch features only)\n\nIn-tree\n\n### Out-Of-Tree Repo\n\n_No response_\n\n### Description and value to the user\n\n_No response_\n\n### Link to design doc, GitHub issues, past submissions, etc\n\n_No response_\n\n### What feedback adopters have provided\n\n_No response_\n\n### Plan for documentations / tutorials\n\nTutorial exists\n\n### Additional context for tutorials\n\n_No response_\n\n### Marketing/Blog Coverage\n\nYes\n\n### Are you requesting other marketing assistance with this feature?\n\n_No response_\n\n### Release Version\n\n_No response_\n\n### OS / Platform / Compute Coverage\n\n_No response_\n\n### Testing Support (CI, test cases, etc..)\n\n_No response_\n\ncc @chauhang @penguinwu @ezyang @bobrenjc93 @aditvenk @laithsakka @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @kadeng @amjames @jataylo @azahed98",
+      "comments": []
+    }
+  ]
+}
