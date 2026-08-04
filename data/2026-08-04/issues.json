@@ -1,0 +1,433 @@
+{
+  "metadata": {
+    "repo": "pytorch/pytorch",
+    "keywords": [
+      "compile",
+      "inductor",
+      "dynamo"
+    ],
+    "generated_at": "2026-08-04T04:00:03.851229+00:00",
+    "since": "2026-08-03T04:00:03.851229+00:00",
+    "lookback_hours": 24.0,
+    "timezone": "Asia/Shanghai",
+    "report_date": "2026-08-04",
+    "issue_count": 8
+  },
+  "issues": [
+    {
+      "number": 192000,
+      "title": "Crash with collectives that are waited-for after a graph break with torch.compile + cudagraphs",
+      "url": "https://github.com/pytorch/pytorch/issues/192000",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/192000",
+      "state": "open",
+      "author": "rmcgibbo",
+      "created_at": "2026-08-03T22:52:11Z",
+      "updated_at": "2026-08-03T22:52:39Z",
+      "closed_at": null,
+      "labels": [
+        "oncall: pt2"
+      ],
+      "comments_count": 0,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "### 🐛 Describe the bug\n\nHere's a bit of code that crashes that I think ought to be allowed.\n\nI believe the issue is that the coordination between the `all_reduce` and the `wait_tensor` is handled in ProcessGroupNCCL.cpp by creating a CUDA event ([around here](https://sourcegraph.com/r/github.com/pytorch/pytorch@62885a375afb5fee9898ec8e5c9e41ec37ec1c01/-/blob/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp?L582-584)), and this event isn't created with `cudaEventExternal`. This means that when the event creation is captured in a cudagraph, we can't wait on the event from eager code or from a subsequent cudagraph. So if a graph break gets inserted between the collective and the wait, things work fine under modes that don't use cudagraphs but break with cudagraphs. \n```\nimport os\n\nimport torch\nimport torch.distributed as dist\n\ndist.init_process_group(\"nccl\")\ntorch.cuda.set_device(int(os.environ[\"LOCAL_RANK\"]))\ngroup = dist.group.WORLD.group_name\n\n@torch.compile(mode=\"reduce-overhead\")\ndef model(x):\n    pending = torch.ops._c10d_functional.all_reduce.default(x, \"sum\", group)\n    torch._dynamo.graph_break()\n    return torch.ops._c10d_functional.wait_tensor.default(pending)\n\nx = torch.ones(16, device=\"cuda\")\nfor _ in range(3):\n    print(model(x))\ndist.destroy_process_group()\n```\n\n### Error logs\n\n```\n$ python -m torch.distributed.run --standalone --nproc-per-node=2 code.py\n\n*****************************************\nSetting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed.\n*****************************************\ntensor([2., 2., 2., 2., 2., 2., 2., 2., 2., 2., 2., 2., 2., 2., 2., 2.],\n       device='cuda:0')\ntensor([2., 2., 2., 2., 2., 2., 2., 2., 2., 2., 2., 2., 2., 2., 2., 2.],\n       device='cuda:1')\n[rank0]: Traceback (most recent call last):\n[rank0]:   File \".../python3.12/site-packages/torch/_inductor/cudagraph_trees.py\", line 1361, in _record\n[rank0]:     static_outputs = model(inputs)\n[rank0]:                      ^^^^^^^^^^^^^\n[rank0]:   File \"/usr/tmp/torchinductor_robert/3q/c3qomedvvfamny2ii6frqgbn47iaydt2ksg4qpjj5frxv3suumfw.py\", line 39, in partition_0\n[rank0]:     torch.ops._c10d_functional.wait_tensor.default(arg0_1)\n[rank0]:   File \".../python3.12/site-packages/torch/_ops.py\", line 871, in __call__\n[rank0]:     return self._op(*args, **kwargs)\n[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank0]:   File \".../python3.12/site-packages/torch/_library/autograd.py\", line 112, in autograd_impl\n[rank0]:     result = forward_no_grad(*args, Metadata(keyset, keyword_only_args))\n[rank0]:              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank0]:   File \".../python3.12/site-packages/torch/_library/autograd.py\", line 41, in forward_no_grad\n[rank0]:     result = op.redispatch(keyset & _C._after_autograd_keyset, *args, **kwargs)\n[rank0]:              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank0]:   File \".../python3.12/site-packages/torch/_ops.py\", line 878, in redispatch\n[rank0]:     return self._handle.redispatch_boxed(keyset, *args, **kwargs)  # type: ignore[return-value]\n[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank0]:   File \".../python3.12/site-packages/torch/_compile.py\", line 54, in inner\n[rank0]:     return disable_fn(*args, **kwargs)\n[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank0]:   File \".../python3.12/site-packages/torch/_dynamo/eval_frame.py\", line 1298, in _fn\n[rank0]:     return fn(*args, **kwargs)\n[rank0]:            ^^^^^^^^^^^^^^^^^^^\n[rank0]:   File \".../python3.12/site-packages/torch/_higher_order_ops/cudagraph_conditional_nodes.py\", line 33, in __torch_dispatch__\n[rank0]:     return func(*args, **kwargs)\n[rank0]:            ^^^^^^^^^^^^^^^^^^^^^\n[rank0]:   File \".../python3.12/site-packages/torch/_ops.py\", line 871, in __call__\n[rank0]:     return self._op(*args, **kwargs)\n[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank0]: torch.AcceleratorError: CUDA error: invalid argument\n[rank0]: Search for `cudaErrorInvalidValue' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.\n[rank0]: CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\n[rank0]: For debugging consider passing CUDA_LAUNCH_BLOCKING=1\n[rank0]: Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n\n\n[rank0]: During handling of the above exception, another exception occurred:\n\n[rank0]: Traceback (most recent call last):\n[rank0]:   File \"code.py\", line 20, in <module>\n[rank0]:     print(model(x))\n[rank0]:           ^^^^^^^^\n[rank0]:   File \".../python3.12/site-packages/torch/_dynamo/eval_frame.py\", line 1047, in compile_wrapper\n[rank0]:     result = fn(*args, **kwargs)\n[rank0]:              ^^^^^^^^^^^^^^^^^^^\n[rank0]:   File \"code.py\", line 14, in model\n[rank0]:     torch._dynamo.graph_break()\n[rank0]:   File \"code.py\", line 14, in torch_dynamo_resume_in_model_at_14\n[rank0]:     torch._dynamo.graph_break()\n[rank0]:   File \".../python3.12/site-packages/torch/_dynamo/eval_frame.py\", line 1298, in _fn\n[rank0]:     return fn(*args, **kwargs)\n[rank0]:            ^^^^^^^^^^^^^^^^^^^\n[rank0]:   File \".../python3.12/site-packages/torch/_functorch/aot_autograd.py\", line 1273, in forward\n[rank0]:     return compiled_fn(full_args)\n[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^\n[rank0]:   File \".../python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py\", line 2384, in __call__\n[rank0]:     return self.compiled_fn(*args, **kwargs)\n[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank0]:   File \".../python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py\", line 777, in runtime_wrapper\n[rank0]:     all_outs = compiled_invoker.run(args, on_before_call=exit_prologue)\n[rank0]:                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank0]:   File \".../python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py\", line 523, in run\n[rank0]:     return call_func_at_runtime_with_args(\n[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank0]:   File \".../python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py\", line 126, in call_func_at_runtime_with_args\n[rank0]:     out = normalize_as_list(f(args))\n[rank0]:                             ^^^^^^^\n[rank0]:   File \".../python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py\", line 850, in wrapper\n[rank0]:     return compiled_fn(runtime_args)\n[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank0]:   File \".../python3.12/site-packages/torch/_inductor/output_code.py\", line 725, in __call__\n[rank0]:     return self.current_callable(inputs)\n[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank0]:   File \"/usr/tmp/torchinductor_robert/3q/c3qomedvvfamny2ii6frqgbn47iaydt2ksg4qpjj5frxv3suumfw.py\", line 60, in call\n[rank0]:     (arg0_1,) = self.partitions[0](partition0_args)\n[rank0]:                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank0]:   File \".../python3.12/site-packages/torch/_inductor/compile_fx.py\", line 1913, in run\n[rank0]:     return compiled_fn(new_inputs)  # type: ignore[arg-type]\n[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^\n[rank0]:   File \".../python3.12/site-packages/torch/_inductor/cudagraph_trees.py\", line 430, in deferred_cudagraphify\n[rank0]:     return fn(inputs)\n[rank0]:            ^^^^^^^^^^\n[rank0]:   File \".../python3.12/site-packages/torch/_inductor/utils.py\", line 3503, in run\n[rank0]:     out = model(new_inputs)\n[rank0]:           ^^^^^^^^^^^^^^^^^\n[rank0]:   File \".../python3.12/site-packages/torch/_inductor/cudagraph_trees.py\", line 2158, in run\n[rank0]:     out = self._run(new_inputs, function_id)\n[rank0]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank0]:   File \".../python3.12/site-packages/torch/_inductor/cudagraph_trees.py\", line 2343, in _run\n[rank0]:     return self.record_function(new_inputs, function_id)\n[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank0]:   File \".../python3.12/site-packages/torch/_inductor/cudagraph_trees.py\", line 2383, in record_function\n[rank0]:     node = CUDAGraphNode(\n[rank0]:            ^^^^^^^^^^^^^^\n[rank0]:   File \".../python3.12/site-packages/torch/_inductor/cudagraph_trees.py\", line 1119, in __init__\n[rank0]:     self.recording_outputs: OutputType | None = self._record(\n[rank0]:                                                 ^^^^^^^^^^^^^\n[rank0]:   File \".../python3.12/site-packages/torch/_inductor/cudagraph_trees.py\", line 1350, in _record\n[rank0]:     torch.cuda.graph(\n[rank0]:   File \".../python3.12/site-packages/torch/cuda/graphs.py\", line 283, in __exit__\n[rank0]:     self.cuda_graph.capture_end()\n[rank0]:   File \".../python3.12/site-packages/torch/cuda/graphs.py\", line 126, in capture_end\n[rank0]:     super().capture_end()\n[rank0]: torch.AcceleratorError: CUDA error: operation failed due to a previous error during capture\n[rank0]: Search for `cudaErrorStreamCaptureInvalidated' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.\n[rank0]: CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\n[rank0]: For debugging consider passing CUDA_LAUNCH_BLOCKING=1\n[rank0]: Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n\n[rank1]: Traceback (most recent call last):\n[rank1]:   File \".../python3.12/site-packages/torch/_inductor/cudagraph_trees.py\", line 1361, in _record\n[rank1]:     static_outputs = model(inputs)\n[rank1]:                      ^^^^^^^^^^^^^\n[rank1]:   File \"/usr/tmp/torchinductor_robert/wa/cwauhkggmz43byh7iahomplqresusbsh6uld23t5mu2no3hzg4iw.py\", line 39, in partition_0\n[rank1]:     torch.ops._c10d_functional.wait_tensor.default(arg0_1)\n[rank1]:   File \".../python3.12/site-packages/torch/_ops.py\", line 871, in __call__\n[rank1]:     return self._op(*args, **kwargs)\n[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank1]:   File \".../python3.12/site-packages/torch/_library/autograd.py\", line 112, in autograd_impl\n[rank1]:     result = forward_no_grad(*args, Metadata(keyset, keyword_only_args))\n[rank1]:              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank1]:   File \".../python3.12/site-packages/torch/_library/autograd.py\", line 41, in forward_no_grad\n[rank1]:     result = op.redispatch(keyset & _C._after_autograd_keyset, *args, **kwargs)\n[rank1]:              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank1]:   File \".../python3.12/site-packages/torch/_ops.py\", line 878, in redispatch\n[rank1]:     return self._handle.redispatch_boxed(keyset, *args, **kwargs)  # type: ignore[return-value]\n[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank1]:   File \".../python3.12/site-packages/torch/_compile.py\", line 54, in inner\n[rank1]:     return disable_fn(*args, **kwargs)\n[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank1]:   File \".../python3.12/site-packages/torch/_dynamo/eval_frame.py\", line 1298, in _fn\n[rank1]:     return fn(*args, **kwargs)\n[rank1]:            ^^^^^^^^^^^^^^^^^^^\n[rank1]:   File \".../python3.12/site-packages/torch/_higher_order_ops/cudagraph_conditional_nodes.py\", line 33, in __torch_dispatch__\n[rank1]:     return func(*args, **kwargs)\n[rank1]:            ^^^^^^^^^^^^^^^^^^^^^\n[rank1]:   File \".../python3.12/site-packages/torch/_ops.py\", line 871, in __call__\n[rank1]:     return self._op(*args, **kwargs)\n[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank1]: torch.AcceleratorError: CUDA error: invalid argument\n[rank1]: Search for `cudaErrorInvalidValue' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.\n[rank1]: CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\n[rank1]: For debugging consider passing CUDA_LAUNCH_BLOCKING=1\n[rank1]: Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n\n\n[rank1]: During handling of the above exception, another exception occurred:\n\n[rank1]: Traceback (most recent call last):\n[rank1]:   File \"code.py\", line 20, in <module>\n[rank1]:     print(model(x))\n[rank1]:           ^^^^^^^^\n[rank1]:   File \".../python3.12/site-packages/torch/_dynamo/eval_frame.py\", line 1047, in compile_wrapper\n[rank1]:     result = fn(*args, **kwargs)\n[rank1]:              ^^^^^^^^^^^^^^^^^^^\n[rank1]:   File \"code.py\", line 14, in model\n[rank1]:     torch._dynamo.graph_break()\n[rank1]:   File \"code.py\", line 14, in torch_dynamo_resume_in_model_at_14\n[rank1]:     torch._dynamo.graph_break()\n[rank1]:   File \".../python3.12/site-packages/torch/_dynamo/eval_frame.py\", line 1298, in _fn\n[rank1]:     return fn(*args, **kwargs)\n[rank1]:            ^^^^^^^^^^^^^^^^^^^\n[rank1]:   File \".../python3.12/site-packages/torch/_functorch/aot_autograd.py\", line 1273, in forward\n[rank1]:     return compiled_fn(full_args)\n[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^\n[rank1]:   File \".../python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py\", line 2384, in __call__\n[rank1]:     return self.compiled_fn(*args, **kwargs)\n[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank1]:   File \".../python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py\", line 777, in runtime_wrapper\n[rank1]:     all_outs = compiled_invoker.run(args, on_before_call=exit_prologue)\n[rank1]:                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank1]:   File \".../python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py\", line 523, in run\n[rank1]:     return call_func_at_runtime_with_args(\n[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank1]:   File \".../python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py\", line 126, in call_func_at_runtime_with_args\n[rank1]:     out = normalize_as_list(f(args))\n[rank1]:                             ^^^^^^^\n[rank1]:   File \".../python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py\", line 850, in wrapper\n[rank1]:     return compiled_fn(runtime_args)\n[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank1]:   File \".../python3.12/site-packages/torch/_inductor/output_code.py\", line 725, in __call__\n[rank1]:     return self.current_callable(inputs)\n[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank1]:   File \"/usr/tmp/torchinductor_robert/wa/cwauhkggmz43byh7iahomplqresusbsh6uld23t5mu2no3hzg4iw.py\", line 60, in call\n[rank1]:     (arg0_1,) = self.partitions[0](partition0_args)\n[rank1]:                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank1]:   File \".../python3.12/site-packages/torch/_inductor/compile_fx.py\", line 1913, in run\n[rank1]:     return compiled_fn(new_inputs)  # type: ignore[arg-type]\n[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^\n[rank1]:   File \".../python3.12/site-packages/torch/_inductor/cudagraph_trees.py\", line 430, in deferred_cudagraphify\n[rank1]:     return fn(inputs)\n[rank1]:            ^^^^^^^^^^\n[rank1]:   File \".../python3.12/site-packages/torch/_inductor/utils.py\", line 3503, in run\n[rank1]:     out = model(new_inputs)\n[rank1]:           ^^^^^^^^^^^^^^^^^\n[rank1]:   File \".../python3.12/site-packages/torch/_inductor/cudagraph_trees.py\", line 2158, in run\n[rank1]:     out = self._run(new_inputs, function_id)\n[rank1]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank1]:   File \".../python3.12/site-packages/torch/_inductor/cudagraph_trees.py\", line 2343, in _run\n[rank1]:     return self.record_function(new_inputs, function_id)\n[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank1]:   File \".../python3.12/site-packages/torch/_inductor/cudagraph_trees.py\", line 2383, in record_function\n[rank1]:     node = CUDAGraphNode(\n[rank1]:            ^^^^^^^^^^^^^^\n[rank1]:   File \".../python3.12/site-packages/torch/_inductor/cudagraph_trees.py\", line 1119, in __init__\n[rank1]:     self.recording_outputs: OutputType | None = self._record(\n[rank1]:                                                 ^^^^^^^^^^^^^\n[rank1]:   File \".../python3.12/site-packages/torch/_inductor/cudagraph_trees.py\", line 1350, in _record\n[rank1]:     torch.cuda.graph(\n[rank1]:   File \".../python3.12/site-packages/torch/cuda/graphs.py\", line 283, in __exit__\n[rank1]:     self.cuda_graph.capture_end()\n[rank1]:   File \".../python3.12/site-packages/torch/cuda/graphs.py\", line 126, in capture_end\n[rank1]:     super().capture_end()\n[rank1]: torch.AcceleratorError: CUDA error: operation failed due to a previous error during capture\n[rank1]: Search for `cudaErrorStreamCaptureInvalidated' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.\n[rank1]: CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\n[rank1]: For debugging consider passing CUDA_LAUNCH_BLOCKING=1\n[rank1]: Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n\n[rank0]:[W803 18:36:41.873716139 ProcessGroupNCCL.cpp:1647] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())\nW0803 18:36:42.256000 54893 torch/distributed/elastic/multiprocessing/api.py:1014] Sending process 55018 closing signal SIGTERM\nE0803 18:36:42.971000 54893 torch/distributed/elastic/multiprocessing/api.py:988] failed (exitcode: 1) local_rank: 0 (pid: 55017) of binary: /usr/local/venvs/versioned/algovenv12-1.0.74/bin/python\nTraceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \".../python3.12/site-packages/torch/distributed/run.py\", line 1020, in <module>\n    main()\n  File \".../python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py\", line 367, in wrapper\n    return f(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^\n  File \".../python3.12/site-packages/torch/distributed/run.py\", line 1016, in main\n    run(args)\n  File \".../python3.12/site-packages/torch/distributed/run.py\", line 1007, in run\n    elastic_launch(\n  File \".../python3.12/site-packages/torch/distributed/launcher/api.py\", line 191, in __call__\n    return launch_agent(self._config, self._entrypoint, list(args))\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \".../python3.12/site-packages/torch/distributed/launcher/api.py\", line 371, in launch_agent\n    raise ChildFailedError(\ntorch.distributed.elastic.multiprocessing.errors.ChildFailedError:\n============================================================\ncode.py FAILED\n------------------------------------------------------------\nFailures:\n[1]:\n  time      : 2026-08-03_18:36:42\n  host      : gpu101\n  rank      : 1 (local_rank: 1)\n  exitcode  : -15 (pid: 55018)  (SIGTERM)\n  error_file: <N/A>\n  traceback : Signal 15 (SIGTERM) received by PID 55018\n------------------------------------------------------------\nRoot Cause (first observed failure):\n[0]:\n  time      : 2026-08-03_18:36:42\n  host      : gpu101\n  rank      : 0 (local_rank: 0)\n  exitcode  : 1 (pid: 55017)\n  error_file: <N/A>\n  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html\n============================================================\n\n```\n\n### Versions\n\nPytorch 2.12. Linux.\n\ncc @chauhang @penguinwu",
+      "comments": []
+    },
+    {
+      "number": 191500,
+      "title": "dynamic shape tracing time is 2.5x slower than static shapes (Dynamo+AOTAutograd)",
+      "url": "https://github.com/pytorch/pytorch/issues/191500",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/191500",
+      "state": "open",
+      "author": "zou3519",
+      "created_at": "2026-07-29T15:20:09Z",
+      "updated_at": "2026-08-03T21:23:40Z",
+      "closed_at": null,
+      "labels": [
+        "module: performance",
+        "triaged",
+        "oncall: pt2",
+        "module: fakeTensor",
+        "module: dynamic shapes",
+        "module: aotdispatch",
+        "module: dynamo",
+        "module: compile-time",
+        "module: pt2-dispatcher",
+        "bot-triaged"
+      ],
+      "comments_count": 3,
+      "matched_keywords": [
+        "dynamo"
+      ],
+      "body": "I don't know what's going on but I didn't expect it to be this slow.\nhttps://gist.github.com/zou3519/63fa2e77d7fcefe21c73d44e4e9190d6\n\n[static tlparse](https://manifold.edge.x2p.facebook.net/v0/read/tree/logs/.tmpQJgR9h/index.html?bucketName=tlparse_reports&apiKey=tlparse_reports-key&withPayload=1&timeoutMsec=10000)\n\n10s\n\n<img width=\"415\" height=\"309\" alt=\"Image\" src=\"https://github.com/user-attachments/assets/298b6763-7f41-488a-8f4d-784d01ad3ae8\" />\n\n\n[dynamic tlparse](https://manifold.edge.x2p.facebook.net/v0/read/tree/logs/.tmptel4Xv/index.html?bucketName=tlparse_reports&apiKey=tlparse_reports-key&withPayload=1&timeoutMsec=10000)\n\n25s\n\n<img width=\"706\" height=\"300\" alt=\"Image\" src=\"https://github.com/user-attachments/assets/622546a7-dec6-4780-bf08-9d0e3146116f\" />\n\ncc @chauhang @penguinwu @eellison @aorenste @liangel-02 @ezyang @bobrenjc93 @aditvenk @laithsakka @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @kadeng @amjames @jataylo @azahed98 @oulgen @jamesjwu @anijain2305 @masnesral @coconutruben @bdhirsh",
+      "comments": [
+        {
+          "author": "zou3519",
+          "created_at": "2026-07-29T15:23:13Z",
+          "updated_at": "2026-07-29T15:24:27Z",
+          "body": "My codex suspects FakeTensor caching. I have not verified this.\n```\nThe hotspot is FakeTensor dispatch-cache output reconstruction:\n\n- _output_from_cache_entry: 1.57s → 11.83s\n- _get_output_tensor_from_cache_entry: 1.54s → 11.79s\n- About 225K symbolic binary operations\n- About 464K maybe_as_int calls\n\nThe number of fake-tensor operations barely changes. For dynamic outputs, every cache hit reconstructs symbolic shapes,\nstrides, and storage offsets, then calls torch.empty_strided and builds a wrapper subclass. That symbolic reconstruction\naccounts for most of the increase.\n```",
+          "url": "https://github.com/pytorch/pytorch/issues/191500#issuecomment-5119895338"
+        },
+        {
+          "author": "shino16",
+          "created_at": "2026-08-03T17:18:45Z",
+          "updated_at": "2026-08-03T17:18:45Z",
+          "body": "I reproduced your FakeTensor cache signal on the same Qwen3 repro. I found redundant symbolic storage-bound recomputation in two paths:\n\n- FakeTensor cache reconstruction: fresh outputs use `empty_strided`, while views allocate a placeholder and rebind it with `set_`; both paths recompute symbolic storage bounds.\n- FunctionalTensor construction: `_make_wrapper_subclass` recomputes a storage bound from symbolic size, stride, and storage offset.\n\nBelow is a benchmark on c451937d. Each patch was applied separately.\n\n| Metric | Base | Base + FakeTensor patch | Base + FunctionalTensor patch |\n|---|---:|---:|---:|\n| Static first call | 38.876 s | 38.786 s (-0.2%) | 38.961 s (+0.2%) |\n| Dynamic first call | 56.872 s | 49.673 s (-12.7%) | 53.581 s (-5.8%) |\n| Dynamic `aot_collect_metadata` | 5.244 s | 3.561 s (-32.1%) | 4.893 s (-6.7%) |\n\nWithin each fresh process, the 144-token input reused the graph compiled for 128 tokens; no backend recompile occurred.\n\nI'm preparing separate PRs for the FakeTensor and FunctionalTensor changes and will link them here when ready.\n",
+          "url": "https://github.com/pytorch/pytorch/issues/191500#issuecomment-5169535892"
+        },
+        {
+          "author": "zou3519",
+          "created_at": "2026-08-03T21:23:30Z",
+          "updated_at": "2026-08-03T21:23:30Z",
+          "body": "cc @liangel-02 ",
+          "url": "https://github.com/pytorch/pytorch/issues/191500#issuecomment-5171889809"
+        }
+      ]
+    },
+    {
+      "number": 191976,
+      "title": "torch.compile silently produces wrong `nn.LayerNorm` results on MPS",
+      "url": "https://github.com/pytorch/pytorch/issues/191976",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/191976",
+      "state": "open",
+      "author": "jstray",
+      "created_at": "2026-08-03T20:05:38Z",
+      "updated_at": "2026-08-03T20:05:38Z",
+      "closed_at": null,
+      "labels": [],
+      "comments_count": 0,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "### 🐛 Describe the bug\n\n\n`torch.compile` returns numerically incorrect output for `nn.LayerNorm` on the MPS backend. Eager matches a float64 CPU reference to ~2e-7; the compiled version diverges by up to **1.8 absolute** on inputs whose own range is roughly [-4, 4] — the error exceeds the output range.\n\nThere is no warning, no graph break, and no device fallback. The compiled module simply returns wrong numbers.\n\n```python\nimport torch, torch.nn as nn\n\ntorch.manual_seed(0)\ndim = 512\nx = torch.randn(4, dim)\nlayer = nn.LayerNorm(dim)\n\nreference = nn.LayerNorm(dim).double()\nreference.load_state_dict({k: v.double() for k, v in layer.state_dict().items()})\ntruth = reference(x.double())                       # float64 CPU ground truth\n\non_mps = layer.to(\"mps\").eval()\nwith torch.inference_mode():\n    eager = on_mps(x.to(\"mps\")).cpu().double()\n    compiled = torch.compile(on_mps)(x.to(\"mps\")).cpu().double()\n\nprint(\"eager    vs truth:\", (eager - truth).abs().max().item())    # 3.3e-07\nprint(\"compiled vs truth:\", (compiled - truth).abs().max().item()) # 1.8e+00\n```\n\nA self-contained script covering all dimensions and seeds is attached\n(`bug_repro_mps_layernorm.py`).\n\n## Expected behaviour\n\nBoth should agree with the float64 reference to float32 precision, ~1e-7.\n\n## Actual behaviour\n\n`max |output - float64_reference|`, three seeds per row:\n\n| normalized_shape | eager | torch.compile |\n|---|---|---|\n| 32 | 1.2e-07, 2.4e-07, 2.4e-07 | 1.2e-07, 2.4e-07, 2.4e-07 |\n| 64 | ~2e-07 | **1.7e-02**, 2.4e-07, **2.0e-02** |\n| 96 | ~2e-07 | **6.7e-03, 1.7e-02, 1.1e-02** |\n| 128 | ~2e-07 | **3.1e-04, 4.1e-02, 9.5e-03** |\n| 256 | ~2e-07 | **4.7e-03, 6.7e-03, 1.0e-02** |\n| 512 | ~3e-07 | **2.0e+00, 2.8e+00, 1.8e+00** |\n\nEager is correct throughout. Onset is **input-dependent**: `dim=64` fails for\nseeds 0 and 2 but not seed 1. `dim >= 96` failed on every seed tried, `dim=32`\non none, and the error grows with the dimension.\n\n## Scope — only LayerNorm\n\nEach module tested individually on MPS, eager vs compiled:\n\n| module | max diff |\n|---|---|\n| `nn.Linear` | 0.0 |\n| `nn.GELU` | 0.0 |\n| `nn.Softmax(dim=-1)` | 0.0 |\n| `nn.MultiheadAttention`, no mask | 0.0 |\n| `nn.MultiheadAttention`, `key_padding_mask` | 0.0 |\n| **`nn.LayerNorm`** | **0.174** |\n| `nn.TransformerEncoderLayer` | 0.341 — contains LayerNorm |\n\nOther observations:\n\n- **fp32 and fp16 are affected equally**, so this is not a precision tradeoff and is distinct from #66707 (layer_norm needing fp32 accumulation for fp16).\n- Reproduces with `elementwise_affine=True` and `False`.\n- `torch._dynamo.utils.counters[\"graph_break\"]` is empty — it compiles cleanly.\n- Both outputs are on `mps:0`, so it is not a silent CPU fallback.\n- Eager being correct rules out the MPS \"fast math\" behaviour in #84936, which would affect both paths.\n\n## Possible mechanism\n\nThe `torch.compile` on MPS tracker (#150121) notes that **multi-stage Welford reductions are not implemented**. LayerNorm computes mean and variance by a Welford reduction over `normalized_shape`, and the failure appearing between 32 and 96 elements — and worsening with size — is consistent with a reduction that is correct while it fits one stage and wrong once it needs more. #152155 reports a related multistage-reduction failure, though that one raises a shader error rather than returning wrong values.\n\n## Related issues\n\n- #150121 — torch.compile on MPS progress tracker (open). This probably belongs under it.\n- #143182 — same symptom class, `nn.LayerNorm` silently wrong under Inductor,  but **CPU only** and **closed**, with a much smaller error (7e-4 vs 1.8).\n- #150629, #150454 — RMSNorm on MPS under torch.compile: outputs zeros, and  generates invalid shaders. Adjacent normalisation-layer failures.\n- #152155 — multistage reductions on MPS generating out-of-scope variables.\n\n## Real-world impact\n\nFound while embedding `sentence-transformers/all-MiniLM-L6-v2` (6-layer BERT, hidden size 384). The compiled encoder differed from eager by **11.1 absolute** on `last_hidden_state` values spanning [-5.2, 5.3], corrupting every embedding with nothing to indicate a problem — no warning, no error, plausible-looking output.\n\nOn that model `torch.compile` was also **~7x slower** than eager (416 vs 2,885 texts/s at batch 512, fp16), so there is no speed incentive to offset the correctness risk.\n\nThe tracker does describe MPS support as an early prototype, so a failure is not surprising. Filing because this one is *silent*: a user who benchmarks `torch.compile`, sees it is slower, and moves on is fine — but a user who sees a speedup on a different model and adopts it has no signal that the numbers are wrong.\n\ncc @malfet @kulinseth @DenisVieriu97 (MPS), @jansel @desertfire (torch.compile)\n\n[bug_repro_mps_layernorm.py](https://github.com/user-attachments/files/30677340/bug_repro_mps_layernorm.py)\n\n### Versions\n\nPyTorch version: 2.7.1\nIs debug build: False\nCUDA used to build PyTorch: None\nROCM used to build PyTorch: N/A\n\nOS: macOS 26.5.1 (arm64)\nGCC version: Could not collect\nClang version: 21.0.0 (clang-2100.1.1.101)\nCMake version: Could not collect\nLibc version: N/A\n\nPython version: 3.12.0 (main, Feb  4 2025, 11:41:54) [Clang 16.0.0 (clang-1600.0.26.6)] (64-bit runtime)\nPython platform: macOS-26.5.1-arm64-arm-64bit\nIs CUDA available: False\nCUDA runtime version: No CUDA\nCUDA_MODULE_LOADING set to: N/A\nGPU models and configuration: No CUDA\nNvidia driver version: No CUDA\ncuDNN version: No CUDA\nIs XPU available: False\nHIP runtime version: N/A\nMIOpen runtime version: N/A\nIs XNNPACK available: True\nCaching allocator config: N/A\n\nCPU:\nApple M4 Pro\n\nVersions of relevant libraries:\n[pip3] numpy==2.2.2\n[pip3] torch==2.7.1\n[conda] Could not collect\n",
+      "comments": []
+    },
+    {
+      "number": 191942,
+      "title": "[Inductor] Metal code generation failing for uint16",
+      "url": "https://github.com/pytorch/pytorch/issues/191942",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/191942",
+      "state": "open",
+      "author": "rYm-A",
+      "created_at": "2026-08-03T17:14:33Z",
+      "updated_at": "2026-08-03T18:59:40Z",
+      "closed_at": null,
+      "labels": [
+        "triaged",
+        "module: mps",
+        "oncall: pt2",
+        "module: inductor",
+        "module: unsigned int",
+        "bot-triaged"
+      ],
+      "comments_count": 0,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "### 🐛 Describe the bug\n\nThe presence of larger dimension size of 255 in the operator torch.eye causes an error during the code generation in Inductor: the Metal code cannot be generated from the scheduled kernel. \n\nThe error seems to point to [this dictionary](https://github.com/pytorch/pytorch/blob/dc1c3dfd991f182532c0b434e73f07736d78d6eb/torch/_inductor/codegen/mps.py#L42), where the torch.uint16 data type is not included. @malfet is there a reason why is this type not included if it's supported according the [documentation](https://developer.apple.com/documentation/metal/mtldatatype/ushort)?\n\nRepro:\n```python\nimport torch\nimport torch.nn as nn\nfrom typing import Tuple\n\nclass OnlyEye(nn.Module):\n\n    def forward(self, x0: torch.Tensor, Xi: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:\n        I = torch.eye(Xi.shape[-1], dtype=Xi.dtype, device=Xi.device)\n        sol = Xi + 1\n        err = torch.matmul(Xi, I)\n\n        return sol, err\n\nS = 256\ndevice = torch.device(\"mps\")\nx = torch.zeros(S, dtype=torch.float32, device=device)\nXi = torch.zeros(10, S, dtype=torch.float32, device=device)\n\nmodel = OnlyEye().eval().to(device)\ncompiled = torch.compile(model)\nwith torch.inference_mode():\n    compiled(x, Xi)\n```\n\n### Error logs\n\n```\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0] Error in codegen for ComputedBuffer(name='buf1', layout=FixedLayout('mps:0', torch.float32, size=[256, 256], stride=[256, 1]), data=Pointwise(\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]   'mps',\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]   torch.float32,\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]   def inner_fn(index):\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]       i0, i1 = index\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]       tmp0 = ops.index_expr(i0, torch.uint16)\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]       tmp1 = ops.index_expr(i1, torch.uint16)\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]       tmp2 = tmp0 == tmp1\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]       tmp3 = ops.to_dtype(tmp2, torch.float32, src_dtype=torch.bool, use_compute_types=True)\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]       return tmp3\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]   ,\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]   ranges=[256, 256],\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]   origin_node=convert_element_type,\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]   origins=OrderedSet([convert_element_type, eq, unsqueeze, iota...,\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]   stack_traces = {,\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]     File \"/tmp/while_mini_repro.py\", line 12, in forward,\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]       I = torch.eye(Xi.shape[-1], dtype=Xi.dtype, device=Xi.device),\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]   ,\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]   }\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0] ), _split_size=None, _original_inner_fn=None, _original_ranges=None, _original_reduction_ranges=None)\nTraceback (most recent call last):\n  File \"/tmp/while_mini_repro.py\", line 26, in <module>\n    compiled(x, Xi)\n  File \"/torch/_dynamo/eval_frame.py\", line 511, in __call__\n    return super().__call__(*args, **kwargs)\n  File \"/torch/nn/modules/module.py\", line 1778, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n  File \"/torch/nn/modules/module.py\", line 1789, in _call_impl\n    return forward_call(*args, **kwargs)\n  File \"/torch/_dynamo/eval_frame.py\", line 1183, in compile_wrapper\n    raise e.remove_dynamo_frames() from None  # see TORCHDYNAMO_VERBOSE=1\n  File \"/torch/_inductor/compile_fx.py\", line 1079, in _compile_fx_inner\n    raise InductorError(e, currentframe()).with_traceback(\n  File \"/torch/_inductor/compile_fx.py\", line 1059, in _compile_fx_inner\n    mb_compiled_graph = fx_codegen_and_compile(\n  File \"/torch/_inductor/compile_fx.py\", line 1847, in fx_codegen_and_compile\n    return scheme.codegen_and_compile(gm, example_inputs, inputs_to_check, graph_kwargs)\n  File \"/torch/_inductor/compile_fx.py\", line 1608, in codegen_and_compile\n    compiled_module = graph.compile_to_module()\n  File \"/torch/_inductor/graph.py\", line 2669, in compile_to_module\n    return self._compile_to_module()\n  File \"/torch/_inductor/graph.py\", line 2675, in _compile_to_module\n    self.codegen_with_cpp_wrapper() if self.cpp_wrapper else self.codegen()\n  File \"/torch/_inductor/graph.py\", line 2611, in codegen\n    self.scheduler.codegen()\n  File \"/torch/_inductor/scheduler.py\", line 9206, in codegen\n    self._codegen_partitions()\n  File \"/torch/_inductor/scheduler.py\", line 9354, in _codegen_partitions\n    self._codegen(partition)\n  File \"/torch/_inductor/scheduler.py\", line 9508, in _codegen\n    self.get_backend(device).codegen_node(node)\n  File \"/torch/_inductor/codegen/simd.py\", line 2966, in codegen_node\n    return self._codegen_nodes(nodes, coalesce_analysis)  # type: ignore[arg-type]\n  File \"/torch/_inductor/codegen/simd.py\", line 2939, in _codegen_nodes\n    return self.codegen_node_schedule(\n  File \"/torch/_inductor/codegen/simd.py\", line 3054, in codegen_node_schedule\n    self.codegen_node_schedule_with_kernel(node_schedule, kernel)\n  File \"/torch/_inductor/codegen/simd.py\", line 3183, in codegen_node_schedule_with_kernel\n    node.codegen(index_vars)\n  File \"/torch/_inductor/scheduler.py\", line 2499, in codegen\n    self._body(*index_vars)\n  File \"/torch/_inductor/loop_body.py\", line 542, in __call__\n    result = self.root_block()\n  File \"/torch/_inductor/loop_body.py\", line 644, in __call__\n    return InterpreterShim(graph, submodules).run(V.get_ops_handler())\n  File \"/torch/_inductor/loop_body.py\", line 64, in run\n    return super().run(*args, **kwargs)\n  File \"/torch/fx/interpreter.py\", line 197, in run\n    self.env[node] = self.run_node(node)\n  File \"/torch/_inductor/loop_body.py\", line 60, in run_node\n    return super().run_node(n)\n  File \"/torch/fx/interpreter.py\", line 294, in run_node\n    return getattr(self, n.op)(n.target, args, kwargs)\n  File \"/torch/fx/interpreter.py\", line 402, in call_method\n    return getattr(self_obj, target)(*args_tail, **kwargs)\n  File \"/torch/_inductor/sizevars.py\", line 1563, in value_expr\n    return self._inner.value_expr(self._simplify(index), dtype)\n  File \"<string>\", line 434, in value_expr\n  File \"/torch/_inductor/codegen/common.py\", line 2671, in _default\n    value = getattr(self.parent_handler, name)(*args, **kwargs)\n  File \"/torch/_inductor/codegen/mps.py\", line 227, in value_expr\n    return MetalOverrides.index_expr(expr, dtype)\n  File \"/torch/_inductor/codegen/mps.py\", line 221, in index_expr\n    return ops.to_dtype(var, dtype)\n  File \"/torch/_inductor/ops_handler.py\", line 814, in call_default\n    return self._default(target, args, kwargs)\n  File \"/torch/_inductor/virtualized.py\", line 337, in _default\n    return OpsWrapper._wrap(getattr(_ops, name)(*new_args, **new_kwargs))\n  File \"/torch/_inductor/ops_handler.py\", line 814, in call_default\n    return self._default(target, args, kwargs)\n  File \"/torch/_inductor/ops_handler.py\", line 1078, in _default\n    return getattr(self._inner, name)(*args, **kwargs)\n  File \"/torch/_inductor/ops_handler.py\", line 814, in call_default\n    return self._default(target, args, kwargs)\n  File \"/torch/_inductor/codegen/common.py\", line 2671, in _default\n    value = getattr(self.parent_handler, name)(*args, **kwargs)\n  File \"/torch/_inductor/codegen/mps.py\", line 203, in to_dtype\n    return f\"static_cast<{DTYPE_TO_METAL[dtype]}>({x})\"\ntorch._inductor.exc.InductorError: KeyError: torch.uint16\n```\n\n### Versions\n\nPyTorch version: 2.13.0\nIs debug build: False\nCUDA used to build PyTorch: None\nROCM used to build PyTorch: N/A\n\nOS: macOS 26.5.2 (arm64)\nGCC version: Could not collect\nClang version: 19.0.0git (https://github.com/llvm/llvm-project.git 4ae896fe979b7db501cabde4b6b3504478958682)\nCMake version: version 3.30.3\nLibc version: N/A\n\nPython version: 3.10.20 | packaged by conda-forge | (main, Mar  5 2026, 17:06:34) [Clang 19.1.7 ] (64-bit runtime)\nPython platform: macOS-26.5.2-arm64-arm-64bit\nIs CUDA available: False\nCUDA runtime version: No CUDA\nCUDA_MODULE_LOADING set to: N/A\nGPU models and configuration: No CUDA\nNvidia driver version: No CUDA\ncuDNN version: No CUDA\nIs XPU available: False\nHIP runtime version: N/A\nMIOpen runtime version: N/A\nIs XNNPACK available: False\nCaching allocator config: N/A\n\ncc @kulinseth @malfet @DenisVieriu97 @jhavukainen @aditvenk @Isalia20 @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @aakhundov @coconutruben @jataylo",
+      "comments": []
+    },
+    {
+      "number": 190841,
+      "title": "Standardize slot handler naming in `torch/_dynamo`",
+      "url": "https://github.com/pytorch/pytorch/issues/190841",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/190841",
+      "state": "open",
+      "author": "guilhermeleobas",
+      "created_at": "2026-07-23T02:02:43Z",
+      "updated_at": "2026-08-03T16:52:58Z",
+      "closed_at": null,
+      "labels": [
+        "good first issue",
+        "triaged",
+        "enhancement",
+        "oncall: pt2",
+        "module: dynamo",
+        "bot-triaged"
+      ],
+      "comments_count": 6,
+      "matched_keywords": [
+        "dynamo"
+      ],
+      "body": "Following https://github.com/pytorch/pytorch/issues/190702, we would like to standardize the slots functions to follow a specific naming convention as well. I did a little research and I think a good naming convention would be `<family>_<slot_name>_impl`. \n\nThe methods that needs to be updated are:\n\n| Field | Current | New |\n|---|---|---|\n| `nb_bool` | `bool_impl` | `nb_bool_impl` |\n| `sq_length` | `sq_length` | `sq_length_impl` |\n| `sq_contains` | `sq_contains` | `sq_contains_impl` |\n| `mp_length` | `mp_length` | `mp_length_impl` |\n| `tp_repr` | `repr_impl` | `tp_repr_impl` |\n| `tp_str` | `str_impl` | `tp_str_impl` |\n| `tp_getattro` | `getattro_impl` | `tp_getattro_impl` |\n| `tp_setattro` | `setattro_impl` | `tp_setattro_impl` |\n| `tp_richcompare` | `richcompare_impl` | `tp_richcompare_impl` |\n\ncc @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @kadeng @amjames @jataylo @azahed98",
+      "comments": [
+        {
+          "author": "omkar-334",
+          "created_at": "2026-07-23T03:01:55Z",
+          "updated_at": "2026-07-23T03:01:55Z",
+          "body": "i would like to work on this",
+          "url": "https://github.com/pytorch/pytorch/issues/190841#issuecomment-5053837447"
+        },
+        {
+          "author": "ekansh-exe",
+          "created_at": "2026-07-23T04:33:00Z",
+          "updated_at": "2026-07-23T04:33:00Z",
+          "body": "@omkar-334 if you are not taking this issue, can I take it up ?",
+          "url": "https://github.com/pytorch/pytorch/issues/190841#issuecomment-5054389718"
+        },
+        {
+          "author": "omkar-334",
+          "created_at": "2026-07-23T04:34:01Z",
+          "updated_at": "2026-07-23T04:34:01Z",
+          "body": "i am working on this ",
+          "url": "https://github.com/pytorch/pytorch/issues/190841#issuecomment-5054398601"
+        },
+        {
+          "author": "ibrakhim2906",
+          "created_at": "2026-07-24T08:11:51Z",
+          "updated_at": "2026-07-24T08:11:51Z",
+          "body": "I would like to work on this\n",
+          "url": "https://github.com/pytorch/pytorch/issues/190841#issuecomment-5067639489"
+        },
+        {
+          "author": "tomatotomata",
+          "created_at": "2026-08-01T09:04:58Z",
+          "updated_at": "2026-08-01T09:04:58Z",
+          "body": "I was thinking of taking this as a focused rename pass for the nine listed slot handlers, then checking the torch/_dynamo references and adding or updating the narrow regression coverage that exercises those generated names. I would keep compatibility concerns in scope by searching for string-based lookups and avoiding unrelated Dynamo cleanup. Does that scope match what the oncall team expects for this issue?",
+          "url": "https://github.com/pytorch/pytorch/issues/190841#issuecomment-5150752590"
+        },
+        {
+          "author": "guilhermeleobas",
+          "created_at": "2026-08-03T16:52:58Z",
+          "updated_at": "2026-08-03T16:52:58Z",
+          "body": "Thanks for the intestest in working on this but there's already a PR opened in https://github.com/pytorch/pytorch/pull/191011",
+          "url": "https://github.com/pytorch/pytorch/issues/190841#issuecomment-5169283239"
+        }
+      ]
+    },
+    {
+      "number": 127973,
+      "title": "Torch compile OpenMP error with simple nn.Module",
+      "url": "https://github.com/pytorch/pytorch/issues/127973",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/127973",
+      "state": "closed",
+      "author": "thomasahle",
+      "created_at": "2024-06-04T22:49:35Z",
+      "updated_at": "2026-08-03T16:07:29Z",
+      "closed_at": "2026-08-03T16:07:29Z",
+      "labels": [
+        "triaged",
+        "module: macos",
+        "module: openmp",
+        "has workaround",
+        "oncall: pt2"
+      ],
+      "comments_count": 7,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "### 🐛 Describe the bug\n\nI'm running the following program on python3.11.\r\nIt fails with both torch2.2 and torch2.3, but with different errors.\r\n\r\n```python\r\nimport torch\r\nimport torch.nn as nn\r\n\r\nclass Net(nn.Module):\r\n    def __init__(self, dim):\r\n        super().__init__()\r\n        self.w1 = nn.Parameter(torch.empty(dim, dim))\r\n\r\n    def forward(self, x: torch.Tensor):\r\n        x = x[:, None, :] * self.w1\r\n        x = torch.relu(x).sum(-1)\r\n        return x\r\n\r\ndef test(batch_size, dim):\r\n    print(batch_size, dim)\r\n    x = torch.randn(batch_size, dim)\r\n    func = torch.compile(Net(dim))\r\n    result = func(x)\r\n    result.sum().backward()\r\n\r\nfor dim in [2**i for i in range(10)]:\r\n    test(1, dim)\r\n```\r\n\r\nWith torch2.2.2 this fails with the error\r\n```\r\n[2024-06-04 15:45:00,474] torch._dynamo.convert_frame: [WARNING] torch._dynamo hit config.cache_size_limit (8)\r\n[2024-06-04 15:45:00,474] torch._dynamo.convert_frame: [WARNING]    function: 'forward' (/Users/ahle/kode/cuda_test/repro.py:9)\r\n[2024-06-04 15:45:00,474] torch._dynamo.convert_frame: [WARNING]    last reason: ___guarded_code.valid\r\n[2024-06-04 15:45:00,474] torch._dynamo.convert_frame: [WARNING] To log all recompilation reasons, use TORCH_LOGS=\"recompiles\".\r\n[2024-06-04 15:45:00,474] torch._dynamo.convert_frame: [WARNING] To diagnose recompilation issues, see https://pytorch.org/docs/master/compile/troubleshooting.html.\r\n1 512\r\n```\r\n\r\nI upgraded to torch2.3.0, but now it fails with \r\n```\r\nOMP: Error #15: Initializing libomp.dylib, but found libomp.dylib already initialized.\r\nOMP: Hint This means that multiple copies of the OpenMP runtime have been linked into the program. That is dangerous, since it can degrade performance or cause incorrect results. The best thing to do is to ensure that only a single OpenMP runtime is linked into the process, e.g. by avoiding static linking of the OpenMP runtime in any library. As an unsafe, unsupported, undocumented workaround you can set the environment variable KMP_DUPLICATE_LIB_OK=TRUE to allow the program to continue to execute, but that may cause crashes or silently produce incorrect results. For more information, please see http://openmp.llvm.org/\r\nAbort trap: 6\r\n/opt/homebrew/Cellar/python@3.11/3.11.8/Frameworks/Python.framework/Versions/3.11/lib/python3.11/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown\r\n  warnings.warn('resource_tracker: There appear to be %d '\r\n```\r\n\r\nI tried to disable to duplicate library check with `KMP_DUPLICATE_LIB_OK=True`, but even then it still fails with\r\n```\r\nOMP: Error #179: Function pthread_mutex_init failed:\r\nOMP: System error #22: Invalid argument\r\nSegmentation fault: 11\r\n/opt/homebrew/Cellar/python@3.11/3.11.8/Frameworks/Python.framework/Versions/3.11/lib/python3.11/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown\r\n  warnings.warn('resource_tracker: There appear to be %d '\r\n```\n\n### Versions\n\nCollecting environment information...\r\nPyTorch version: N/A\r\nIs debug build: N/A\r\nCUDA used to build PyTorch: N/A\r\nROCM used to build PyTorch: N/A\r\n\r\nOS: macOS 13.4.1 (arm64)\r\nGCC version: Could not collect\r\nClang version: 14.0.3 (clang-1403.0.22.14.1)\r\nCMake version: version 3.28.1\r\nLibc version: N/A\r\n\r\nPython version: 3.11.5 (main, Sep 11 2023, 08:31:25) [Clang 14.0.6 ] (64-bit runtime)\r\nPython platform: macOS-13.4.1-arm64-arm-64bit\r\nIs CUDA available: N/A\r\nCUDA runtime version: Could not collect\r\nCUDA_MODULE_LOADING set to: N/A\r\nGPU models and configuration: Could not collect\r\nNvidia driver version: Could not collect\r\ncuDNN version: Could not collect\r\nHIP runtime version: N/A\r\nMIOpen runtime version: N/A\r\nIs XNNPACK available: N/A\r\n\r\nCPU:\r\nApple M2 Pro\r\n\r\nVersions of relevant libraries:\r\n[pip3] No relevant packages\r\n[conda] No relevant packages\r\n\n\ncc @malfet @albanD @ezyang @msaroufim @bdhirsh @anijain2305 @chauhang",
+      "comments": [
+        {
+          "author": "thomasahle",
+          "created_at": "2024-06-04T22:54:59Z",
+          "updated_at": "2024-06-04T22:55:11Z",
+          "body": "It seems to work with torch==2.1.\r\nIt also works on my server with cuda, all torch versions.\r\nSo maybe it's a Mac thing...",
+          "url": "https://github.com/pytorch/pytorch/issues/127973#issuecomment-2148545735"
+        },
+        {
+          "author": "malfet",
+          "created_at": "2024-06-05T00:27:14Z",
+          "updated_at": "2024-06-05T00:27:14Z",
+          "body": "Sounds like a spiritual duplicate of https://github.com/pytorch/pytorch/issues/124497\r\n\r\nWorkaround is to uninstall another OpenMP binary or symlink them together",
+          "url": "https://github.com/pytorch/pytorch/issues/127973#issuecomment-2148622608"
+        },
+        {
+          "author": "StrongerXi",
+          "created_at": "2025-02-24T19:14:59Z",
+          "updated_at": "2025-02-24T19:14:59Z",
+          "body": "Doing old issue scrubbing, I can't repro this on Linux, d0f08dc3ebc. @malfet is this still on your plate and relevant?",
+          "url": "https://github.com/pytorch/pytorch/issues/127973#issuecomment-2679419873"
+        },
+        {
+          "author": "malfet",
+          "created_at": "2025-02-24T19:41:55Z",
+          "updated_at": "2025-02-24T19:41:55Z",
+          "body": "> Doing old issue scrubbing, I can't repro this on Linux, d0f08dc3ebc. \n\n@StrongerXi Mind sharing your repro steps? (Also please note, that author of the issue mentions that this is a Mac specific problem, but one can probably repro it on Linux)\n",
+          "url": "https://github.com/pytorch/pytorch/issues/127973#issuecomment-2679477915"
+        },
+        {
+          "author": "StrongerXi",
+          "created_at": "2025-02-24T20:58:21Z",
+          "updated_at": "2025-02-24T20:58:21Z",
+          "body": "> > Doing old issue scrubbing, I can't repro this on Linux, [d0f08dc](https://github.com/pytorch/pytorch/commit/d0f08dc3ebcc2df3bbe8a6a94ef1425a0f0a2386).\n> \n> [@StrongerXi](https://github.com/StrongerXi) Mind sharing your repro steps? (Also please note, that author of the issue mentions that this is a Mac specific problem, but one can probably repro it on Linux)\n\nJust running the shared repro code.\n```\nimport torch\nimport torch.nn as nn\n\nclass Net(nn.Module):\n    def __init__(self, dim):\n        super().__init__()\n        self.w1 = nn.Parameter(torch.empty(dim, dim))\n\n    def forward(self, x: torch.Tensor):\n        x = x[:, None, :] * self.w1\n        x = torch.relu(x).sum(-1)\n        return x\n\ndef test(batch_size, dim):\n    print(batch_size, dim)\n    x = torch.randn(batch_size, dim)\n    func = torch.compile(Net(dim))\n    result = func(x)\n    result.sum().backward()\n\nfor dim in [2**i for i in range(10)]:\n    test(1, dim)\n```\n\nI tried it on my mac as well, no error.",
+          "url": "https://github.com/pytorch/pytorch/issues/127973#issuecomment-2679631175"
+        },
+        {
+          "author": "StrongerXi",
+          "created_at": "2025-08-04T19:41:52Z",
+          "updated_at": "2025-08-04T19:41:52Z",
+          "body": "Issue scrubbing. I got the same results -- no error on mac. @malfet can we close this?",
+          "url": "https://github.com/pytorch/pytorch/issues/127973#issuecomment-3152112739"
+        },
+        {
+          "author": "malfet",
+          "created_at": "2026-08-03T16:07:29Z",
+          "updated_at": "2026-08-03T16:07:29Z",
+          "body": "Closing as fixed (don't remember which commit fixed it though)",
+          "url": "https://github.com/pytorch/pytorch/issues/127973#issuecomment-5168820954"
+        }
+      ]
+    },
+    {
+      "number": 191481,
+      "title": "Rename test/inductor/test_cudacodecache.py to test_device_codecache.py",
+      "url": "https://github.com/pytorch/pytorch/issues/191481",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/191481",
+      "state": "open",
+      "author": "tszulist-hbn",
+      "created_at": "2026-07-29T11:46:43Z",
+      "updated_at": "2026-08-03T09:58:08Z",
+      "closed_at": null,
+      "labels": [
+        "module: tests",
+        "triaged",
+        "small",
+        "oncall: pt2",
+        "module: inductor",
+        "bot-triaged"
+      ],
+      "comments_count": 5,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "**Context**\n\nThe rename was originally part of the PR #183530 that added the XPU coverage, but it was deliberately deferred: Keeping the old path made that PR an in-place diff. `test/inductor/test_cudacodecache.py` is no longer CUDA-specific. It now covers CUDA, XPU, and ROCm:\n\n- `TestGPUCodeCache` is device-generic via `instantiate_device_type_tests(..., only_for=(\"cuda\", \"xpu\"), allow_xpu=True)`, with the compiler probe, code cache class, and expected exception type selected per device (`_has_gpu_codecache_compiler`, `_gpu_codecache`, `_compile_error`).\n- ROCm reuses the CUDA source through the `__HIPCC__` guard.\n- `TestXPUCodeCacheClear` covers `XPUCodeCache`'s DLL cache.\n\n**Task**\n\nRename the file to reflect its scope:\n\n      git mv test/inductor/test_cudacodecache.py test/inductor/test_device_codecache.py\n\nand update the one referencing path, `S390X_BLOCKLIST` in test/run_test.py:242:\n\n```\n   -    \"inductor/test_cudacodecache\",\n   +    \"inductor/test_device_codecache\",\n```\n That is the only reference outside the file itself. Done on its own, this is a 100%-similarity rename plus a one-line edit.\n\n**Notes**\n- Anyone tracking flaky/disabled test entries or local scripts keyed on the old module name will need to update them; worth a grep at merge time in case new references land in the meantime.\n- No test bodies or class names change, so there is no impact on which tests run or on CI sharding beyond the module name itself.\n\ncc @mruberry @voznesenskym @penguinwu @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @chauhang @aakhundov @coconutruben @jataylo",
+      "comments": [
+        {
+          "author": "Pavan910",
+          "created_at": "2026-07-29T16:55:05Z",
+          "updated_at": "2026-07-29T16:55:05Z",
+          "body": "Hi, I'd like to work on this — a straightforward git mv rename plus the S390X_BLOCKLIST update in test/run_test.py. Will grep for any other references before submitting.",
+          "url": "https://github.com/pytorch/pytorch/issues/191481#issuecomment-5120933480"
+        },
+        {
+          "author": "tszulist-hbn",
+          "created_at": "2026-07-29T18:06:48Z",
+          "updated_at": "2026-07-29T18:06:48Z",
+          "body": "Please note that this is a follow-up to https://github.com/pytorch/pytorch/pull/183530, and it depends on that PR. I would prefer to start this one after it has been submitted.",
+          "url": "https://github.com/pytorch/pytorch/issues/191481#issuecomment-5121718370"
+        },
+        {
+          "author": "Pavan910",
+          "created_at": "2026-07-30T13:26:50Z",
+          "updated_at": "2026-07-30T13:26:50Z",
+          "body": "Got it, thanks for the heads up — I'll hold off until  #183530 is merged. Could you tag me here (or I'll keep an eye on it) once it lands so I know when to pick this back up?",
+          "url": "https://github.com/pytorch/pytorch/issues/191481#issuecomment-5131422947"
+        },
+        {
+          "author": "tszulist-hbn",
+          "created_at": "2026-07-30T13:43:44Z",
+          "updated_at": "2026-07-30T13:43:44Z",
+          "body": "Sure thing 👍 ",
+          "url": "https://github.com/pytorch/pytorch/issues/191481#issuecomment-5131607766"
+        },
+        {
+          "author": "tszulist-hbn",
+          "created_at": "2026-08-03T09:58:08Z",
+          "updated_at": "2026-08-03T09:58:08Z",
+          "body": "@Pavan910, https://github.com/pytorch/pytorch/pull/183530 is now in. You can take it from here.",
+          "url": "https://github.com/pytorch/pytorch/issues/191481#issuecomment-5164912545"
+        }
+      ]
+    },
+    {
+      "number": 188336,
+      "title": "AArch64 CPU - Inductor benchmark Regressions",
+      "url": "https://github.com/pytorch/pytorch/issues/188336",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/188336",
+      "state": "open",
+      "author": "aditew01",
+      "created_at": "2026-06-27T14:51:26Z",
+      "updated_at": "2026-08-03T08:05:26Z",
+      "closed_at": null,
+      "labels": [
+        "module: performance",
+        "module: ci",
+        "triaged",
+        "module: regression",
+        "module: arm",
+        "oncall: pt2",
+        "oncall: cpu inductor",
+        "arm priority"
+      ],
+      "comments_count": 10,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "Regression noticed on upstream Compiler Inductor benchmarks after migration to OSDC (ARC) arm64 runners in this PR: https://github.com/pytorch/pytorch/pull/187994  (specifially with the Abs Execution Time field)\nThe overall speedup from the benchmark suite is constant, it mighe be it sees similar slowdown in the Eager path. \nTested this behaviour on commit before and after this PR: \n\n<img width=\"1205\" height=\"316\" alt=\"Image\" src=\"https://github.com/user-attachments/assets/d7196e6c-c865-4cfe-8d36-56aa4a8fb87b\" />\n\nRef: [hud.pytorch.org/benchmark/v3/dashboard/ pre-vs-post-migration-stats](https://hud.pytorch.org/benchmark/v3/dashboard/compiler_inductor?renderGroupId=main&time.start=2026-06-20T00%3A00%3A00.000Z&time.end=2026-06-27T23%3A59%3A59.999Z&filters.repo=pytorch%2Fpytorch&filters.benchmarkName=compiler&filters.mode=inference&filters.dtype=bfloat16&filters.deviceName=cpu+%28aarch64%29&filters.device=cpu&filters.arch=aarch64&filters.suite=all&filters.compiler=default&lbranch=adi%2Ftest_pre_migration&rbranch=adi%2Ftest_migration&rcommit.commit=4f07c525fd9939c71f54d62949060bfac20655bc&rcommit.workflow_id=28288392200&rcommit.date=2026-06-27T12%3A00%3A00Z&rcommit.branch=adi%2Ftest_migration&lcommit.commit=a4a6c8b7bd792a90fcfaafccbdbbda711cf143e5&lcommit.workflow_id=28288399484&lcommit.date=2026-06-27T12%3A00%3A00Z&lcommit.branch=adi%2Ftest_pre_migration&maxSampling=110)\n\n@huydhn  is this expected? \n\ncc @malfet @pytorch/pytorch-dev-infra @snadampal @milpuz01 @nikhil-arm @fadara01 @robert-hardwick @nWEIdia @chauhang @penguinwu",
+      "comments": [
+        {
+          "author": "aditew01",
+          "created_at": "2026-06-29T13:11:40Z",
+          "updated_at": "2026-06-29T13:11:40Z",
+          "body": "@claude triage the issue ",
+          "url": "https://github.com/pytorch/pytorch/issues/188336#issuecomment-4832976559"
+        },
+        {
+          "author": "claude[bot]",
+          "created_at": "2026-06-29T13:12:08Z",
+          "updated_at": "2026-06-29T13:14:34Z",
+          "body": "**Claude finished @aditew01's task in 2m 9s** —— [View job](https://github.com/pytorch/pytorch/actions/runs/28374551307)\n\n---\n### Issue Triage\n\n- [x] Analyze the regression data and PR #187994 context\n- [x] Investigate the runner migration (OSDC/ARC arm64)\n- [x] Classify root cause & recommend labels/next steps\n\n---\n\n### Analysis\n\nThis is a **performance regression on AArch64 CPU** that appeared after migrating the Inductor benchmark jobs to the OSDC (ARC) arm64 runners in #187994. The comparison table shows large jumps in **Abs Execution Time** while accuracy stays `pass` and **Portable speedup stays roughly constant**, e.g.:\n\n| Model | Abs exec time (pre → post) | Approx factor |\n|---|---|---|\n| `mobilenetv2_100` | 52.68ms → 158.30ms | ~3.0x |\n| `deit_base_distilled_patch16_224` | 308.31ms → 514.01ms | ~1.7x |\n| `mobilenetv3_large_100` | 309.20ms → 481.61ms | ~1.6x |\n| `repvgg_a2` | 190.96ms → 292.04ms | ~1.5x |\n| `ghostnet_100` | 138.14ms → 152.06ms | ~1.1x |\n\n**Key signal:** the *speedup* (compiled vs. eager) is essentially unchanged, and you note eager regressed by a similar amount. That points away from a `torch.compile`/Inductor codegen regression and toward the **runner environment itself** — i.e. the new ARC arm64 hosts are measuring slower wall-clock than the previous runners. Common causes for this pattern after a runner migration:\n\n- Different/older Neoverse core generation or lower sustained clocks (no turbo / power policy)\n- Fewer vCPUs or different thread/affinity defaults (`OMP_NUM_THREADS`, core pinning, NUMA)\n- Noisy-neighbor / shared-host contention or thermal throttling on the new fleet\n- Different glibc / kernel / BLAS (e.g. OpenBLAS vs. Arm Compute Library) or `LD_PRELOAD` / allocator differences baked into the new image\n\nSince absolute timings are not normalized across heterogeneous hardware, a runner migration legitimately shifts the baseline. The actionable question for whoever owns the benchmark fleet is whether the new ARC arm64 runners are spec-equivalent (CPU model, core count, threading env) to the pre-migration ones, and whether a fresh baseline needs to be captured for the dashboard.\n\n### Suggested next diagnostics\n- Compare `lscpu` / `nproc` / governor and the `OMP_NUM_THREADS` + thread-affinity settings between the old and new runner images.\n- Confirm the same BLAS/ACL backend and version are present in both images.\n- If the new fleet is intentionally different hardware, the benchmark dashboard baseline likely needs to be re-seeded post-migration rather than treated as a code regression.\n\n### Recommended labels\nBased on the [triage rubric](.claude/skills/triaging-issues), this is a CI-infrastructure-driven performance regression on ARM (root cause is the runner migration, not PT2 codegen), so:\n\n- `module: arm`\n- `module: ci`\n- `module: performance`\n- `module: regression`\n\n> ⚠️ I was unable to apply these labels directly — the `mcp__github__issue_write` tooling isn't available in this session and the `gh` CLI requires an approval I don't have. A maintainer (cc @huydhn) can apply the labels above. If you'd like me to take any further action, please re-run with the appropriate `--allowedTools` granted.\n · branch `claude/issue-188336-20260629-1312`",
+          "url": "https://github.com/pytorch/pytorch/issues/188336#issuecomment-4832980745"
+        },
+        {
+          "author": "huydhn",
+          "created_at": "2026-07-01T05:46:20Z",
+          "updated_at": "2026-07-01T05:46:20Z",
+          "body": "I would not be surprise if this is related.  Although the code is unchanged, the new runner is now managed by Kubernetes instead of running directly on the EC2 instance.  A missing / wrong config here would likely cause performance sensitive job to misbehave.  I don't think I have an answer at the moment, but could take a closer look. ",
+          "url": "https://github.com/pytorch/pytorch/issues/188336#issuecomment-4850641232"
+        },
+        {
+          "author": "aditew01",
+          "created_at": "2026-07-01T08:42:19Z",
+          "updated_at": "2026-07-01T08:42:19Z",
+          "body": "thanks @huydhn ",
+          "url": "https://github.com/pytorch/pytorch/issues/188336#issuecomment-4852244436"
+        },
+        {
+          "author": "aditew01",
+          "created_at": "2026-07-15T12:37:51Z",
+          "updated_at": "2026-07-21T09:19:58Z",
+          "body": "@huydhn followup on this, is this just an issue with incorrect config mapping ?  ",
+          "url": "https://github.com/pytorch/pytorch/issues/188336#issuecomment-4980647906"
+        },
+        {
+          "author": "jathu",
+          "created_at": "2026-07-23T19:42:38Z",
+          "updated_at": "2026-07-23T19:42:38Z",
+          "body": "@aditew01 Huy is OOO this week. He'll look into this next week",
+          "url": "https://github.com/pytorch/pytorch/issues/188336#issuecomment-5062617427"
+        },
+        {
+          "author": "huydhn",
+          "created_at": "2026-07-28T01:43:02Z",
+          "updated_at": "2026-07-28T01:46:59Z",
+          "body": "@aditew01 I'm back now, sorry for the delay. In this case, I want to raise an observation about the nature of the regression.  The main purpose of the dashboard per my understanding is to see if torch.compile regress against eager, namely the `speedup` metric.  In this case, both of them are slower because the job now runs in k8s and not directly on AWS metal host anymore, but the relative `speedup` is unchanged.\n\nMy question is if we even need to get back to the old abs wall clock time (execution time, compilation time) given that the relative `speedup` is still here and any regression in `speedup` will still show up as expected.  This is similar to, for example, updating the job to run on a different ARM runners, g3 for example, thus the abs wall clocks would definitely change, and we just ack this fact.\n\nWdyt?\n\nIn the meantime, I will still try to understand why the abs wall clock is lower.\n\ncc @albanD ",
+          "url": "https://github.com/pytorch/pytorch/issues/188336#issuecomment-5098924697"
+        },
+        {
+          "author": "huydhn",
+          "created_at": "2026-08-01T02:03:23Z",
+          "updated_at": "2026-08-01T02:04:02Z",
+          "body": "Potential fix https://github.com/pytorch/ci-infra/pull/969 to introduce the same metal runner as before. I still need to test this out in staging to confirm that the benchmark numbers are sane",
+          "url": "https://github.com/pytorch/pytorch/issues/188336#issuecomment-5148985222"
+        },
+        {
+          "author": "huydhn",
+          "created_at": "2026-08-03T07:20:10Z",
+          "updated_at": "2026-08-03T07:25:17Z",
+          "body": "Root-caused and validated. The aarch64 perf runner was not on the hardware its label implied.\n\n## Cause\n\n`linux.arm64.m8g.metal-24xl` maps to the OSDC runner `l-barm64g4-94-344`, which was defined on a virtualized `m8g.24xlarge` as a stand-in for the real `m8g.metal-24xl`. Worse, its fleet (`m8g-large`) lists `m8g.48xlarge` at weight 100, so Karpenter was actually provisioning a **192-core / 768 GiB** node and running the 94-core job on part of it.\n\nGraviton4 is 96 cores per socket, so `m8g.48xlarge` is two sockets / two NUMA nodes. The 94-core cgroup straddled both and paid cross-socket memory traffic on every iteration — which is exactly the kind of thing that inflates absolute wall clock while leaving the inductor-vs-eager ratio intact.\n\nThe benchmark records themselves confirm the backing. `runners[0]` from the uploaded results:\n\n```\nnightlies on main   cpu_count=192  avail_mem_in_gb=742    <- m8g.48xlarge, dual-socket\nmock run on metal   cpu_count=96   avail_mem_in_gb=376    <- m8g.metal-24xl, single socket\n```\n\n## Fix and validation\n\npytorch/ci-infra#969 re-points the runner to a real `m8g.metal-24xl` on a dedicated single-instance fleet, so no virtualized node can be substituted in. Validated with #191823, which routes this workflow at the staging cluster where that change is deployed.\n\nMock run vs the median of three `main` nightlies (`inference` / `bfloat16`, config parity verified: `repeat=30, iterations=2, batch_size=None, threads=None`):\n\n| Metric | Median delta | Improved |\n|---|---|---|\n| `abs_latency` | **-49.7%** | 291 / 292 models |\n| `compilation_latency` | -4.0% | 230 / 286 |\n| `speedup` (relative) | -3.5% | flat |\n\nBy suite, `abs_latency`: huggingface -41.6% (n=103), torchbench -73.4% (n=189).\n\nExamples (ms, `inductor_aot_inductor`):\n\n```\nBartForCausalLM                  497.5 -> 263.4   -47%\nElectraForCausalLM               263.3 -> 133.8   -49%\nM2M100ForConditionalGeneration   710.8 -> 352.2   -50%\nBertForMaskedLM                  491.5 -> 273.8   -44%\nAlbertForMaskedLM               1675.8 -> 1280.4  -24%\n```\n\nThis reproduces the decoupling reported here, in reverse: absolute time halves while relative speedup stays flat. It also ran on *fewer* cores (92 vs 94), so this is not \"more CPU\".\n\nData: `s3://ossci-benchmarks/v3/pytorch/pytorch/{workflow_id}/`, workflow `30680927631` (metal) vs `30738497917` / `30690425905` / `30614840265` (baseline).",
+          "url": "https://github.com/pytorch/pytorch/issues/188336#issuecomment-5163442854"
+        },
+        {
+          "author": "aditew01",
+          "created_at": "2026-08-03T08:05:26Z",
+          "updated_at": "2026-08-03T08:05:26Z",
+          "body": "Thank you @huydhn for looking into it!",
+          "url": "https://github.com/pytorch/pytorch/issues/188336#issuecomment-5163809992"
+        }
+      ]
+    }
+  ]
+}
