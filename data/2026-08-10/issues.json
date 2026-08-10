@@ -1,0 +1,343 @@
+{
+  "metadata": {
+    "repo": "pytorch/pytorch",
+    "keywords": [
+      "compile",
+      "inductor",
+      "dynamo"
+    ],
+    "generated_at": "2026-08-10T04:00:05.173480+00:00",
+    "since": "2026-08-09T04:00:05.173480+00:00",
+    "lookback_hours": 24.0,
+    "timezone": "Asia/Shanghai",
+    "report_date": "2026-08-10",
+    "issue_count": 10
+  },
+  "issues": [
+    {
+      "number": 192709,
+      "title": "[Bug] CPU FP8 `scaled_mm` produces NaN under torch.compile with zero-dim tensor",
+      "url": "https://github.com/pytorch/pytorch/issues/192709",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/192709",
+      "state": "open",
+      "author": "XAheli",
+      "created_at": "2026-08-10T02:58:42Z",
+      "updated_at": "2026-08-10T03:22:57Z",
+      "closed_at": null,
+      "labels": [
+        "oncall: cpu inductor",
+        "bot-triaged"
+      ],
+      "comments_count": 2,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "### 🐛 Describe the bug\n\n`test_zero_dim_tensorwise` fails on CPU when `which_dim_zero=1` and `use_torch_compile=True`. The FP8 `scaled_mm` path produces NaN values (22.1% element mismatch) instead of matching the eager result.\n\nThe CUDA variant of this issue was fixed in #183964 (which resolved #175206), but the CPU path appears to have the same underlying bug. The fix likely only addressed the CUDA/inductor codegen path and missed the CPU FP8 emulation kernel.\n\n### Reproduction\n\n```bash\npython test/test_scaled_matmul_cuda.py TestFP8MatmulCPU.test_zero_dim_tensorwise_which_dim_zero_1_use_torch_compile_True_cpu\n```\n\n### Error\n\n```\nFAIL: test_zero_dim_tensorwise_which_dim_zero_1_use_torch_compile_True_cpu\n\nTraceback (most recent call last):\n  File \"test/test_scaled_matmul_cuda.py\", line 1937, in test_zero_dim_tensorwise\n    self.assertEqual(out_fp32, out_fp8.to(torch.float))\nAssertionError: Tensor-likes are not close!\n\nMismatched elements: 226 / 1024 (22.1%)\nGreatest absolute difference: nan at index (0, 18) (up to 1e-05 allowed)\nGreatest relative difference: nan at index (0, 18) (up to 1.3e-06 allowed)\n```\n\n### Environment\n\n- PyTorch: 2.14.0a0+gitac94967 (built from source, upstream/main)\n- Python: 3.11.15\n- Hardware: NVIDIA H200, tested on CPU path\n- OS: Linux (RHEL-based)\n\n### Context\n\n- The test was introduced in #164266 (split scaled-mm tests into separate file)\n- #175206 reported a similar CUDA regression with mixed scalar/single-element scale shapes under `torch.compile`\n- #183964 fixed the CUDA variant by normalizing tensorwise scales before template config generation\n- Only the `torch.compile=True` + `which_dim_zero=1` combination fails; eager mode and `which_dim_zero=0` pass fine\n\ncc @amjames @jansel @chauhang @muchulee8",
+      "comments": [
+        {
+          "author": "ty239",
+          "created_at": "2026-08-10T03:06:53Z",
+          "updated_at": "2026-08-10T03:06:53Z",
+          "body": "Hi! Can I be assigned to this issue? I’d like to work on it and investigate a fix. Thanks!",
+          "url": "https://github.com/pytorch/pytorch/issues/192709#issuecomment-5235427314"
+        },
+        {
+          "author": "XAheli",
+          "created_at": "2026-08-10T03:22:57Z",
+          "updated_at": "2026-08-10T03:22:57Z",
+          "body": "> Hi! Can I be assigned to this issue? I’d like to work on it and investigate a fix. Thanks!\n\nHi @ty239 I'm already working on the PR and will be opening soon :)",
+          "url": "https://github.com/pytorch/pytorch/issues/192709#issuecomment-5235517295"
+        }
+      ]
+    },
+    {
+      "number": 191942,
+      "title": "[Inductor] Metal code generation failing for uint16",
+      "url": "https://github.com/pytorch/pytorch/issues/191942",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/191942",
+      "state": "closed",
+      "author": "rYm-A",
+      "created_at": "2026-08-03T17:14:33Z",
+      "updated_at": "2026-08-10T01:45:32Z",
+      "closed_at": "2026-08-10T01:45:32Z",
+      "labels": [
+        "triaged",
+        "module: mps",
+        "oncall: pt2",
+        "module: inductor",
+        "module: unsigned int",
+        "bot-triaged"
+      ],
+      "comments_count": 0,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "### 🐛 Describe the bug\n\nThe presence of larger dimension size of 255 in the operator torch.eye causes an error during the code generation in Inductor: the Metal code cannot be generated from the scheduled kernel. \n\nThe error seems to point to [this dictionary](https://github.com/pytorch/pytorch/blob/dc1c3dfd991f182532c0b434e73f07736d78d6eb/torch/_inductor/codegen/mps.py#L42), where the torch.uint16 data type is not included. @malfet is there a reason why is this type not included if it's supported according the [documentation](https://developer.apple.com/documentation/metal/mtldatatype/ushort)?\n\nRepro:\n```python\nimport torch\nimport torch.nn as nn\nfrom typing import Tuple\n\nclass OnlyEye(nn.Module):\n\n    def forward(self, x0: torch.Tensor, Xi: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:\n        I = torch.eye(Xi.shape[-1], dtype=Xi.dtype, device=Xi.device)\n        sol = Xi + 1\n        err = torch.matmul(Xi, I)\n\n        return sol, err\n\nS = 256\ndevice = torch.device(\"mps\")\nx = torch.zeros(S, dtype=torch.float32, device=device)\nXi = torch.zeros(10, S, dtype=torch.float32, device=device)\n\nmodel = OnlyEye().eval().to(device)\ncompiled = torch.compile(model)\nwith torch.inference_mode():\n    compiled(x, Xi)\n```\n\n### Error logs\n\n```\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0] Error in codegen for ComputedBuffer(name='buf1', layout=FixedLayout('mps:0', torch.float32, size=[256, 256], stride=[256, 1]), data=Pointwise(\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]   'mps',\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]   torch.float32,\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]   def inner_fn(index):\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]       i0, i1 = index\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]       tmp0 = ops.index_expr(i0, torch.uint16)\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]       tmp1 = ops.index_expr(i1, torch.uint16)\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]       tmp2 = tmp0 == tmp1\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]       tmp3 = ops.to_dtype(tmp2, torch.float32, src_dtype=torch.bool, use_compute_types=True)\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]       return tmp3\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]   ,\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]   ranges=[256, 256],\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]   origin_node=convert_element_type,\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]   origins=OrderedSet([convert_element_type, eq, unsqueeze, iota...,\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]   stack_traces = {,\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]     File \"/tmp/while_mini_repro.py\", line 12, in forward,\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]       I = torch.eye(Xi.shape[-1], dtype=Xi.dtype, device=Xi.device),\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]   ,\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0]   }\nC0803 19:07:34.877000 8316 site-packages/torch/_inductor/scheduler.py:2501] [0/0] ), _split_size=None, _original_inner_fn=None, _original_ranges=None, _original_reduction_ranges=None)\nTraceback (most recent call last):\n  File \"/tmp/while_mini_repro.py\", line 26, in <module>\n    compiled(x, Xi)\n  File \"/torch/_dynamo/eval_frame.py\", line 511, in __call__\n    return super().__call__(*args, **kwargs)\n  File \"/torch/nn/modules/module.py\", line 1778, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n  File \"/torch/nn/modules/module.py\", line 1789, in _call_impl\n    return forward_call(*args, **kwargs)\n  File \"/torch/_dynamo/eval_frame.py\", line 1183, in compile_wrapper\n    raise e.remove_dynamo_frames() from None  # see TORCHDYNAMO_VERBOSE=1\n  File \"/torch/_inductor/compile_fx.py\", line 1079, in _compile_fx_inner\n    raise InductorError(e, currentframe()).with_traceback(\n  File \"/torch/_inductor/compile_fx.py\", line 1059, in _compile_fx_inner\n    mb_compiled_graph = fx_codegen_and_compile(\n  File \"/torch/_inductor/compile_fx.py\", line 1847, in fx_codegen_and_compile\n    return scheme.codegen_and_compile(gm, example_inputs, inputs_to_check, graph_kwargs)\n  File \"/torch/_inductor/compile_fx.py\", line 1608, in codegen_and_compile\n    compiled_module = graph.compile_to_module()\n  File \"/torch/_inductor/graph.py\", line 2669, in compile_to_module\n    return self._compile_to_module()\n  File \"/torch/_inductor/graph.py\", line 2675, in _compile_to_module\n    self.codegen_with_cpp_wrapper() if self.cpp_wrapper else self.codegen()\n  File \"/torch/_inductor/graph.py\", line 2611, in codegen\n    self.scheduler.codegen()\n  File \"/torch/_inductor/scheduler.py\", line 9206, in codegen\n    self._codegen_partitions()\n  File \"/torch/_inductor/scheduler.py\", line 9354, in _codegen_partitions\n    self._codegen(partition)\n  File \"/torch/_inductor/scheduler.py\", line 9508, in _codegen\n    self.get_backend(device).codegen_node(node)\n  File \"/torch/_inductor/codegen/simd.py\", line 2966, in codegen_node\n    return self._codegen_nodes(nodes, coalesce_analysis)  # type: ignore[arg-type]\n  File \"/torch/_inductor/codegen/simd.py\", line 2939, in _codegen_nodes\n    return self.codegen_node_schedule(\n  File \"/torch/_inductor/codegen/simd.py\", line 3054, in codegen_node_schedule\n    self.codegen_node_schedule_with_kernel(node_schedule, kernel)\n  File \"/torch/_inductor/codegen/simd.py\", line 3183, in codegen_node_schedule_with_kernel\n    node.codegen(index_vars)\n  File \"/torch/_inductor/scheduler.py\", line 2499, in codegen\n    self._body(*index_vars)\n  File \"/torch/_inductor/loop_body.py\", line 542, in __call__\n    result = self.root_block()\n  File \"/torch/_inductor/loop_body.py\", line 644, in __call__\n    return InterpreterShim(graph, submodules).run(V.get_ops_handler())\n  File \"/torch/_inductor/loop_body.py\", line 64, in run\n    return super().run(*args, **kwargs)\n  File \"/torch/fx/interpreter.py\", line 197, in run\n    self.env[node] = self.run_node(node)\n  File \"/torch/_inductor/loop_body.py\", line 60, in run_node\n    return super().run_node(n)\n  File \"/torch/fx/interpreter.py\", line 294, in run_node\n    return getattr(self, n.op)(n.target, args, kwargs)\n  File \"/torch/fx/interpreter.py\", line 402, in call_method\n    return getattr(self_obj, target)(*args_tail, **kwargs)\n  File \"/torch/_inductor/sizevars.py\", line 1563, in value_expr\n    return self._inner.value_expr(self._simplify(index), dtype)\n  File \"<string>\", line 434, in value_expr\n  File \"/torch/_inductor/codegen/common.py\", line 2671, in _default\n    value = getattr(self.parent_handler, name)(*args, **kwargs)\n  File \"/torch/_inductor/codegen/mps.py\", line 227, in value_expr\n    return MetalOverrides.index_expr(expr, dtype)\n  File \"/torch/_inductor/codegen/mps.py\", line 221, in index_expr\n    return ops.to_dtype(var, dtype)\n  File \"/torch/_inductor/ops_handler.py\", line 814, in call_default\n    return self._default(target, args, kwargs)\n  File \"/torch/_inductor/virtualized.py\", line 337, in _default\n    return OpsWrapper._wrap(getattr(_ops, name)(*new_args, **new_kwargs))\n  File \"/torch/_inductor/ops_handler.py\", line 814, in call_default\n    return self._default(target, args, kwargs)\n  File \"/torch/_inductor/ops_handler.py\", line 1078, in _default\n    return getattr(self._inner, name)(*args, **kwargs)\n  File \"/torch/_inductor/ops_handler.py\", line 814, in call_default\n    return self._default(target, args, kwargs)\n  File \"/torch/_inductor/codegen/common.py\", line 2671, in _default\n    value = getattr(self.parent_handler, name)(*args, **kwargs)\n  File \"/torch/_inductor/codegen/mps.py\", line 203, in to_dtype\n    return f\"static_cast<{DTYPE_TO_METAL[dtype]}>({x})\"\ntorch._inductor.exc.InductorError: KeyError: torch.uint16\n```\n\n### Versions\n\nPyTorch version: 2.13.0\nIs debug build: False\nCUDA used to build PyTorch: None\nROCM used to build PyTorch: N/A\n\nOS: macOS 26.5.2 (arm64)\nGCC version: Could not collect\nClang version: 19.0.0git (https://github.com/llvm/llvm-project.git 4ae896fe979b7db501cabde4b6b3504478958682)\nCMake version: version 3.30.3\nLibc version: N/A\n\nPython version: 3.10.20 | packaged by conda-forge | (main, Mar  5 2026, 17:06:34) [Clang 19.1.7 ] (64-bit runtime)\nPython platform: macOS-26.5.2-arm64-arm-64bit\nIs CUDA available: False\nCUDA runtime version: No CUDA\nCUDA_MODULE_LOADING set to: N/A\nGPU models and configuration: No CUDA\nNvidia driver version: No CUDA\ncuDNN version: No CUDA\nIs XPU available: False\nHIP runtime version: N/A\nMIOpen runtime version: N/A\nIs XNNPACK available: False\nCaching allocator config: N/A\n\ncc @kulinseth @malfet @DenisVieriu97 @jhavukainen @aditvenk @Isalia20 @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @aakhundov @coconutruben @jataylo",
+      "comments": []
+    },
+    {
+      "number": 185888,
+      "title": "[Inductor] as_strided_ metadata mutation is not reflected on original tensor",
+      "url": "https://github.com/pytorch/pytorch/issues/185888",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/185888",
+      "state": "closed",
+      "author": "rookieLiu2018",
+      "created_at": "2026-06-02T04:02:36Z",
+      "updated_at": "2026-08-10T00:27:35Z",
+      "closed_at": "2026-08-10T00:27:35Z",
+      "labels": [
+        "triaged",
+        "module: meta tensors",
+        "oncall: pt2",
+        "module: dynamo",
+        "bot-triaged"
+      ],
+      "comments_count": 1,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "### 🐛 Describe the bug\n\n\n`torch.Tensor.as_strided_` mutates the size/stride metadata of the original tensor in eager mode. However, after compiling the same function with `torch.compile(..., backend=\"inductor\", fullgraph=True, dynamic=True)`, the returned view has the expected metadata, but the original tensor's metadata remains stale.\n\nIn the repro below, eager mode shows that both `x` and `y` have size `(2, 2)` and stride `(2, 1)` after:\n\n```python\ny = x.as_strided_((2, 2), (2, 1))\n```\n\nHowever, the compiled path returns:\n\n```text\nx.size()   == (4,)\nx.stride() == (1,)\n```\n\nwhile `y.size()` and `y.stride()` are correctly `(2, 2)` and `(2, 1)`.\n\nThis looks like an Inductor metadata visibility / mutation semantics issue: the `as_strided_` mutation is reflected on the returned tensor `y`, but not on the original tensor `x`.\n\nExpected behavior: compiled execution should match eager. After `as_strided_`, both `x` and `y` should expose the mutated size/stride metadata.\n\nActual behavior: compiled execution leaves `x.size()` and `x.stride()` stale.\n\n```python\nimport torch\n\ndef fn():\n    x = torch.arange(4.0, dtype=torch.float32)\n    y = x.as_strided_((2, 2), (2, 1))\n    observer = torch.max(y)\n    return y, x.size(), y.size(), x.stride(), y.stride(), observer\n\ndef show(name, out):\n    y, x_size, y_size, x_stride, y_stride, observer = out\n    print(name)\n    print(\"y:\", y)\n    print(\"x_size:\", tuple(x_size))\n    print(\"y_size:\", tuple(y_size))\n    print(\"x_stride:\", tuple(x_stride))\n    print(\"y_stride:\", tuple(y_stride))\n    print(\"max:\", observer)\n\nprint(\"torch\", torch.__version__)\n\neager = fn()\nshow(\"eager\", eager)\n\ncompiled = torch.compile(fn, backend=\"inductor\", fullgraph=True, dynamic=True)\ncompiled_out = compiled()\nshow(\"compiled\", compiled_out)\n```\n\nObserved output:\n\n```text\ntorch 2.10.0+cpu\neager\ny: tensor([[0., 1.],\n        [2., 3.]])\nx_size: (2, 2)\ny_size: (2, 2)\nx_stride: (2, 1)\ny_stride: (2, 1)\nmax: tensor(3.)\ncompiled\ny: tensor([[0., 1.],\n        [2., 3.]])\nx_size: (4,)\ny_size: (2, 2)\nx_stride: (1,)\ny_stride: (2, 1)\nmax: tensor(3.)\n```\n\nThis is not a numerical tolerance issue. The tensor values and `torch.max(y)` match, but the structure/metadata visible through `x.size()` and `x.stride()` differs between eager and compiled execution after the in-place metadata mutation.\n\n\n### Versions\n\n`Pytotch Version: 2.10.0+cpu`\n\ncc @ezyang @eellison @bdhirsh @bobrenjc93 @aorenste @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @kadeng @amjames @jataylo @azahed98",
+      "comments": [
+        {
+          "author": "P1yansh",
+          "created_at": "2026-06-04T08:35:28Z",
+          "updated_at": "2026-06-04T08:35:28Z",
+          "body": "Opened a fix: https://github.com/pytorch/pytorch/pull/186205\n",
+          "url": "https://github.com/pytorch/pytorch/issues/185888#issuecomment-4620433365"
+        }
+      ]
+    },
+    {
+      "number": 185575,
+      "title": "[inductor] Upsample(mode='area') fails under torch.compile(dynamic=True) — \"cannot determine truth value of Relational\" in _adaptive_avg_pool2d lowering",
+      "url": "https://github.com/pytorch/pytorch/issues/185575",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/185575",
+      "state": "closed",
+      "author": "lijunqiang123",
+      "created_at": "2026-05-29T01:17:42Z",
+      "updated_at": "2026-08-10T00:26:43Z",
+      "closed_at": "2026-08-10T00:26:43Z",
+      "labels": [
+        "triaged",
+        "module: pooling",
+        "module: interpolation",
+        "oncall: pt2",
+        "module: dynamic shapes",
+        "module: inductor",
+        "bot-triaged"
+      ],
+      "comments_count": 0,
+      "matched_keywords": [
+        "compile",
+        "inductor"
+      ],
+      "body": "### 🐛 Describe the bug\n\n`nn.Upsample(scale_factor=2, mode='area')` (which decomposes to `aten._adaptive_avg_pool2d` ) crashes under `torch.compile(dynamic=True)` . Inductor's `_adaptive_avg_pool2d` lowering contains a static if `window_size > 25`: branch that cannot be resolved when window_size is a symbolic expression under `dynamic=True` .\n\nEager mode works correctly.\n\n### Minimal repro \n```\nimport torch\nimport torch.nn as nn\n\nx = torch.randn(1, 3, 15, 19)\nm = nn.Upsample(scale_factor=2, mode='area')\nm = torch.compile(m, dynamic=True)\nm(x)    #crash here!\n```\n### Error logs\n```\ntorch._inductor.exc.InductorError: LoweringException: TypeError: cannot determine truth \nvalue of Relational: (((2*TruncToInt(2.0*ToFloat(s69)) + 13)//(TruncToInt(2.0*ToFloat(\ns69)))))*(((2*TruncToInt(2.0*ToFloat(s87)) + 17)//(TruncToInt(2.0*ToFloat(s87))))) > 25\n  target: aten._adaptive_avg_pool2d.default\n  args[0]: TensorBox(StorageBox(\n    InputBuffer(name='arg3_1', layout=FixedLayout('cpu', torch.float32, size=[1, s50, s69, s87],\n    stride=[s50*s69*s87, s69*s87, s87, 1]))\n  ))\n  args[1]: [TruncToInt(2.0*ToFloat(s69)), TruncToInt(2.0*ToFloat(s87))]\n\n  File \"torch/_inductor/lowering.py\", line 5831, in _adaptive_avg_pool2d\n    if window_size > 25:\n       ^^^^^^^^^^^^^^^^\n  File \"sympy/core/relational.py\", line 519, in __bool__\n    raise TypeError(...)\n```\n### Root cause\nIn `torch/_inductor/lowering.py:5831` , `_adaptive_avg_pool2d` lowering uses a static Python `if` to choose between kernel implementations:\n\n```\nif window_size > 25:\n    # one kernel path\nelse:\n    # another kernel path\n```\n\n`Upsample(mode='area')` decomposes to `aten._adaptive_avg_pool2d` . When `dynamic=True` , `window_size` is a symbolic expression (SymInt / SymPy object), and `window_size > 25` returns a `Relational` object instead of `bool` — causing SymPy to refuse evaluation.\n\n### Possible fix\n1. Guard on concrete values: insert `torch._check(window_size > 25)` prior to the static if\n2. Use `torch._sympy.definitely_true() / torch._sympy.could_be_true()` to branch with symbolic awareness\n3. Emit a conditional kernel dispatch that resolves at runtime\n\n\n### Versions\n\n```\nPyTorch version: 2.13.0.dev20260521+cu126\nOS: Linux (Ubuntu 22.04)\nPython: 3.12\nCUDA: 12.6\n```\n\ncc @mikaylagawarecki @chauhang @penguinwu @ezyang @bobrenjc93 @aditvenk @laithsakka @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @aakhundov @coconutruben @jataylo",
+      "comments": []
+    },
+    {
+      "number": 167191,
+      "title": "[dynamo] [dynamic] `nn.LazyLinear` reject SymInt when direct using `torch.compile()`",
+      "url": "https://github.com/pytorch/pytorch/issues/167191",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/167191",
+      "state": "closed",
+      "author": "shaoyuyoung",
+      "created_at": "2025-11-06T05:04:25Z",
+      "updated_at": "2026-08-10T00:26:03Z",
+      "closed_at": "2026-08-10T00:26:03Z",
+      "labels": [
+        "triaged",
+        "oncall: pt2"
+      ],
+      "comments_count": 4,
+      "matched_keywords": [
+        "compile",
+        "dynamo"
+      ],
+      "body": "### 🐛 Describe the bug\n\n```python\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nfrom torch._inductor import config\n\nconfig.fallback_random = True\ntorch.set_grad_enabled(False)\ntorch._dynamo.config.capture_scalar_outputs = True\n\nclass Model(nn.Module):\n\n    def __init__(self):\n        super().__init__()\n        self.lazy_fc = nn.LazyLinear(out_features=128)\n\n    def forward(self, x):\n        x = self.lazy_fc(x)\n        return x\n\n\nmodel = Model()\n\n\nx = torch.randn(1, 28, 28)\n\ninputs = [x]\n\ndevice = \"cpu\"\ndef run_test(model, inputs, device, backend):\n    torch.manual_seed(0)\n    model.to(device)\n    inputs = [input.to(device) for input in inputs]\n    if backend != \"eager\":\n        model = torch.compile(model, backend=backend, dynamic=True)\n    try:\n        output = model(*inputs)\n        print(f\"succeed on {backend}\")\n    except Exception as e:\n        print(e)\n\nrun_test(model, inputs, device, 'aot_eager')\nrun_test(model, inputs, device, 'eager')\n\n\n```\n\nIf we first use eager to initialize lazylinear (i.e., swap the position of the last two lines of code), dynamo can catch `in_features` and run successfully.\n\n### Error logs\n\n```\nRuntimeError: /pytorch/build/aten/src/ATen/RegisterCPU_1.cpp:2512: SymIntArrayRef expected to contain only concrete integers\nsucceed on eager\n```\n\n### Versions\n\n2.10.0.dev20251103+cu126\n\ncc @chauhang @penguinwu",
+      "comments": [
+        {
+          "author": "can-gaa-hou",
+          "created_at": "2025-11-06T07:11:29Z",
+          "updated_at": "2025-11-06T07:11:29Z",
+          "body": "Feels like this is expected.\nhttps://github.com/pytorch/pytorch/blob/ed4aa449b60f0b595e376575362efe739eae00a1/test/dynamo/test_modules.py#L1514-L1520\n\nMaybe caused by the mismatch between Dynamo's symbolic shape tracking (needed for dynamic shapes) and Lazy modules' initialization logic (which needs concrete dimensions to allocate tensors)? I turn dynamic off, and it works :)",
+          "url": "https://github.com/pytorch/pytorch/issues/167191#issuecomment-3495428221"
+        },
+        {
+          "author": "shaoyuyoung",
+          "created_at": "2025-11-06T07:18:02Z",
+          "updated_at": "2025-11-06T07:18:02Z",
+          "body": "\n> I turn dynamic off, and it works\n\nYes, that's exactly where I'm confused. Because in my understanding, even if `dynamic=True` is set, `torch.compile` should also behave consistently with eager.\nFeel free to correct me if i am wrong. :)",
+          "url": "https://github.com/pytorch/pytorch/issues/167191#issuecomment-3495450420"
+        },
+        {
+          "author": "krastogi-in",
+          "created_at": "2025-11-17T07:16:46Z",
+          "updated_at": "2025-11-17T07:16:46Z",
+          "body": "@shaoyuyoung / @can-gaa-hou , Dynamic = True creates symbolic shape which is represented by SymInt datatype whereas in False there is no symbolic shape is created. Lazy modules need to have concrete integers as they do memory allocation. We need typecasting to be there in lazy modules to support symints",
+          "url": "https://github.com/pytorch/pytorch/issues/167191#issuecomment-3540297854"
+        },
+        {
+          "author": "jansel",
+          "created_at": "2026-08-10T00:26:02Z",
+          "updated_at": "2026-08-10T00:26:02Z",
+          "body": "My agent says this is fixed by #188595, landed as commit 1233fd72baa891bc0132f39bf65226609a17e1cd. Current main passes the original LazyLinear dynamic=True reproducer.",
+          "url": "https://github.com/pytorch/pytorch/issues/167191#issuecomment-5234649038"
+        }
+      ]
+    },
+    {
+      "number": 192658,
+      "title": "[Dynamo] Architectural Improvement: Trace-time detection for in-place rank mutation on placeholders",
+      "url": "https://github.com/pytorch/pytorch/issues/192658",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/192658",
+      "state": "open",
+      "author": "P1yansh",
+      "created_at": "2026-08-09T18:48:58Z",
+      "updated_at": "2026-08-09T18:55:10Z",
+      "closed_at": null,
+      "labels": [
+        "triaged",
+        "enhancement",
+        "oncall: pt2",
+        "module: fakeTensor",
+        "module: dynamo",
+        "module: pt2-dispatcher",
+        "bot-triaged"
+      ],
+      "comments_count": 1,
+      "matched_keywords": [
+        "dynamo"
+      ],
+      "body": "**Context:**\nThis issue tracks a future architectural improvement following the fix for internal crash #185888 (in-place rank mutation via `as_strided_` under dynamic shapes). \n\nCurrently, Dynamo allows `FakeTensor`s to mutate their rank in-place during tracing if the user calls an op like `x.as_strided_((2, 2), (2, 1))` on a 1D input. Dynamo only catches this at the very end of compilation during guard generation in `symbolic_shapes.py`, where it raises `Unsupported` and triggers a graph break. \n\nWhile the guard-time fix prevents compiler crashes and silent correctness bugs, it is suboptimal because it allows an invalid state (a mutated placeholder rank) to exist inside the tracing machinery for a brief window.\n\n**The Architectural Goal:**\nThe ideal fix is to intercept this mutation at the exact millisecond it occurs—during `FakeTensor` dispatch in `torch/_subclasses/fake_tensor.py`. If an in-place metadata-mutating op is called on a tensor that is a Dynamo graph input, Dynamo should immediately trigger a graph break.\n\n**Benefits of Trace-Time Detection:**\n1. **Protecting Compiler Invariants:** Prevents invalid IR (mutated placeholder rank) from flowing through downstream FX passes and shape analysis.\n2. **Failing Fast:** Avoids wasting compilation time tracing the rest of a model that is ultimately going to be discarded.\n3. **Accurate Error Localization:** Allows Dynamo to point the user to the exact line of Python code that caused the graph break, rather than a generic \"ambient guard\" failure.\n\n**The Challenge:**\n`FakeTensor` is a low-level primitive used by many PyTorch subsystems (`torch.export`, `torch.jit.trace`, FSDP, etc.). Hardcoding a check like `if tensor.is_dynamo_placeholder` inside `fake_tensor.py` would cross a delicate boundary between the eager subsystem (`torch._subclasses`) and the compiler subsystem (`torch._dynamo`), creating coupling and circular import risks.\n\n**Proposed Direction:**\nInstead of direct coupling, we should use an inversion of control. `FakeTensorMode` could expose generic metadata-mutation hooks. Dynamo could register a listener during tracing that catches these mutations, checks if the tensor is a tracked placeholder, and raises `Unsupported` right then and there.\n\n**Related PRs:**\n* Pending PR for guard-time fix in #185888\n\nGenerated by my agent\n\n\ncc @chauhang @penguinwu @eellison @aorenste @liangel-02 @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @kadeng @amjames @jataylo @azahed98 @bdhirsh @bobrenjc93",
+      "comments": [
+        {
+          "author": "P1yansh",
+          "created_at": "2026-08-09T18:55:10Z",
+          "updated_at": "2026-08-09T18:55:10Z",
+          "body": "cc @ezyang  - Filing this architectural tracking issue based on recent fixes to #185888 regarding in-place rank mutations and FakeTensor.",
+          "url": "https://github.com/pytorch/pytorch/issues/192658#issuecomment-5233312198"
+        }
+      ]
+    },
+    {
+      "number": 192551,
+      "title": "[MPS] Compiled training is 4x slower than eager because layout optimization forces channels_last",
+      "url": "https://github.com/pytorch/pytorch/issues/192551",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/192551",
+      "state": "open",
+      "author": "eyupcanakman",
+      "created_at": "2026-08-07T22:36:36Z",
+      "updated_at": "2026-08-09T13:44:25Z",
+      "closed_at": null,
+      "labels": [
+        "module: performance",
+        "module: convolution",
+        "triaged",
+        "module: mps",
+        "oncall: pt2",
+        "module: inductor",
+        "bot-triaged"
+      ],
+      "comments_count": 1,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "### 🐛 Describe the bug\n\nTraining a small conv net on MPS with torch.compile runs 4.5x slower than eager on the current nightly, and 9x slower on the 2.13.0 release wheel.\nThere are zero graph breaks.\nThe cause is inductor's layout optimization, and setting `TORCHINDUCTOR_LAYOUT_OPTIMIZATION=0` turns compile into a win at every shape I tried.\nI tracked it down with Claude's help and reviewed everything below.\nThe numbers are from my machine.\n\nRepro, batch 256 at 32x32, bf16 autocast, Apple M5 Pro, macOS 27.\n\n```python\nimport time\nimport torch\nimport torch.nn as nn\n\n\nclass Block(nn.Module):\n    def __init__(self, c_in, c_out, stride=1):\n        super().__init__()\n        self.conv1 = nn.Conv2d(c_in, c_out, 3, stride, 1, bias=False)\n        self.bn1 = nn.BatchNorm2d(c_out)\n        self.conv2 = nn.Conv2d(c_out, c_out, 3, 1, 1, bias=False)\n        self.bn2 = nn.BatchNorm2d(c_out)\n        self.short = (\n            nn.Sequential(nn.Conv2d(c_in, c_out, 1, stride, bias=False), nn.BatchNorm2d(c_out))\n            if stride != 1 or c_in != c_out\n            else nn.Identity()\n        )\n\n    def forward(self, x):\n        out = torch.relu(self.bn1(self.conv1(x)))\n        out = self.bn2(self.conv2(out))\n        return torch.relu(out + self.short(x))\n\n\nclass Net(nn.Module):\n    def __init__(self, w=24):\n        super().__init__()\n        self.stem = nn.Sequential(nn.Conv2d(3, w, 3, 1, 1, bias=False), nn.BatchNorm2d(w), nn.ReLU())\n        self.stage1 = Block(w, w)\n        self.stage2 = nn.Sequential(Block(w, 2 * w, 2), Block(2 * w, 2 * w))\n        self.stage3 = nn.Sequential(Block(2 * w, 4 * w, 2), Block(4 * w, 4 * w))\n        self.head = nn.Linear(4 * w, 10)\n\n    def forward(self, x):\n        x = self.stage3(self.stage2(self.stage1(self.stem(x))))\n        return self.head(x.mean(dim=(2, 3)))\n\n\ndev = torch.device(\"mps\")\n\n\ndef bench(compiled, iters=15):\n    torch.manual_seed(0)\n    m = Net().to(dev)\n    if compiled:\n        m.compile()\n    opt = torch.optim.SGD(m.parameters(), lr=0.1, momentum=0.9)\n    lf = nn.CrossEntropyLoss()\n    x = torch.randn(256, 3, 32, 32, device=dev)\n    y = torch.randint(0, 10, (256,), device=dev)\n\n    def step():\n        opt.zero_grad(set_to_none=True)\n        with torch.autocast(\"mps\", dtype=torch.bfloat16):\n            loss = lf(m(x), y)\n        loss.backward()\n        opt.step()\n\n    for i in range(iters + 5):\n        if i == 5:\n            torch.mps.synchronize()\n            t = time.time()\n        step()\n    torch.mps.synchronize()\n    return (time.time() - t) / iters * 1000\n\n\ne = bench(False)\nc = bench(True)\nprint(f\"torch {torch.__version__}\")\nprint(f\"eager:    {e:7.2f} ms/step\")\nprint(f\"compiled: {c:7.2f} ms/step   ({c / e:.2f}x eager)\")\n```\n\nOutput.\n\n```\ntorch 2.14.0.dev20260807\neager:      25.59 ms/step\ncompiled:  114.48 ms/step   (4.47x eager)\n```\n\nSame model swept across input shapes, eager -> compiled ms/step, with layout optimization on (default) and off (`TORCHINDUCTOR_LAYOUT_OPTIMIZATION=0`), each config in a fresh process and cache.\n\n```\n                 layout opt on (default)      TORCHINDUCTOR_LAYOUT_OPTIMIZATION=0\n8x8   b256     7.20 ->   9.87   1.37x           7.18 ->  5.58   0.78x\n16x16 b256     8.81 ->  31.65   3.59x           7.96 ->  6.75   0.85x\n24x24 b128     8.46 ->  35.19   4.16x           8.42 ->  7.11   0.84x\n32x32 b128    13.92 ->  60.50   4.35x          13.75 -> 11.95   0.87x\n32x32 b256    27.36 -> 119.08   4.35x          27.38 -> 19.78   0.72x\n```\n\nWith the flag, compiled is faster than eager at every shape.\nThe regression grows with spatial size, which matches the per-op numbers below.\n\nAI-assisted analysis (Claude), reviewed by me:\n\n`decide_layout_opt` in `torch/_inductor/graph.py` enables channels_last for graphs with convolutions, and `aten.convolution_backward` on MPS runs about 10x slower on channels_last inputs than on contiguous ones at common shapes, so the compiled backward pays that penalty 13 times per step.\nWith `backend=\"eager\"` the step takes 27.0 ms and with `backend=\"aot_eager\"` 26.5 ms, both matching eager, so the loss is inside inductor codegen rather than dynamo or AOTAutograd.\nTiming every call in the generated backward code, with a sync around each call, attributes 84% of the backward to the 13 external `convolution_backward` calls at 8.3 ms per call, while no generated Metal kernel exceeds 1.3 ms.\nThe op on its own shows the layout penalty in bf16.\n\n```\nconvolution_backward (256,24,32,32) w=(24,24,3,3)  contiguous 1.84 ms   channels_last 23.52 ms   12.8x\nconvolution_backward (256,48,16,16) w=(48,48,3,3)  contiguous 0.53 ms   channels_last  5.74 ms   10.9x\nconvolution_backward (256,96,8,8)   w=(96,96,5,5)  contiguous 1.92 ms   channels_last  3.86 ms    2.0x\n```\n\nForward convolution is unaffected and is even faster on channels_last at these shapes (0.48 ms vs 0.94 ms at 32x32), so inference would not notice.\n\nThe heuristics in `decide_layout_opt` come from CUDA benchmarks (the code carries a `TODO - get different values per hardware`) and the function has no MPS branch.\nThe channels_last penalty inside MPS `convolution_backward` itself may deserve its own look, since it grows with spatial size.\n\nEnd of the AI-assisted analysis.\nI patched `decide_layout_opt` locally to skip layout optimization for MPS training graphs and compiled training went from 4.5x slower to 1.3x faster than eager.\nI can send that patch if it is the right direction.\n\nFor reference, #150121 tracks compile on MPS but has no conv training performance item, and #189239 is the mirror problem on CUDA and XPU where backward graphs get too little channels_last rather than too much.\n\n### Versions\n\n```\nPyTorch version: 2.14.0.dev20260807\nIs debug build: False\nCUDA used to build PyTorch: None\nROCM used to build PyTorch: N/A\nOS: macOS 27.0 (arm64)\nGCC version: Could not collect\nClang version: 21.0.0 (clang-2100.1.1.101)\nCMake version: version 4.4.2\nLibc version: N/A\nPython version: 3.12.13 (main, Mar  3 2026, 12:39:30) [Clang 21.0.0 (clang-2100.0.123.102)] (64-bit runtime)\nPython platform: macOS-27.0-arm64-arm-64bit\nIs CUDA available: False\nCUDA runtime version: No CUDA\nCUDA_MODULE_LOADING set to: N/A\nGPU models and configuration: No CUDA\nNvidia driver version: No CUDA\ncuDNN version: No CUDA\nIs XPU available: False\nHIP runtime version: N/A\nMIOpen runtime version: N/A\nIs XNNPACK available: False\nCaching allocator config: N/A\nCPU:\nApple M5 Pro\nVersions of relevant libraries:\n[pip3] numpy==2.5.1\n[pip3] torch==2.14.0.dev20260807\n[conda] Could not collect\n```\n\n\ncc @kulinseth @malfet @DenisVieriu97 @jhavukainen @aditvenk @Isalia20 @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @aakhundov @coconutruben @jataylo",
+      "comments": [
+        {
+          "author": "Isalia20",
+          "created_at": "2026-08-09T13:44:25Z",
+          "updated_at": "2026-08-09T13:44:25Z",
+          "body": "It reproduces on main. Specifically channels last input is the problem:\n```\nimport time\nimport torch\n\n\nWARMUP = 50\nITERATIONS = 200\nINPUT_SHAPE = (256, 24, 32, 32)\nWEIGHT_SHAPE = (24, 24, 3, 3)\n\n\ndef benchmark(memory_format):\n    x = torch.randn(INPUT_SHAPE, device=\"mps\", dtype=torch.bfloat16)\n    grad_output = torch.randn(INPUT_SHAPE, device=\"mps\", dtype=torch.bfloat16)\n    weight = torch.randn(WEIGHT_SHAPE, device=\"mps\", dtype=torch.bfloat16)\n    x = x.contiguous(memory_format=memory_format)\n    grad_output = grad_output.contiguous(memory_format=memory_format)\n    weight = weight.contiguous(memory_format=memory_format)\n\n    def grad_weight():\n        return torch.ops.aten.convolution_backward.default(\n            grad_output,\n            x,\n            weight,\n            None,\n            (1, 1),\n            (1, 1),\n            (1, 1),\n            False,\n            (0, 0),\n            1,\n            (False, True, False),\n        )[1]\n\n    for _ in range(WARMUP):\n        result = grad_weight()\n    torch.mps.synchronize()\n\n    start = time.perf_counter()\n    for _ in range(ITERATIONS):\n        result = grad_weight()\n    torch.mps.synchronize()\n    return (time.perf_counter() - start) * 1000 / ITERATIONS, result.stride()\n\n\ncontiguous_ms, contiguous_stride = benchmark(torch.contiguous_format)\nchannels_last_ms, channels_last_stride = benchmark(torch.channels_last)\n\nprint(f\"contiguous: {contiguous_ms:7.2f} ms  stride={contiguous_stride}\")\nprint(f\"channels_last: {channels_last_ms:7.2f} ms  stride={channels_last_stride}\")\nprint(f\"slowdown: {channels_last_ms / contiguous_ms:7.2f}x\")\n```\n\nleads to:\n```\ntorch 2.14.0a0+git0754e4e\ncontiguous:    2.28 ms  stride=(216, 9, 3, 1)\nchannels_last:   22.14 ms  stride=(216, 1, 72, 24)\nslowdown:    9.72x\n```\n\nNeed to look into this, if it's easily fixable",
+          "url": "https://github.com/pytorch/pytorch/issues/192551#issuecomment-5231832806"
+        }
+      ]
+    },
+    {
+      "number": 192635,
+      "title": "torch.compile peak-memory reordering changes native_dropout RNG order when fallback_random=True",
+      "url": "https://github.com/pytorch/pytorch/issues/192635",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/192635",
+      "state": "open",
+      "author": "O1range",
+      "created_at": "2026-08-09T12:06:37Z",
+      "updated_at": "2026-08-09T12:11:40Z",
+      "closed_at": null,
+      "labels": [
+        "triage review",
+        "module: random",
+        "module: correctness (silent)",
+        "oncall: pt2",
+        "module: inductor",
+        "bot-triaged"
+      ],
+      "comments_count": 0,
+      "matched_keywords": [
+        "compile"
+      ],
+      "body": "## Summary\n\nWhen both of the following Inductor options are enabled:\n\n```python\ntorch._inductor.config.fallback_random = True\ntorch._inductor.config.reorder_for_peak_memory = True\n```\n\n`torch.compile` may reorder independent `aten.native_dropout` calls. The fallback operator consumes the global RNG state, but the scheduler does not see this hidden state dependency. Consequently, the same dropout calls receive different random masks in eager and compiled execution even when `torch.manual_seed()` is reset to the same value immediately before each run.\n\nIn the reproducer below, eager executes the large encoder branch first and the small decoder branch last. Inductor's peak-memory scheduling moves the decoder branch first. This changes both the output and gradients.\n\n## Environment\n\n```text\nPyTorch: 2.12.0+cpu\nGit revision: 7661cd9c6b841b62b7f411aa52ec51f05457263b\nPython: 3.10\nDevice: CPU\n```\n\n## Minimal reproducer\n\n```python\nimport torch\nimport torch.nn.functional as F\nfrom torch.profiler import ProfilerActivity, profile\n\n\ntorch._inductor.config.fallback_random = True\ntorch._inductor.config.reorder_for_peak_memory = True\n\n\ndef model(encoder, decoder):\n    # The branches are independent until the final add. A sufficiently large\n    # graph causes peak-memory scheduling to move the small branch first.\n    for _ in range(17):\n        encoder = F.dropout(F.relu(encoder), p=0.5, training=True)\n    decoder = F.dropout(decoder, p=0.5, training=True)\n    return encoder + decoder\n\n\ndef run(fn, encoder, decoder):\n    torch.manual_seed(2026)\n    with profile(activities=[ProfilerActivity.CPU], record_shapes=True) as prof:\n        output = fn(encoder, decoder)\n\n    dropout_shapes = [\n        tuple(event.input_shapes[0])\n        for event in prof.events()\n        if event.name in {\"aten::dropout\", \"aten::native_dropout\"}\n        and event.input_shapes\n    ]\n    order = [\n        \"decoder\" if shape == (1, 1, 64) else \"encoder\"\n        for shape in dropout_shapes\n    ]\n    return output, order\n\n\n# requires_grad=True selects the training graph. Calling backward is not needed\n# to expose the forward RNG-order mismatch.\nencoder = torch.randn(1, 128, 64, requires_grad=True)\ndecoder = torch.randn(1, 1, 64, requires_grad=True)\ncompiled_model = torch.compile(model)\ncompiled_model(encoder, decoder)  # compile outside the profiler\n\neager_output, eager_order = run(model, encoder, decoder)\ncompiled_output, compiled_order = run(compiled_model, encoder, decoder)\n\nprint(\"eager order:  \", eager_order)\nprint(\"compiled order:\", compiled_order)\nprint(\"outputs equal:\", torch.equal(eager_output, compiled_output))\n\ntorch.testing.assert_close(compiled_output, eager_output, rtol=0, atol=0)\n```\n\nRun with:\n\n```bash\npython debug_dropout_cpu.py\n```\n\n## Actual behavior\n\nAbbreviated output:\n\n```text\neager order:    [encoder x17, decoder]\ncompiled order: [decoder, encoder x17]\noutputs equal: False\n\nAssertionError: Tensor-likes are not equal!\n```\n\n## Expected behavior\n\nWith the same input tensors and manual seed, `torch.compile` should preserve the observable RNG ordering of fallback random operators. The compiled order should be `[encoder x17, decoder]`, and the output should exactly equal eager output.\n\n## Root cause\n\nThe relevant path in the inspected source is:\n\n```text\ntorch/_inductor/lowering.py\n  native_dropout()\n    fallback_random=True\n      -> ir.FallbackKernel.create(aten.native_dropout.default, ...)\n\ntorch/_inductor/scheduler.py\n  Scheduler initialization\n    reorder_for_peak_memory=True\n      -> memory.reorder_for_peak_memory(...)\n```\n\nThe encoder and decoder are independent dataflow branches until the final add. Therefore, moving the decoder branch before the encoder is a valid topological reordering if `native_dropout` is treated as a pure operator.\n\nHowever, fallback `native_dropout` consumes the global CPU RNG state. The actual semantic dependency is:\n\n```text\nRNG S0 -> encoder dropout 0 -> S1 -> ... -> encoder dropout 16 -> S17\n        -> decoder dropout -> S18\n```\n\nThat dependency is absent from the scheduler graph. Peak-memory scheduling can therefore move the small decoder branch first and assign every dropout a different part of the global random-number sequence.\n\nRegistering `aten.native_dropout.default` as an `ORDERED` effect makes AOTAutograd thread an effect token through the calls. Inductor lowers `with_effects` by adding ordering dependencies between the generated operations, which prevents the peak-memory scheduler from reversing them.\n\n## Proposed fix: opt-in config switch\n\nAdd an option for users/backends that require eager RNG order for fallback dropout. The default remains `False`, so this has no behavior change unless the option is explicitly enabled.\n\n### `torch/_inductor/config.py`\n\n```diff\n # fallback to eager for random/dropout, this is slow but useful for debugging\n fallback_random = False\n\n+# Preserve eager RNG ordering for fallback native_dropout calls by threading an\n+# ordered effect token through the compiled graph.\n+preserve_fallback_random_order = False\n```\n\n### `torch/_inductor/compile_fx.py`\n\nAdd this context manager immediately before `_compile_fx_main`:\n\n```diff\n+@contextlib.contextmanager\n+def _preserve_fallback_random_order():\n+    if not (\n+        config.fallback_random\n+        and config.preserve_fallback_random_order\n+    ):\n+        yield\n+        return\n+\n+    from torch._higher_order_ops.effects import (\n+        _EffectType,\n+        _register_effectful_op,\n+    )\n+\n+    handle = _register_effectful_op(\n+        torch.ops.aten.native_dropout.default,\n+        _EffectType.ORDERED,\n+    )\n+    try:\n+        yield\n+    finally:\n+        handle.destroy()\n```\n\nEnter the context before AOTAutograd traces the graph:\n\n```diff\n def _compile_fx_main(...):\n     ...\n     with (\n+        _preserve_fallback_random_order(),\n         _use_lazy_graph_module(dynamo_config.use_lazy_graph_module),\n         enable_python_dispatcher(),\n         ...\n     ):\n```\n\nEnable it with:\n\n```python\ntorch._inductor.config.fallback_random = True\ntorch._inductor.config.preserve_fallback_random_order = True\n```\n\n### Verification result\n\n```text\nswitch=False:\n  eager:    [encoder x17, decoder]\n  compiled: [decoder, encoder x17]\n  outputs equal: False\n\nswitch=True:\n  eager:    [encoder x17, decoder]\n  compiled: [encoder x17, decoder]\n  outputs equal: True\n```\n\n### Trade-offs\n\n- No default behavior or performance change.\n- Users must know that the switch is required for correct fallback RNG ordering.\n- The effect registry is process-global. Temporarily changing it during a scoped config patch can race with concurrent compilation in another thread. A production implementation may need a non-global conditional effect mechanism or compiler-level dependency representation.\n- Preserving order may reduce peak-memory scheduling freedom for graphs containing many fallback dropout calls. Because the new switch defaults to `False`, users opt into this correctness/performance trade-off explicitly.\n\nThe current local PyTorch 2.12 source contains this switch-based implementation.\n\n## Verification matrix\n\n| Case | Result |\n|---|---|\n| Original 2.12, `fallback_random=True` | Reproduced order and output mismatch |\n| New switch off | Mismatch remains; existing behavior is unchanged |\n| New switch on | Dropout order and output match eager |\n| New switch on with backward | Encoder and decoder gradients match eager |\n\n\ncc @pbelevich @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @aakhundov @coconutruben @jataylo",
+      "comments": []
+    },
+    {
+      "number": 169991,
+      "title": "aot_export_joint_with_descriptors don't work  with compile inside due to dynamo config",
+      "url": "https://github.com/pytorch/pytorch/issues/169991",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/169991",
+      "state": "closed",
+      "author": "tugsbayasgalan",
+      "created_at": "2025-12-09T20:48:58Z",
+      "updated_at": "2026-08-09T12:10:10Z",
+      "closed_at": "2026-08-09T12:10:10Z",
+      "labels": [
+        "oncall: pt2",
+        "oncall: export"
+      ],
+      "comments_count": 1,
+      "matched_keywords": [
+        "compile",
+        "dynamo"
+      ],
+      "body": "### 🐛 Describe the bug\n\n```python \nfrom torch.nn.attention.flex_attention import create_block_mask, flex_attention\nimport torch \n\nclass MixedFakeModeModel(torch.nn.Module):\n    def __init__(self, dim=64, use_inductor=True):\n        super().__init__()\n        self.dim = dim\n        self.q_proj = torch.nn.Linear(64, 64)\n        self.k_proj = torch.nn.Linear(64, 64)\n        self.v_proj = torch.nn.Linear(64, 64)\n        self.use_inductor = use_inductor\n        self.flex_attention = torch.compile(flex_attention, backend=\"inductor\")\n\n    def forward(self, x):\n        batch_size, seq_len, _ = x.shape\n\n        # Process input first - this creates fake tensors in export's fake mode\n        processed = self.q_proj(x)\n\n        # Create some computation that depends on processed tensor\n        intermediate = processed.sum(dim=-1).detach()  # Shape: (batch, seq_len)\n\n        # Now call create_block_mask which internally calls torch.compile\n        # The mask function will capture 'intermediate' which is a fake tensor\n        # from export's fake mode, but create_block_mask will create its own fake mode\n        def dynamic_mask_function(batch_idx, head_idx, q_idx, kv_idx):\n            # This captures the intermediate tensor from the outer scope\n            # When torch.compile is called inside create_block_mask,\n            # this tensor will be from export's fake mode while new tensors\n            # created inside will be from the nested fake mode\n            threshold = intermediate[\n                batch_idx, q_idx % seq_len\n            ]  # Access the captured tensor\n            return (kv_idx <= q_idx) & (threshold > 0)  # Mix fake modes\n\n        block_mask = create_block_mask(\n            mask_mod=dynamic_mask_function,\n            B=batch_size,\n            H=None,\n            Q_LEN=seq_len,\n            KV_LEN=seq_len,\n            device=x.device,\n        )\n        q = self.q_proj(processed).view(batch_size, 1, seq_len, self.dim)\n        k = self.k_proj(processed).view(batch_size, 1, seq_len, self.dim)\n        v = self.v_proj(processed).view(batch_size, 1, seq_len, self.dim)\n\n        # Use flex_attention with torch.compile - during export, compile should be skipped\n        backend = \"inductor\" if self.use_inductor else \"eager\"\n        out = self.flex_attention(\n            q, k, v, block_mask=block_mask\n        )\n\n        return out\n\nmodel = MixedFakeModeModel(use_inductor=True)\nx = torch.randn(2, 128, 64)\nfrom torch._functorch.aot_autograd import aot_export_joint_with_descriptors\nfrom contextlib import ExitStack\naot_export_joint_with_descriptors(ExitStack(), model, (x,))\n\n```\nErrors with:\n```\nRuntimeError: Detected that you are using FX to symbolically trace a dynamo-optimized function. This is not supported at the moment.\n```\n\nnon-strict export doesn't error btw. We can probably copy paste whatever we do for non-strict here. \n\n### Versions\n\nmain\n\ncc @chauhang @penguinwu @avikchaudhuri @gmagogsfm @zhxchen17 @angelayi @suo @ydwu4",
+      "comments": [
+        {
+          "author": "jansel",
+          "created_at": "2026-08-09T12:10:10Z",
+          "updated_at": "2026-08-09T12:10:10Z",
+          "body": "My agent says this is fixed by https://github.com/pytorch/pytorch/pull/185732 (commit e7ace6cf0440ab733c0c1d3948de03934aaf4762). That merged change makes nested torch.compile calls run eagerly during AOT metadata and FX tracing while preserving HOP-internal compilation, and the original CUDA FlexAttention reproduction now passes on current main.",
+          "url": "https://github.com/pytorch/pytorch/issues/169991#issuecomment-5231443927"
+        }
+      ]
+    },
+    {
+      "number": 192618,
+      "title": "[inductor] schedule_overlap_bucketing crashes with AttributeError when both memory caps are None (the documented \"no limit\" configuration)",
+      "url": "https://github.com/pytorch/pytorch/issues/192618",
+      "api_url": "https://api.github.com/repos/pytorch/pytorch/issues/192618",
+      "state": "open",
+      "author": "X-XG",
+      "created_at": "2026-08-08T20:42:41Z",
+      "updated_at": "2026-08-09T05:20:25Z",
+      "closed_at": null,
+      "labels": [
+        "triaged",
+        "oncall: pt2",
+        "module: inductor",
+        "bot-triaged"
+      ],
+      "comments_count": 1,
+      "matched_keywords": [
+        "inductor"
+      ],
+      "body": "\n### 🐛 Describe the bug\n\n`schedule_overlap_bucketing` documents its memory caps as optional:\n\n```\nmax_memory_increase_gb: Maximum GB increase above baseline memory (absolute cap). If None, no absolute limit.\nmax_memory_increase_ratio: Maximum increase as ratio of baseline peak memory. If None, no ratio limit.\n```\n\nPassing both as `None` — the documented \"no limits\" configuration — crashes on\nthe very first scheduled node:\n\n```\nFile \"torch/_inductor/fx_passes/overlap_scheduling.py\", line 1140, in _schedule\n    self.memory_tracker.schedule_node(node)\nAttributeError: 'NoneType' object has no attribute 'schedule_node'\n```\n\n### Repro (single process, CPU, no GPU needed)\n\n```python\nimport torch\nimport torch.distributed as dist\nfrom torch.fx.experimental.proxy_tensor import make_fx\nfrom torch.testing._internal.distributed.fake_pg import FakeStore\n\ndist.init_process_group(\"fake\", rank=0, world_size=4, store=FakeStore())\ngroup_name = dist.distributed_c10d._get_default_group().group_name\n\n\ndef f(x, w):\n    ag = torch.ops._c10d_functional.all_gather_into_tensor(x, 4, group_name)\n    ag = torch.ops._c10d_functional.wait_tensor(ag)\n    return ag @ w\n\n\ngm = make_fx(f, tracing_mode=\"fake\")(torch.randn(8, 16), torch.randn(16, 16))\n\nfrom torch._inductor.fx_passes.overlap_scheduling import schedule_overlap_bucketing\n\nschedule_overlap_bucketing(\n    gm,\n    max_memory_increase_gb=None,\n    max_memory_increase_ratio=None,\n)\n```\n\n### Analysis\n\nIn `OverlapScheduler.__init__`:\n\n```python\nneeds_memory_tracking = (\n    max_memory_increase_gb is not None or max_memory_increase_ratio is not None\n)\nif needs_memory_tracking:\n    ...\n    self.memory_tracker = MemoryTracker(self.graph)\nelse:\n    ...\n    self.memory_tracker = None  # type: ignore[assignment]\n```\n\nbut the base class dereferences `self.memory_tracker` unconditionally in six\nplaces (line numbers for 2.14.0.dev20260728):\n\n| line | method | expression |\n|---|---|---|\n| 643 | `_prefetch_would_exceed_memory_budget` | `.current_memory_bytes + size` |\n| 935 | `_get_next_nodes` | `.current_memory_bytes` |\n| 1140 | `_schedule` | `.schedule_node(node)` (first hit) |\n| 1145 | `_schedule` | `.get_current_memory_bytes()` |\n| 1616 | `_reorder_graph` | `.peak_memory` |\n| 1627 | `_reorder_graph` | `.peak_memory` |\n\nThe `None` branch was introduced for `ManualOverlapScheduler`\n(#183565, \"Skip MemoryTracker in ManualOverlapScheduler\"), which overrides the\nscheduling loop; for the base `OverlapScheduler` the branch is unreachable\nwithout crashing, and no test exercises it — the `# type: ignore[assignment]`\non a non-Optional attribute is the tell.\n\n### Suggested fix\n\nGuard the six call sites (`if self.memory_tracker is not None`), or install a\nno-op tracker when both caps are `None`, mirroring how\n`ManualOverlapScheduler` sidesteps it.\n\n### Versions\n\ntorch 2.14.0.dev20260728+cu130; per file history the code is unchanged on\ncurrent `main`.\n\n\ncc @chauhang @penguinwu @voznesenskym @EikanWang @jgong5 @Guobing-Chen @XiaobingSuper @zhuhaozhe @blzheng @wenzhe-nrv @jiayisunx @ipiszy @kadeng @muchulee8 @amjames @aakhundov @coconutruben @jataylo",
+      "comments": [
+        {
+          "author": "HussainNizamani",
+          "created_at": "2026-08-09T05:20:25Z",
+          "updated_at": "2026-08-09T05:20:25Z",
+          "body": "Reproduced on current main (Linux aarch64, CPU-only build). With both memory caps set to `None` the pass crashes exactly as reported:\n\n`overlap_scheduling.py:1140` -`AttributeError: 'NoneType' object has no attribute 'schedule_node'`\n\nThe cause is right there in the source: the no-limits branch sets `self.memory_tracker = None` (around line 531), but `_schedule` and five other places (643, 935, 1145, 1616, 1627) call it without checking.\n\nSide note from reproducing this on a machine with no GPU: the documented CPU path can't currently run on an actual CPU-only setup anyway. `estimate_roofline_runtime_ms` pulls in `get_gpu_dram_gbps`, which imports triton (ModuleNotFoundError if it isn't installed, and a driver assertion even when it is), and `benchmark_node_with_cache_key` eventually hits `torch.cuda.synchronize()`, which asserts on a CUDA-less build. I got to the reported crash by mocking those two hardware probes only; neither touches the memory-cap logic.\n\nI'd like to work on the fix (either guard the tracker uses or swap in a no-op tracker), and can include the CPU-path hardening too if that's wanted. Will post my approach here before opening a PR.",
+          "url": "https://github.com/pytorch/pytorch/issues/192618#issuecomment-5229921477"
+        }
+      ]
+    }
+  ]
+}
